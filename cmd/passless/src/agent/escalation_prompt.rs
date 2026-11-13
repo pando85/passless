@@ -1222,10 +1222,14 @@ mod tests {
              Requested by: the agent in advance (no page is waiting), principal user alice"
         );
         assert!(body.lines().count() <= 7);
-        // A ceremony that adopted the pre-request before it was shown has a page: its origin.
+        // A ceremony that adopted the pre-request before it was shown has a page: its origin,
+        // and the daemon no longer marks the request as made in advance (review N2).
         pre.origin = Some("https://www.example.org".to_string());
+        pre.requested_in_advance = false;
         let (_, body) = render_prompt(&pre).unwrap();
         assert!(body.contains("\nOrigin: https://www.example.org\n"));
+        assert!(!body.contains("in advance"), "{body}");
+        assert!(!body.contains("no page is waiting"), "{body}");
     }
 
     #[test]

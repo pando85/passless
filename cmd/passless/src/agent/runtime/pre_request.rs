@@ -487,11 +487,28 @@ impl AgentRuntime {
             store_counter,
         };
         let key = escalation_request.key();
-        let mut state = self.escalation.pre_request(PreRequestParams {
-            request: escalation_request,
-            pending_for,
-            session_remaining,
-        });
+        // `handle_principal` released the session's slot before this call, so the session may
+        // have ended since (review L1): the request is then withdrawn at once, and the session's
+        // refusal ledger is dropped too, as `cleanup_browser_for_session` would have done had it
+        // run after this call. The slot is taken alone, with no lock held.
+        let session_alive = || self.principal_session_alive(profile_id, &requester.session_id);
+        let mut state = self.escalation.pre_request_while(
+            PreRequestParams {
+                request: escalation_request,
+                pending_for,
+                session_remaining,
+            },
+            &session_alive,
+        );
+        if state == PreRequestState::Expired && !session_alive() {
+            self.pre_request_refusals
+                .session_ended(&requester.session_id);
+            info!(
+                "agent pre-request: profile={} rp={} action={:?} -> its session ended",
+                profile_id, rp_id, action
+            );
+            return respond(access_status(&state, rp_id, action));
+        }
 
         // 6. Wait for the decision, if asked to, holding no lock.
         let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(MAX_ACCESS_WAIT_MS));
@@ -499,12 +516,11 @@ impl AgentRuntime {
             && !wait.is_zero()
             && let Some(_parked) = self.pre_request_refusals.park(&requester.session_id)
         {
-            let still_valid = || self.principal_session_alive(profile_id, &requester.session_id);
             state = self.escalation.wait_pre_request(
                 &requester.session_id,
                 &key,
                 Instant::now() + wait,
-                &still_valid,
+                &session_alive,
             );
         }
 

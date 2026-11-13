@@ -41,7 +41,10 @@
 //!   call. Its expiry is a timeout of the key (cooldown). Repeating the request from the same
 //!   principal session reports its state instead of raising another. Per principal session at
 //!   most [`MAX_PENDING_PRE_REQUESTS`] is pending and at most [`MAX_PRE_REQUESTS_PER_WINDOW`] are
-//!   raised per [`PRE_REQUEST_WINDOW`].
+//!   raised per [`PRE_REQUEST_WINDOW`]; per profile, across all its principal sessions (the
+//!   out-of-session CLI starts a new one for every call), at most
+//!   [`MAX_PENDING_PRE_REQUESTS_PER_PROFILE`] are pending and at most
+//!   [`MAX_PRE_REQUESTS_PER_PROFILE_WINDOW`] are raised per window.
 //!   - `authenticate`: ceremonies of the key join the pre-request's escalation as usual, and a
 //!     pre-request joins a ceremony's. The approval persists the same grant a ceremony-time
 //!     approval would, with `source = "pre_request"` and no origin.
@@ -151,8 +154,14 @@ pub const PRE_APPROVAL_TTL: Duration = Duration::from_secs(600);
 pub const MAX_PENDING_PRE_REQUESTS: usize = 1;
 /// Pre-requests a principal session may raise per [`PRE_REQUEST_WINDOW`].
 pub const MAX_PRE_REQUESTS_PER_WINDOW: usize = 6;
-/// The window of [`MAX_PRE_REQUESTS_PER_WINDOW`]; also how long an unreported pre-request outcome
-/// is kept for its requester.
+/// Pending pre-requests per profile, across all its principal sessions. The per-session limits
+/// do not bound the out-of-session CLI, which starts a fresh principal session for every call.
+pub const MAX_PENDING_PRE_REQUESTS_PER_PROFILE: usize = 3;
+/// Pre-requests a profile may raise per [`PRE_REQUEST_WINDOW`], across all its principal
+/// sessions.
+pub const MAX_PRE_REQUESTS_PER_PROFILE_WINDOW: usize = 12;
+/// The window of [`MAX_PRE_REQUESTS_PER_WINDOW`] and [`MAX_PRE_REQUESTS_PER_PROFILE_WINDOW`]; also
+/// how long an unreported pre-request outcome is kept for its requester.
 pub const PRE_REQUEST_WINDOW: Duration = Duration::from_secs(600);
 
 /// The ID of one escalation (`request_id` of the granted rule it produces).
@@ -311,7 +320,9 @@ impl EscalationRequest {
             },
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
-            requested_in_advance: self.source == RequestSource::PreRequest,
+            // A ceremony that adopted the pre-request has a page: the prompt names its origin
+            // and no longer says that nothing is waiting.
+            requested_in_advance: self.source == RequestSource::PreRequest && self.origin.is_none(),
             rule: match self.rule {
                 PermittingRule::Exact => PromptRule::Exact,
                 PermittingRule::Wildcard => PromptRule::Wildcard,
@@ -589,7 +600,15 @@ enum PreStatus {
     Pending,
     /// A registration ceremony adopted the escalation.
     Adopted,
-    /// A `register` approval nobody adopted.
+    /// A `register` approval nobody adopted, whose `pre_approval.issued` record is not written
+    /// yet: not usable. `dropped` is set when something that drops a token (session end, lease
+    /// revocation, a policy change) happened meanwhile; the issuing step then records the drop
+    /// right after `issued`.
+    Issuing {
+        token: Box<PreApprovalToken>,
+        dropped: Option<PreApprovalExpireReason>,
+    },
+    /// A `register` approval nobody adopted, issued (audited) and usable.
     Token(Box<PreApprovalToken>),
     /// Ended; reported once to the requester, then forgotten.
     Settled(PreRequestState),
@@ -968,11 +987,17 @@ struct Inner {
     reservation_epoch: Arc<AtomicU64>,
     /// Pre-requests by principal session and key (ADR 0014 amendment section 2.3). Bounded: a
     /// principal session has at most [`MAX_PENDING_PRE_REQUESTS`] pending and raises at most
-    /// [`MAX_PRE_REQUESTS_PER_WINDOW`] per window; settled ones are dropped once reported or after
+    /// [`MAX_PRE_REQUESTS_PER_WINDOW`] per window, and a profile has at most
+    /// [`MAX_PENDING_PRE_REQUESTS_PER_PROFILE`] pending and raises at most
+    /// [`MAX_PRE_REQUESTS_PER_PROFILE_WINDOW`] per window across its sessions; settled ones are dropped once reported or after
     /// the window, and all of a session's go when it ends.
     pre_requests: HashMap<PreRequestKey, PreRequestRecord>,
     /// When each principal session raised its recent pre-requests (the rate window).
     pre_request_history: HashMap<PrincipalSessionId, VecDeque<MonotonicTime>>,
+    /// When each profile raised its recent pre-requests, across all its principal sessions (the
+    /// profile's rate window). At most [`MAX_PRE_REQUESTS_PER_PROFILE_WINDOW`] per profile;
+    /// unlike a session's, it survives the end of the session that raised them.
+    pre_request_profile_history: HashMap<ProfileId, VecDeque<MonotonicTime>>,
     next_serial: u64,
     next_waiter: u64,
     next_ticket: u64,
@@ -1006,6 +1031,9 @@ enum Admission {
 /// Deferred side effects, run after the mutex is released.
 enum Effect {
     Audit(AuditEvent),
+    /// Record `pre_approval.issued` of the pre-approval in `Issuing` state at this key and only
+    /// then make it usable ([`EscalationService::issue_token`]).
+    Issue(PreRequestKey, AuditEvent),
     /// Show a prompt; a registration's count is taken just before it is rendered (review L4).
     Show(PromptTicket, PromptFields, Option<Arc<dyn StoreCounter>>),
     Withdraw(PromptTicket),
@@ -1597,12 +1625,17 @@ impl Inner {
                             expires_at,
                         };
                         let ttl_secs = expires_at.saturating_duration_since(now) / 1000;
-                        effects.push(Effect::Audit(token.meta().issued(ttl_secs)));
+                        // Usable only once `pre_approval.issued` is written (review N1): the
+                        // record waits in `Issuing`, which the requester sees as pending.
+                        effects.push(Effect::Issue(key.clone(), token.meta().issued(ttl_secs)));
                         info!(
                             "escalation {}: registration pre-approved for {}/{} ({} s)",
                             token.approval.escalation_id, key.1.profile, key.1.rp_id, ttl_secs
                         );
-                        record.status = PreStatus::Token(Box::new(token));
+                        record.status = PreStatus::Issuing {
+                            token: Box::new(token),
+                            dropped: None,
+                        };
                         record.settled_at = Some(now);
                         self.pre_requests.insert(key, record);
                         continue;
@@ -1634,6 +1667,16 @@ impl Inner {
         reason: PreApprovalExpireReason,
         effects: &mut Vec<Effect>,
     ) {
+        // A pre-approval whose `issued` record is still being written is marked: the issuing
+        // step records the drop right after `issued`, so the audit shows both.
+        for (key, record) in &mut self.pre_requests {
+            if let PreStatus::Issuing { dropped, .. } = &mut record.status
+                && dropped.is_none()
+                && matches(key)
+            {
+                *dropped = Some(reason);
+            }
+        }
         let keys: Vec<PreRequestKey> = self
             .pre_requests
             .iter()
@@ -1655,42 +1698,50 @@ impl Inner {
         }
     }
 
-    /// Whether `principal` may raise another pre-request now: at most
-    /// [`MAX_PENDING_PRE_REQUESTS`] pending and [`MAX_PRE_REQUESTS_PER_WINDOW`] per
-    /// [`PRE_REQUEST_WINDOW`].
+    /// Whether `principal` may raise another pre-request in `profile` now. Per principal session:
+    /// at most [`MAX_PENDING_PRE_REQUESTS`] pending and [`MAX_PRE_REQUESTS_PER_WINDOW`] per
+    /// [`PRE_REQUEST_WINDOW`]. Per profile, across all its principal sessions: at most
+    /// [`MAX_PENDING_PRE_REQUESTS_PER_PROFILE`] pending and
+    /// [`MAX_PRE_REQUESTS_PER_PROFILE_WINDOW`] per window (the out-of-session CLI starts a fresh
+    /// principal session for every call, so the session limits alone never bind it).
     fn pre_request_limit(
         &mut self,
         principal: &PrincipalSessionId,
+        profile: &ProfileId,
         now: MonotonicTime,
     ) -> Option<PreRequestState> {
-        let pending = self
+        let (session_pending, profile_pending) = self
             .pre_requests
             .iter()
-            .filter(|((owner, _), record)| {
-                owner == principal && matches!(record.status, PreStatus::Pending)
-            })
-            .count();
-        if pending >= MAX_PENDING_PRE_REQUESTS {
+            .filter(|(_, record)| matches!(record.status, PreStatus::Pending))
+            .fold((0, 0), |(session, in_profile), ((owner, key), _)| {
+                (
+                    session + usize::from(owner == principal),
+                    in_profile + usize::from(key.profile == *profile),
+                )
+            });
+        if session_pending >= MAX_PENDING_PRE_REQUESTS
+            || profile_pending >= MAX_PENDING_PRE_REQUESTS_PER_PROFILE
+        {
             return Some(PreRequestState::RateLimited { retry_after: None });
         }
         let window = u64::try_from(PRE_REQUEST_WINDOW.as_millis()).unwrap_or(u64::MAX);
-        let recent = self.pre_request_history.get_mut(principal)?;
-        while recent
-            .front()
-            .is_some_and(|at| now.saturating_duration_since(*at) >= window)
-        {
-            recent.pop_front();
+        let mut limited = None;
+        if let Some(recent) = self.pre_request_history.get_mut(principal) {
+            limited = window_limit(recent, MAX_PRE_REQUESTS_PER_WINDOW, window, now);
+            if recent.is_empty() {
+                self.pre_request_history.remove(principal);
+            }
         }
-        if recent.len() >= MAX_PRE_REQUESTS_PER_WINDOW {
-            let retry_after = recent.front().map(|oldest| {
-                Duration::from_millis(window.saturating_sub(now.saturating_duration_since(*oldest)))
-            });
-            return Some(PreRequestState::RateLimited { retry_after });
+        if let Some(recent) = self.pre_request_profile_history.get_mut(profile) {
+            let profile_limited =
+                window_limit(recent, MAX_PRE_REQUESTS_PER_PROFILE_WINDOW, window, now);
+            if recent.is_empty() {
+                self.pre_request_profile_history.remove(profile);
+            }
+            limited = limited.or(profile_limited);
         }
-        if recent.is_empty() {
-            self.pre_request_history.remove(principal);
-        }
-        None
+        limited
     }
 
     /// The state of `principal`'s pre-request for `key`, if it has one. A settled outcome is
@@ -1704,7 +1755,8 @@ impl Inner {
         let record_key = (principal.clone(), key.clone());
         let record = self.pre_requests.get(&record_key)?;
         match &record.status {
-            PreStatus::Pending => Some(PreRequestState::Pending),
+            // Not usable until its `issued` record is written.
+            PreStatus::Pending | PreStatus::Issuing { .. } => Some(PreRequestState::Pending),
             PreStatus::Adopted => Some(PreRequestState::Adopted),
             PreStatus::Token(token) => Some(PreRequestState::PreApproved {
                 expires_in: Duration::from_millis(token.expires_at.saturating_duration_since(now)),
@@ -1735,6 +1787,30 @@ impl Inner {
 enum Departure {
     Timeout,
     Aborted,
+}
+
+/// Drop the entries of `recent` older than `window` (milliseconds) and say whether it still
+/// holds `limit` of them: the answer is then `RateLimited` with the time until the oldest ages
+/// out.
+fn window_limit(
+    recent: &mut VecDeque<MonotonicTime>,
+    limit: usize,
+    window: u64,
+    now: MonotonicTime,
+) -> Option<PreRequestState> {
+    while recent
+        .front()
+        .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+    {
+        recent.pop_front();
+    }
+    if recent.len() < limit {
+        return None;
+    }
+    let retry_after = recent.front().map(|oldest| {
+        Duration::from_millis(window.saturating_sub(now.saturating_duration_since(*oldest)))
+    });
+    Some(PreRequestState::RateLimited { retry_after })
 }
 
 /// The escalation coordinator.
@@ -1819,6 +1895,7 @@ impl EscalationService {
                         warn!("escalation: failed to audit {}: {}", kind, e);
                     }
                 }
+                Effect::Issue(key, event) => self.issue_token(&key, event),
                 Effect::Show(ticket, mut fields, counter) => {
                     // The count of this moment, under the store's lock for the count alone and
                     // with no escalation lock held; an unavailable count omits the clause.
@@ -1946,7 +2023,9 @@ impl EscalationService {
                 && (inner
                     .pre_requests
                     .contains_key(&(principal.clone(), key.clone()))
-                    || inner.pre_request_limit(principal, now).is_some())
+                    || inner
+                        .pre_request_limit(principal, &request.profile, now)
+                        .is_some())
             {
                 // Raced with another pre-request of the same session; the caller reports it.
                 return Err(EscalationRefusal::PreRequestRateLimited);
@@ -2019,6 +2098,11 @@ impl EscalationService {
                     .entry(principal.clone())
                     .or_default()
                     .push_back(now);
+                inner
+                    .pre_request_profile_history
+                    .entry(request.profile.clone())
+                    .or_default()
+                    .push_back(now);
             }
             (
                 Entered {
@@ -2032,6 +2116,21 @@ impl EscalationService {
         };
 
         let Some(announcement) = announcement else {
+            if entered.joined && request.source == RequestSource::PreRequest {
+                // A pre-request that joins a live escalation is announced under that
+                // escalation's ID with its own principal session hash and note, so its note is
+                // not lost (review N3). The creator's record already opened the escalation, so a
+                // failed write only loses this one.
+                if let Err(e) = self
+                    .audit
+                    .record(request.audit_context(&entered.escalation_id).requested())
+                {
+                    warn!(
+                        "escalation {}: the joining pre-request could not be audited: {}",
+                        entered.escalation_id, e
+                    );
+                }
+            }
             debug!(
                 "escalation {}: {} ({}/{})",
                 entered.escalation_id,
@@ -2774,6 +2873,33 @@ impl EscalationService {
     /// cap and store, bus, queue and waiter caps. Nothing here waits for the human; see
     /// [`Self::wait_pre_request`].
     pub fn pre_request(&self, params: PreRequestParams) -> PreRequestState {
+        self.pre_request_while(params, &|| true)
+    }
+
+    /// [`Self::pre_request`] for a requester whose principal session can end while the request is
+    /// admitted (review L1): the caller copied the session out of its list and released the list
+    /// before calling, so [`Self::principal_session_ended`] may already have run and found
+    /// nothing to withdraw. After the request is admitted, if `still_valid()` (called with no lock
+    /// held) says the session is gone, the request is withdrawn like any other of that session
+    /// and the answer is `Expired`. A session leaves its list before its cleanup runs, so a
+    /// session that is still listed here is cleaned up by its own, later, call.
+    pub fn pre_request_while(
+        &self,
+        params: PreRequestParams,
+        still_valid: &dyn Fn() -> bool,
+    ) -> PreRequestState {
+        let principal = params.request.principal.clone();
+        let state = self.pre_request_inner(params);
+        match principal {
+            Some(principal) if !still_valid() => {
+                self.principal_session_ended(&principal);
+                PreRequestState::Expired
+            }
+            _ => state,
+        }
+    }
+
+    fn pre_request_inner(&self, params: PreRequestParams) -> PreRequestState {
         let PreRequestParams {
             request,
             pending_for,
@@ -2788,13 +2914,14 @@ impl EscalationService {
         }
         self.sweep_pre_requests();
         let key = request.key();
+        let profile = request.profile.clone();
         let now = self.clock.now();
         {
             let mut inner = self.lock();
             if let Some(state) = inner.report(&principal, &key, now) {
                 return state;
             }
-            if let Some(limited) = inner.pre_request_limit(&principal, now) {
+            if let Some(limited) = inner.pre_request_limit(&principal, &request.profile, now) {
                 return limited;
             }
         }
@@ -2818,7 +2945,7 @@ impl EscalationService {
                 let mut inner = self.lock();
                 inner
                     .report(&principal, &key, now)
-                    .or_else(|| inner.pre_request_limit(&principal, now))
+                    .or_else(|| inner.pre_request_limit(&principal, &profile, now))
                     .unwrap_or(PreRequestState::RateLimited { retry_after: None })
             }
             Err(refusal) => PreRequestState::Refused(refusal),
@@ -2859,6 +2986,31 @@ impl EscalationService {
                 return PreRequestState::Expired;
             }
         }
+    }
+
+    /// Whether [`Self::take_pre_approval`] would hand out a pre-approval for `consumer` now:
+    /// a usable token of its principal session exists, is within its TTL and revocation epoch and
+    /// was approved through the rule that matches now. Consumes and audits nothing (review L3): a
+    /// registration ceremony asks before it takes the replay key, and takes the token only once
+    /// the key is fresh. A token that is no longer valid is left for the sweep or the take to
+    /// drop and audit.
+    pub fn has_pre_approval(&self, consumer: &PreApprovalConsumer<'_>) -> bool {
+        let now = self.clock.now();
+        let epoch = self.epoch.current();
+        let key = (
+            consumer.principal.clone(),
+            EscalationKey {
+                profile: consumer.profile.clone(),
+                rp_id: consumer.rp_id.to_string(),
+                action: CeremonyAction::Register,
+            },
+        );
+        let inner = self.lock();
+        matches!(
+            inner.pre_requests.get(&key).map(|record| &record.status),
+            Some(PreStatus::Token(token))
+                if token.invalid(now, epoch).is_none() && token.approval.rule == consumer.rule
+        )
     }
 
     /// Consume the pre-approval of `consumer.principal` for a registration at `consumer.rp_id`
@@ -2936,6 +3088,67 @@ impl EscalationService {
         Some(approval)
     }
 
+    /// Record `pre_approval.issued` and only then make the pre-approval at `key` usable (review
+    /// N1): a token must never be consumable before its issue is on the audit trail. If the
+    /// record cannot be written the token is dropped (its wildcard cap slot is released) and the
+    /// requester is told `unavailable`: fail closed. A drop that happened while the record was
+    /// being written (the session ended, a lease was revoked, the policy changed) is recorded as
+    /// `pre_approval.expired` right after `issued`. Runs with no lock held.
+    fn issue_token(&self, key: &PreRequestKey, issued: AuditEvent) {
+        let waiting = matches!(
+            self.lock()
+                .pre_requests
+                .get(key)
+                .map(|record| &record.status),
+            Some(PreStatus::Issuing { .. })
+        );
+        if !waiting {
+            return;
+        }
+        let recorded = self.audit.record(issued);
+        let mut effects = Vec::new();
+        {
+            let mut inner = self.lock();
+            let now = self.clock.now();
+            if let Some(record) = inner.pre_requests.get_mut(key)
+                && matches!(record.status, PreStatus::Issuing { .. })
+                && let PreStatus::Issuing { token, dropped } = std::mem::replace(
+                    &mut record.status,
+                    PreStatus::Settled(PreRequestState::Expired),
+                )
+            {
+                match (&recorded, dropped) {
+                    (Ok(()), None) => {
+                        record.status = PreStatus::Token(token);
+                    }
+                    (Ok(()), Some(reason)) => {
+                        effects.push(Effect::Audit(token.meta().expired(reason)));
+                        inner.pre_requests.remove(key);
+                    }
+                    (Err(e), dropped) => {
+                        warn!(
+                            "escalation {}: pre_approval.issued could not be audited; no \
+                             pre-approval is issued: {}",
+                            token.approval.escalation_id, e
+                        );
+                        if dropped.is_some() {
+                            inner.pre_requests.remove(key);
+                        } else {
+                            record.status = PreStatus::Settled(PreRequestState::Refused(
+                                EscalationRefusal::AuditFailure,
+                            ));
+                            record.settled_at = Some(now);
+                        }
+                        // The token (and with it the wildcard cap slot) is dropped here.
+                        drop(token);
+                    }
+                }
+            }
+            self.changed.notify_all();
+        }
+        self.run(effects);
+    }
+
     /// Enforce the pre-requests' deadlines and the pre-approvals' TTL and epoch binding, and
     /// forget unreported outcomes older than [`PRE_REQUEST_WINDOW`]. The runtime loop calls it
     /// about once a second; every pre-request call runs it first as well.
@@ -2949,13 +3162,25 @@ impl EscalationService {
             if inner.pre_requests.is_empty() {
                 return;
             }
-            let due: Vec<(PreRequestKey, u64, Option<u64>)> = inner
+            // A pre-request whose escalation the human has decided (`Deciding`: the approval is
+            // being written) is not expired: `finish_deciding` settles it with the decision.
+            let due_keys: Vec<PreRequestKey> = inner
                 .pre_requests
-                .iter_mut()
+                .iter()
                 .filter(|(_, record)| {
-                    matches!(record.status, PreStatus::Pending) && record.deadline <= now
+                    matches!(record.status, PreStatus::Pending)
+                        && record.deadline <= now
+                        && inner.entries.get(&record.serial).map(|entry| entry.state)
+                            != Some(EscalationState::Deciding)
                 })
-                .map(|(key, record)| (key.clone(), record.serial, record.waiter.take()))
+                .map(|(key, _)| key.clone())
+                .collect();
+            let due: Vec<(PreRequestKey, u64, Option<u64>)> = due_keys
+                .into_iter()
+                .filter_map(|key| {
+                    let record = inner.pre_requests.get_mut(&key)?;
+                    Some((key, record.serial, record.waiter.take()))
+                })
                 .collect();
             for (key, serial, waiter) in due {
                 info!(
@@ -3039,9 +3264,11 @@ impl EscalationService {
                     &mut effects,
                 );
             }
-            inner
-                .pre_requests
-                .retain(|(owner, _), _| owner != principal);
+            // A pre-approval still being issued is marked dropped above and removed by its
+            // issuing step, which records the drop after `issued`.
+            inner.pre_requests.retain(|(owner, _), record| {
+                owner != principal || matches!(record.status, PreStatus::Issuing { .. })
+            });
             inner.pre_request_history.remove(principal);
             // A `register` pre-request a ceremony has not adopted is no longer adoptable by
             // anyone (it was withdrawn above unless ceremonies of other keys hold it).
@@ -6025,7 +6252,30 @@ mod tests {
                 .unwrap();
             let b = principal(2);
             assert_eq!(pre_auth(&h, "b.example", &b), PreRequestState::Pending);
-            assert_eq!(h.audit.count("escalation.requested"), 2);
+            // The joiner is announced too (review N3): same escalation, its own hash and note.
+            assert_eq!(h.audit.count("escalation.requested"), 3);
+            let joined = h.audit.last("escalation.requested");
+            let creator = h
+                .audit
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|event| event["kind"] == "escalation.requested")
+                .nth(1)
+                .cloned()
+                .unwrap();
+            assert_eq!(creator["rp_id"], "b.example");
+            assert_eq!(creator["source"], "ceremony");
+            assert!(creator["agent_note"].is_null());
+            assert_eq!(joined["escalation_id"], creator["escalation_id"]);
+            assert_eq!(joined["source"], "pre_request");
+            assert_eq!(joined["agent_note"], "agent says hi");
+            assert_eq!(
+                joined["principal_session_id_hash"],
+                crate::agent::audit_events::principal_session_id_hash(&b)
+            );
             let parked = park(ceremony);
             approve_last(&h);
             assert!(matches!(
@@ -6190,28 +6440,49 @@ mod tests {
         }
 
         #[test]
-        fn per_session_limits_one_pending_and_six_per_window() {
+        fn the_limits_bound_each_session_and_the_profile_across_sessions() {
             let h = harness();
             let a = principal(1);
             assert_eq!(pre_auth(&h, "a1.example", &a), PreRequestState::Pending);
-            // One pending per principal session.
+            // Per session: one pending.
             assert_eq!(
                 pre_auth(&h, "a2.example", &a),
                 PreRequestState::RateLimited { retry_after: None }
             );
-            // Another session is not affected.
+            // Another session is not affected by it, up to the profile's three pending ...
             assert_eq!(
                 pre_auth(&h, "a2.example", &principal(2)),
                 PreRequestState::Pending
             );
+            assert_eq!(
+                pre_auth(&h, "a3.example", &principal(3)),
+                PreRequestState::Pending
+            );
+            // ... and a fourth session, with nothing pending of its own, is refused: the profile
+            // already has three, whichever sessions raised them (the out-of-session CLI starts a
+            // fresh session per call). Nothing is prompted for it.
+            let shown = h.prompter.shown().len();
+            assert_eq!(
+                pre_auth(&h, "a4.example", &principal(4)),
+                PreRequestState::RateLimited { retry_after: None }
+            );
+            assert_eq!(h.prompter.shown().len(), shown);
+            for _ in 0..3 {
+                approve_last(&h);
+            }
+            // A decided request no longer counts as pending: the fourth session is admitted.
+            assert_eq!(
+                pre_auth(&h, "a4.example", &principal(4)),
+                PreRequestState::Pending
+            );
             approve_last(&h);
-            approve_last(&h);
+            // Per session: six per window. `a` raised one; five more.
             for n in 2..=6 {
                 let rp = format!("a{n}x.example");
                 assert_eq!(pre_auth(&h, &rp, &a), PreRequestState::Pending, "{n}");
                 approve_last(&h);
             }
-            // The seventh within ten minutes is refused without a prompt.
+            // The seventh of `a` within ten minutes is refused without a prompt.
             let shown = h.prompter.shown().len();
             match pre_auth(&h, "a7.example", &a) {
                 PreRequestState::RateLimited {
@@ -6220,8 +6491,65 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
             assert_eq!(h.prompter.shown().len(), shown);
+            // Per profile: twelve per window across sessions. `a`'s six and three other sessions'
+            // made nine; three more sessions make twelve.
+            for n in 10..13u8 {
+                let rp = format!("s{n}.example");
+                assert_eq!(pre_auth(&h, &rp, &principal(n)), PreRequestState::Pending);
+                approve_last(&h);
+            }
+            // The thirteenth, from a session that never asked, is refused without a prompt.
+            let shown = h.prompter.shown().len();
+            match pre_auth(&h, "s13.example", &principal(14)) {
+                PreRequestState::RateLimited {
+                    retry_after: Some(after),
+                } => assert!(after <= PRE_REQUEST_WINDOW),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(h.prompter.shown().len(), shown);
             h.clock.advance(PRE_REQUEST_WINDOW);
             assert_eq!(pre_auth(&h, "a7.example", &a), PreRequestState::Pending);
+            assert_eq!(
+                pre_auth(&h, "s13.example", &principal(14)),
+                PreRequestState::Pending
+            );
+        }
+
+        #[test]
+        fn ending_sessions_neither_resets_nor_keeps_the_profile_limits() {
+            let h = harness();
+            // Twelve sessions of one profile, each ended after its request: the out-of-session
+            // CLI's pattern. The profile window outlives the sessions.
+            for n in 1..=12u8 {
+                let who = principal(n);
+                let rp = format!("c{n}.example");
+                assert_eq!(pre_auth(&h, &rp, &who), PreRequestState::Pending, "{n}");
+                approve_last(&h);
+                h.service.principal_session_ended(&who);
+            }
+            let shown = h.prompter.shown().len();
+            assert!(matches!(
+                pre_auth(&h, "c13.example", &principal(13)),
+                PreRequestState::RateLimited {
+                    retry_after: Some(_)
+                }
+            ));
+            assert_eq!(h.prompter.shown().len(), shown);
+            // A session's end withdraws its pending request, which frees the pending slot.
+            h.clock.advance(PRE_REQUEST_WINDOW);
+            for n in 20..23u8 {
+                let rp = format!("d{n}.example");
+                assert_eq!(pre_auth(&h, &rp, &principal(n)), PreRequestState::Pending);
+            }
+            assert_eq!(
+                pre_auth(&h, "d23.example", &principal(23)),
+                PreRequestState::RateLimited { retry_after: None }
+            );
+            h.service.principal_session_ended(&principal(20));
+            assert_eq!(
+                pre_auth(&h, "d23.example", &principal(23)),
+                PreRequestState::Pending
+            );
         }
 
         #[test]
@@ -6675,6 +7003,250 @@ mod tests {
             assert_eq!(h.service.precheck(&ceremony), Ok(()));
             let waiter = h.service.join_or_create(ceremony).unwrap();
             assert!(waiter.joined());
+        }
+
+        #[test]
+        fn a_pre_request_admitted_after_its_session_ended_is_withdrawn() {
+            // Review L1: the runtime copies the requester out of its session list and releases
+            // the list; the session can end (and its cleanup run) before the request is
+            // admitted, and the cleanup then finds nothing to withdraw.
+            let h = harness();
+            let a = principal(1);
+            h.service.principal_session_ended(&a);
+            let state = h.service.pre_request_while(
+                params(pre(CeremonyAction::Authenticate, "a.example", &a)),
+                &|| false,
+            );
+            assert_eq!(state, PreRequestState::Expired);
+            // The prompt that was raised is withdrawn, and nothing of the session is left.
+            assert_eq!(h.prompter.shown().len(), 1);
+            assert_eq!(h.prompter.withdrawn().len(), 1);
+            {
+                let inner = h.service.lock();
+                assert!(inner.pre_requests.is_empty());
+                assert!(!inner.pre_request_history.contains_key(&a));
+                assert!(inner.entries.is_empty(), "the entry is collected");
+            }
+            // Nothing keeps it alive until its own deadline.
+            h.clock.advance(Duration::from_secs(599));
+            h.service.sweep_pre_requests();
+            assert_eq!(h.prompter.withdrawn().len(), 1);
+            // A late approval of the withdrawn prompt persists no grant.
+            assert!(h.grants.rules.lock().unwrap().is_empty());
+            // A session that is still there is not touched.
+            assert_eq!(
+                h.service.pre_request_while(
+                    params(pre(
+                        CeremonyAction::Authenticate,
+                        "b.example",
+                        &principal(2)
+                    )),
+                    &|| true
+                ),
+                PreRequestState::Pending
+            );
+            assert_eq!(h.service.lock().pre_requests.len(), 1);
+        }
+
+        #[test]
+        fn a_sweep_during_the_decision_does_not_discard_the_approval() {
+            // Review L4: the deadline passes while the human's approval is being written.
+            for action in [CeremonyAction::Register, CeremonyAction::Authenticate] {
+                let h = harness();
+                let a = principal(1);
+                let request = |h: &Harness| {
+                    h.service
+                        .pre_request(params(pre(action, "r.example", &principal(1))))
+                };
+                assert_eq!(request(&h), PreRequestState::Pending);
+                let service = h.service.clone();
+                let clock = h.clock.clone();
+                h.audit.hook("escalation.approved", move || {
+                    clock.advance(PRE_REQUEST_PENDING_LIMIT);
+                    service.sweep_pre_requests();
+                });
+                approve_last(&h);
+                match action {
+                    CeremonyAction::Register => {
+                        assert!(
+                            matches!(request(&h), PreRequestState::PreApproved { .. }),
+                            "a register approval issues a pre-approval"
+                        );
+                        assert_eq!(h.audit.count("pre_approval.issued"), 1);
+                        assert!(h.service.has_pre_approval(&consumer("r.example", &a)));
+                    }
+                    CeremonyAction::Authenticate => {
+                        assert_eq!(request(&h), PreRequestState::Approved);
+                        assert_eq!(h.grants.rules.lock().unwrap().len(), 1);
+                    }
+                }
+                assert_eq!(h.audit.count("escalation.approved"), 1);
+                assert_eq!(h.audit.count("escalation.expired"), 0);
+                // An undecided pre-request still expires at its deadline.
+                let h = harness();
+                assert_eq!(request(&h), PreRequestState::Pending);
+                h.clock.advance(PRE_REQUEST_PENDING_LIMIT);
+                h.service.sweep_pre_requests();
+                assert_eq!(request(&h), PreRequestState::Expired);
+            }
+        }
+
+        #[test]
+        fn a_pre_approval_is_usable_only_after_its_issue_is_recorded() {
+            // Review N1: `issued` is on the audit trail before the token can be consumed.
+            let h = harness();
+            let a = principal(1);
+            let early = Arc::new(Mutex::new(Vec::new()));
+            {
+                let service = h.service.clone();
+                let a = a.clone();
+                let early = early.clone();
+                h.audit.hook("pre_approval.issued", move || {
+                    // While `issued` is being recorded the token is neither visible nor usable.
+                    let c = consumer("r.example", &a);
+                    early.lock().unwrap().push((
+                        service.has_pre_approval(&c),
+                        service.take_pre_approval(c).is_some(),
+                    ));
+                });
+            }
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Pending);
+            approve_last(&h);
+            assert_eq!(*early.lock().unwrap(), [(false, false)]);
+            // Once recorded it is usable, and `consumed` follows `issued`.
+            assert!(matches!(
+                pre_reg(&h, "r.example", &a),
+                PreRequestState::PreApproved { .. }
+            ));
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_some()
+            );
+            let kinds = h.audit.kinds();
+            let position = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+            assert!(position("pre_approval.issued") < position("pre_approval.consumed"));
+            assert_eq!(h.audit.count("pre_approval.issued"), 1);
+            assert_eq!(h.audit.count("pre_approval.consumed"), 1);
+        }
+
+        #[test]
+        fn a_pre_approval_whose_issue_cannot_be_recorded_is_not_issued() {
+            let h = harness();
+            let a = principal(1);
+            let wildcard = |who: &PrincipalSessionId| EscalationRequest {
+                rule: PermittingRule::Wildcard,
+                mode: AgentMode::SameUser,
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 24,
+                ..pre(CeremonyAction::Register, "w.example", who)
+            };
+            h.audit.fail("pre_approval.issued");
+            assert_eq!(
+                h.service.pre_request(params(wildcard(&a))),
+                PreRequestState::Pending
+            );
+            approve_last(&h);
+            // Fail closed: no token, and the agent is told it is unavailable.
+            assert_eq!(h.audit.count("pre_approval.issued"), 0);
+            let mut c = consumer("w.example", &a);
+            c.rule = PermittingRule::Wildcard;
+            assert!(!h.service.has_pre_approval(&c));
+            assert!(h.service.take_pre_approval(c).is_none());
+            assert_eq!(h.audit.count("pre_approval.consumed"), 0);
+            assert_eq!(
+                h.service.pre_request(params(wildcard(&a))),
+                PreRequestState::Refused(EscalationRefusal::AuditFailure)
+            );
+            // The wildcard cap slot is free again.
+            assert_eq!(h.service.lock().reserved_wildcards(&profile("p")), 0);
+            let other = EscalationRequest {
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 24,
+                ..wildcard_register("p", "v.example", 1)
+            };
+            assert_eq!(h.service.precheck(&other), Ok(()));
+        }
+
+        #[test]
+        fn a_pre_approval_dropped_while_its_issue_is_recorded_is_dropped_after_it() {
+            let h = harness();
+            let a = principal(1);
+            {
+                let service = h.service.clone();
+                let a = a.clone();
+                h.audit.hook("pre_approval.issued", move || {
+                    service.principal_session_ended(&a);
+                });
+            }
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Pending);
+            approve_last(&h);
+            let kinds = h.audit.kinds();
+            let issued = kinds
+                .iter()
+                .position(|k| k == "pre_approval.issued")
+                .unwrap();
+            let expired = kinds
+                .iter()
+                .position(|k| k == "pre_approval.expired")
+                .unwrap();
+            assert!(issued < expired);
+            assert_eq!(
+                h.audit.last("pre_approval.expired")["reason"],
+                "session_end"
+            );
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_none()
+            );
+            assert!(h.service.lock().pre_requests.is_empty());
+        }
+
+        #[test]
+        fn the_prompt_of_an_adopted_pre_request_names_its_page_not_the_advance_request() {
+            // Review N2: a ceremony that adopts the pre-request before it is shown gives it an
+            // origin; the prompt must not also say that no page is waiting.
+            let h = harness();
+            let a = principal(1);
+            // Another escalation holds the prompt, so the pre-request waits in the queue.
+            let first = h
+                .service
+                .join_or_create(request("p", "first.example", 1))
+                .unwrap();
+            let first = park(first);
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Pending);
+            assert_eq!(h.prompter.shown().len(), 1);
+            let ceremony = h
+                .service
+                .join_or_create(EscalationRequest {
+                    origin: Some("https://www.r.example".to_string()),
+                    ..ceremony_register("r.example", 5, &a)
+                })
+                .unwrap();
+            let adopted = park(ceremony);
+            approve_last(&h);
+            assert!(matches!(
+                first.join().unwrap(),
+                EscalationOutcome::Approved { .. }
+            ));
+            assert_eq!(h.prompter.shown().len(), 2);
+            let fields = h.prompter.shown.lock().unwrap()[1].1.clone();
+            assert_eq!(fields.origin.as_deref(), Some("https://www.r.example"));
+            assert!(!fields.requested_in_advance);
+            let (_, body) = render_prompt(&fields).unwrap();
+            assert!(body.contains("Origin: https://www.r.example"), "{body}");
+            assert!(!body.contains("in advance"), "{body}");
+            approve_last(&h);
+            assert!(matches!(
+                adopted.join().unwrap(),
+                EscalationOutcome::RegistrationApproved(_)
+            ));
+            // A pre-request nobody adopted still says so.
+            let h = harness();
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Pending);
+            let fields = h.prompter.shown.lock().unwrap()[0].1.clone();
+            assert!(fields.requested_in_advance && fields.origin.is_none());
         }
     }
 }

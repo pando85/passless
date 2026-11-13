@@ -128,6 +128,16 @@ enum Approval {
     PreApproved(RegistrationApproval),
 }
 
+/// What a registration that needs an approval has prepared before its replay key is claimed.
+enum Prepared {
+    /// A usable pre-approval of its principal session exists. It is taken only once the replay
+    /// key is fresh (a duplicate must not spend it); if it is gone by then, the ceremony raises
+    /// its own escalation.
+    PreApprovalAvailable,
+    /// Its own escalation, to raise once the key is fresh.
+    Escalate(Box<PreparedEscalation>),
+}
+
 /// What the escalated path carries into [`RegisterHandler::register_fresh`].
 struct Fresh<'a> {
     algorithm: i32,
@@ -489,18 +499,20 @@ impl RegisterHandler {
             audit,
             store_counter,
         };
-        // A pre-approval of the principal session that owns this bearer is consumed here, where
-        // the ceremony's own escalation would be raised: after the option checks (an unsupported
-        // request does not spend it) and before the replay key. From here the path is the one
-        // of an approved ceremony-time escalation (ADR 0014 amendment section 2.3).
+        // A pre-approval of the principal session that owns this bearer replaces the ceremony's
+        // own escalation: it is looked for here, after the option checks (an unsupported request
+        // does not spend it), but consumed only below, once the replay key is fresh (a duplicate,
+        // joined or replayed ceremony must not spend it). From there the path is the one of an
+        // approved ceremony-time escalation (ADR 0014 amendment section 2.3).
         let prepared = if matched.action == RuleAction::Request {
-            match self.take_pre_approval(ctx, &matched.rule, target, &req.origin, audit) {
-                Some(approval) => Some(Approval::PreApproved(approval)),
-                None => Some(Approval::Escalate(
+            if self.has_pre_approval(ctx, &matched.rule, target, &req.origin, audit) {
+                Some(Prepared::PreApprovalAvailable)
+            } else {
+                Some(Prepared::Escalate(Box::new(
                     escalation
                         .prepare()
                         .map_err(|refused| self.deny(target, refused))?,
-                )),
+                )))
             }
         } else {
             None
@@ -523,8 +535,24 @@ impl RegisterHandler {
         match claim {
             Claim::Fresh(mut guard) => {
                 let mut key_used = false;
-                let outcome = if let Some(prepared) = prepared {
-                    self.register_escalated(
+                let prepared = match prepared {
+                    Some(Prepared::PreApprovalAvailable) => {
+                        match self.take_pre_approval(ctx, &matched.rule, target, &req.origin, audit)
+                        {
+                            Some(approval) => Ok(Some(Approval::PreApproved(approval))),
+                            // Spent, dropped or invalid since the look: escalate as usual.
+                            None => escalation
+                                .prepare()
+                                .map(|prepared| Some(Approval::Escalate(prepared)))
+                                .map_err(|refused| self.deny(target, refused)),
+                        }
+                    }
+                    Some(Prepared::Escalate(prepared)) => Ok(Some(Approval::Escalate(*prepared))),
+                    None => Ok(None),
+                };
+                let outcome = match prepared {
+                    Err(denied) => Err(denied),
+                    Ok(Some(prepared)) => self.register_escalated(
                         ctx,
                         req,
                         target,
@@ -538,9 +566,8 @@ impl RegisterHandler {
                         cancelled,
                         park,
                         &mut key_used,
-                    )
-                } else {
-                    self.register_fresh(
+                    ),
+                    Ok(None) => self.register_fresh(
                         ctx,
                         req,
                         target,
@@ -549,7 +576,7 @@ impl RegisterHandler {
                         None,
                         cancelled,
                         &mut key_used,
-                    )
+                    ),
                 };
                 let ceremony = outcome
                     .clone()
@@ -693,6 +720,35 @@ impl RegisterHandler {
             }
         }
         Ok(response)
+    }
+
+    /// Whether this bearer's principal session has a usable pre-approval for the RP: the look
+    /// that [`Self::take_pre_approval`] follows once the replay key is fresh. Consumes nothing.
+    fn has_pre_approval(
+        &self,
+        ctx: &RegisterContext,
+        rule: &RuleIdentity,
+        target: &AuditTarget,
+        origin: &str,
+        audit: &CeremonyAudit,
+    ) -> bool {
+        let rule = match rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => return false,
+        };
+        let Some(principal) = ctx.session.owning_principal_session(&self.policy_runtime) else {
+            return false;
+        };
+        self.escalation.has_pre_approval(&PreApprovalConsumer {
+            profile: &ctx.profile_id,
+            rp_id: target.rp_id,
+            principal: &principal,
+            rule,
+            session: WaiterSession::of(&ctx.session),
+            origin,
+            request_id: audit.request_id(),
+        })
     }
 
     /// Consume this bearer's principal session's pre-approval for the RP, if it has one (ADR 0014
@@ -3555,6 +3611,46 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Unauthorized);
             assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
             assert!(kinds(&f, "pre_approval.consumed").is_empty());
+        }
+
+        #[test]
+        fn a_duplicate_ceremony_does_not_spend_the_pre_approval() {
+            // Review L3: a replayed challenge is answered from the stored outcome; it must not
+            // use up the token (and write a misleading `pre_approval.consumed`).
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            let req = f.make_req();
+            let first = f.make_handler().register(&ctx, &req).expect("first");
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+            assert_eq!(kinds(&f, "pre_approval.consumed").len(), 1);
+            // A second pre-approval; the page replays the same challenge.
+            assert_eq!(pre_register(&f, &principal), PreRequestState::Pending);
+            f.prompter.approve(2);
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+            let duplicate = f
+                .make_handler()
+                .register(&ctx, &req)
+                .expect("the duplicate is served the stored outcome");
+            assert_eq!(duplicate.credential_id_b64u, first.credential_id_b64u);
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+            // Only the fresh ceremony consumed a token; the second one is still there.
+            assert_eq!(kinds(&f, "pre_approval.consumed").len(), 1);
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+            // A new challenge (a fresh ceremony) takes it, and writes the second record.
+            let next = req_with_challenge(&f, b"another challenge, not a replay");
+            f.make_handler()
+                .register(&ctx, &next)
+                .expect("the surviving pre-approval works");
+            assert_eq!(kinds(&f, "pre_approval.consumed").len(), 2);
+            assert_eq!(f.prompter.shown(), 2);
         }
 
         #[test]
