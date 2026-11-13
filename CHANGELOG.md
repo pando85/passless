@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.25.0](https://github.com/pando85/passless/tree/v0.25.0) - 2026-11-13
+
+### Added
+
+- Add client set-cred-protect to change stored credProtect levels (#590) ([e5f3ddb](https://github.com/pando85/passless/commit/e5f3ddbe8ca73c2add12fa8217536aaca505f27f))
+
+### Fixed
+
+- Retry GetAssertion with UV for credProtect-protected SSH credentials (#589) ([9c5178e](https://github.com/pando85/passless/commit/9c5178ed68a3f75a493df00b1cf7eb6a303bfc9f))
+
+### Build
+
+- deps: Update Rust crate clap-serde-derive to v1 (#571) ([c29f7ff](https://github.com/pando85/passless/commit/c29f7ff64583e4ed1d682fcef17f8aabe3892e83))
+- deps: Update soft-fido2 to 0.18.0 (#595) ([82165b7](https://github.com/pando85/passless/commit/82165b7835e683dc6d4987c5ed1e7815c0de953e))
+
+### Ci
+
+- Group soft-fido2 crates into one renovate PR (#593) ([ec90afe](https://github.com/pando85/passless/commit/ec90afe7f41088d6e0d14e95633cc13683a78a22))
+
 ## [v0.24.1](https://github.com/pando85/passless/tree/v0.24.1) - 2026-11-12
 
 ### Fixed
