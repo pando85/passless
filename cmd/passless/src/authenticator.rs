@@ -773,8 +773,6 @@ pub struct AuthenticatorService<
     pub authenticator: Authenticator<PasslessCallbacks<S, P>, K>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
-    /// Maximum UV retries (configured value)
-    max_uv_retries: u8,
     /// The configured `security.always_uv` (advertised as the `alwaysUv` option).
     always_uv: bool,
     /// Runtime feature gate for credential export/import.
@@ -917,7 +915,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         let mut service = Self {
             authenticator,
             storage,
-            max_uv_retries: pin_config.max_uv_retries,
             always_uv: security_config.always_uv,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
@@ -1056,7 +1053,6 @@ impl<
         let mut service = Self {
             authenticator,
             storage,
-            max_uv_retries: pin_config.max_uv_retries,
             always_uv: security_config.always_uv,
             credential_backup_enabled: false,
             credential_backup_supported: false,
@@ -1715,9 +1711,20 @@ impl<
 
             match self.reset_uv_retries() {
                 Ok(()) => {
+                    // Report the counter that is actually in effect. soft-fido2 refills its
+                    // in-memory counter to its own maximum (`pin.max_retries`), not to
+                    // `pin.max_uv_retries`, so the configured value may not be what the daemon
+                    // now allows.
+                    let in_effect = match self.authenticator.uv_retries() {
+                        Ok(retries) => retries,
+                        Err(_) => {
+                            response_buffer.push(StatusCode::Other as u8);
+                            return Ok(());
+                        }
+                    };
                     response_buffer.push(0x00);
                     if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
-                        .insert(1, self.max_uv_retries)
+                        .insert(1, in_effect)
                         .and_then(|b| b.build())
                     {
                         response_buffer.extend_from_slice(&cbor_data);
@@ -3566,8 +3573,11 @@ mod tests {
                         always_uv,
                         ..Default::default()
                     },
+                    // soft-fido2 refills its in-memory counter to `max_retries`, so keep the two
+                    // limits equal: an accepted UV then restores exactly MAX_RETRIES.
                     PinConfig {
                         enforcement,
+                        max_retries: MAX_RETRIES,
                         max_uv_retries: MAX_RETRIES,
                         ..Default::default()
                     },
@@ -3747,7 +3757,8 @@ mod tests {
             let response = harness.send(&make_credential_with_uv("assert.example"));
             let credential_id = enrolled_credential_id(&response);
             // An accepted verification refills the counter.
-            let full = harness.uv_retries();
+            let full = MAX_RETRIES;
+            assert_eq!(harness.uv_retries(), full);
 
             harness.answer(NotificationResult::Dismissed);
             let response = harness.send(&get_assertion_with_uv("assert.example", &credential_id));
@@ -3835,7 +3846,54 @@ mod tests {
                     vec![StatusCode::OperationDenied as u8],
                     "{answer:?}: presence is refused"
                 );
-                assert_eq!(harness.uv_retries(), MAX_RETRIES, "{answer:?}");
+            }
+        }
+
+        /// `uv-reset` reports the counter the daemon now enforces, not the configured value.
+        /// soft-fido2 refills its in-memory counter to `max_retries`, so with a smaller
+        /// `max_uv_retries` the two differ until the next restart; the answer must not claim
+        /// the configured one while the daemon allows more denials.
+        #[test]
+        fn uv_reset_reports_the_counter_in_effect() {
+            for (max_retries, max_uv_retries) in [(3, 3), (8, 3)] {
+                let (mut service, _dir) = cred_protect_service_with(
+                    &[],
+                    false,
+                    SecurityConfig::default(),
+                    PinConfig {
+                        max_retries,
+                        max_uv_retries,
+                        ..Default::default()
+                    },
+                );
+                service.set_prompts(Answering {
+                    answer: NotificationResult::Denied,
+                    verifications: Arc::new(Mutex::new(0)),
+                });
+                for _ in 0..max_uv_retries {
+                    let _ = platform::token(&mut service, 2, platform::Way::BuiltInUv, 0x04, None);
+                }
+                assert_eq!(service.authenticator.uv_retries().unwrap(), 0);
+
+                let payload = soft_fido2_ctap::cbor::MapBuilder::new()
+                    .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+                    .and_then(|b| b.build())
+                    .expect("payload");
+                let mut request = vec![CMD_PASSLESS_RESET_UV_RETRIES];
+                request.extend_from_slice(&payload);
+                let mut response = Vec::new();
+                service.handle(&request, &mut response).expect("handle");
+
+                let in_effect = service.authenticator.uv_retries().unwrap();
+                assert!(in_effect > 0, "UV is usable again");
+                assert_eq!(
+                    response,
+                    vec![0x00, 0xa1, 0x01, in_effect],
+                    "max_retries={max_retries}, max_uv_retries={max_uv_retries}"
+                );
+                if max_retries == max_uv_retries {
+                    assert_eq!(in_effect, max_uv_retries);
+                }
             }
         }
 
