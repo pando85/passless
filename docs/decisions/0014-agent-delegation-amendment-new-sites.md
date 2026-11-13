@@ -764,8 +764,9 @@ Phase 2:
 
 | ID | Phase | Scenario |
 |---|---|---|
-| E2E-58 | 1 | Pins with `*`: an exact RP signs only with its pinned credential; an unlisted RP discovers through `*`; an exact RP whose pin is gone fails with no fallthrough |
+| E2E-58 | 1 | Pins with `*`: an exact RP signs only with its pinned credential; an unlisted RP discovers through `*`; an exact RP whose pin is gone fails with no fallthrough; the agent's own `doctor` carries no pin check (review L3) |
 | E2E-59 | 1 | Same-user wildcard registration approved: summary, buttons and store count in the prompt, credential in the human store, grant `kind = registration`, `rule = "*"`, next sign-in without a prompt and with the new credential although the human already had one there |
+| E2E-59/exact-later | 1 | A wildcard registration grant does not upgrade a later exact `request` rule: a sign-in naming the human's passkey prompts, a deny signs nothing, `profile check` reports the grant inert (review M1) |
 | E2E-59/deny | 1 | Deny starts the per-key and the profile-wide cooldown: a second unlisted RP is refused without a prompt |
 | E2E-60 | 1 | Cap and daily limit with non-default values of both keys: the refusal comes without a prompt; revoking one grant frees a cap slot |
 | E2E-61 | 1 | Config refusals: `*` `register = "allow"`, missing `acknowledge_global_registration`, isolated `*`; `localhost` never registers through `*` |
@@ -864,7 +865,7 @@ touches the relay or the broker.
   acknowledgements, the wildcard registration count against the cap.
 - `passless agent capabilities` output for the new `AuthorityCredentialScope`.
 - Unit tests outside the core list; the validation-suite additions of §11.2.
-- E2E-58, E2E-59, E2E-59/deny, E2E-60, E2E-61, E2E-62, the E2E-27 update and E2E-42/register; the
+- E2E-58, E2E-59, E2E-59/deny, E2E-59/exact-later, E2E-60, E2E-61, E2E-62, the E2E-27 update and E2E-42/register; the
   harness's notify double accepts the `register_once` key.
 - Phase 1 docs (§12) and the notify-osd manual check in the release checklist.
 

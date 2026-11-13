@@ -146,3 +146,66 @@ scenario({ id: 'E2E-59/deny', exposeModes: ['port', 'pipe'], title: 'wildcard re
   assert.deepEqual(escalationEvents(audit, 'requested').map(e => [e.rp_id, e.rule]), [['rp-a.test', '*'], ['rp-c.test', 'exact']]);
   assert.deepEqual(grantedRuleEvents(audit, 'add').map(e => [e.rp_id, e.rule, e.grant_kind]), [['rp-c.test', 'exact', 'registration']]);
 });
+
+// E2E-59/exact-later (review M1): a grant belongs to the rule it was approved through. The agent registers at rp-a.test
+// through `*` and the human approves it once; the operator then lists rp-a.test with an exact `authenticate = "request"` rule
+// (no pins) and the daemon restarts. The old grant (`rule = "*"`) must not upgrade that exact rule, and above all must not
+// switch the candidates to discovery: a page that names the human's own passkey (alice) must prompt, and a deny must leave
+// it unsigned. `profile check` reports the grant as inert.
+scenario({ id: 'E2E-59/exact-later', exposeModes: ['port', 'pipe'], title: 'a wildcard registration grant does not upgrade a later exact request rule: the human\'s passkey needs a prompt, a deny signs nothing', ci: true, timeoutMs: 240000 }, async ctx => {
+  const stack = await ctx.stack({
+    rps: { a: { host: 'rp-a.test' } },
+    profiles: { coding: { mode: 'same-user', ...WILDCARD } },
+    notify: { script: ['approve:1500', 'deny:1500'] },
+  });
+  const rp = stack.rp.a;
+  await stack.seedHuman(rp, 'alice');
+
+  let b = await stack.open('coding', `${rp.origin}/raw`);
+  assertInterceptionActive(b);
+  await b.page.waitForFunction(() => window.e2e);
+  const reg = await b.page.evaluate(u => window.e2e.register({ username: u, userVerification: 'preferred', timeout: 30000 }), user);
+  assert.equal(reg.ok, true, `the approved registration completes: ${JSON.stringify(reg)}`);
+  assert.equal(stack.notify.notifications().length, 1, 'one prompt: the registration');
+  // The wildcard grant works as before while only `*` governs the site.
+  assertVerifiedAssertion(rp, await authenticate(b.page, {}), { username: user });
+  assert.equal(stack.notify.notifications().length, 1, 'the wildcard grant makes the sign-in prompt-free');
+  assert.equal(grantsStore(stack, 'coding').grants.length, 1);
+
+  // The operator lists the site with an exact rule that asks. No pins, so discovery would find alice.
+  await stack.restartDaemon({
+    coding: {
+      mode: 'same-user',
+      rules: [
+        { rp: 'rp-a.test', authenticate: 'request', register: 'deny' },
+        { rp: '*', authenticate: 'request', register: 'request' },
+      ],
+    },
+  });
+  b = await stack.open('coding', `${rp.origin}/raw`);
+  assertInterceptionActive(b);
+  const signedBefore = rp.authentications.filter(a => a.ok).length;
+  const fingerprint = JSON.stringify(stack.daemon.humanStore().sort((x, y) => x.file.localeCompare(y.file)));
+
+  // A sign-in that names the human's credential prompts (and the human denies): nothing is signed.
+  const denied = await authenticate(b.page, { username: 'alice' });
+  assert.equal(denied.ok, false, `the page named the human's passkey and must not get a silent assertion: ${JSON.stringify(denied)}`);
+  assert.equal(denied.name, 'NotAllowedError');
+  const notes = stack.notify.notifications();
+  assert.equal(notes.length, 2, `the exact rule asked again: ${JSON.stringify(notes.map(n => n.summary))}`);
+  assert.notEqual(notes[1].summary, REGISTER_SUMMARY, 'a sign-in prompt, not a registration one');
+  assert.equal(rp.authentications.filter(a => a.ok).length, signedBefore, 'the RP saw no new assertion');
+  assert.equal(rp.authentications.filter(a => a.ok && a.username === 'alice').length, 0, 'alice never signed in');
+  assert.equal(JSON.stringify(stack.daemon.humanStore().sort((x, y) => x.file.localeCompare(y.file))), fingerprint, 'the store is unchanged');
+
+  const audit = await stack.daemon.audit();
+  const afterRestart = escalationEvents(audit, 'requested').filter(e => e.action === 'authenticate');
+  assert.deepEqual(afterRestart.map(e => [e.rp_id, e.rule]), [['rp-a.test', 'exact']], JSON.stringify(afterRestart));
+  assert.ok(!policyEvents(audit, 'policy.allow').some(e => e.action === 'authenticate' && e.rule === 'rp-a.test'),
+    'no allow was recorded through the exact rule');
+
+  // The doctor says why: the `*` grant is inert at a site an exact rule now governs.
+  const report = await stack.daemon.adminJson('profile', 'check', 'coding');
+  const inert = report.checks.find(c => c.name === 'granted_rules_inert');
+  assert.ok(inert && inert.message.startsWith('warning:') && inert.message.includes('rp-a.test'), JSON.stringify(inert));
+});
