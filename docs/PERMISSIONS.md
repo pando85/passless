@@ -456,10 +456,11 @@ dialog, does not: the request is refused with `CTAP2_ERR_USER_ACTION_TIMEOUT` an
 as they were. Servers without a Deny button (notify-osd 1.0, mako 0.0.0 and quickshell use
 default-action mode) can therefore never spend a retry.
 
-Exception: when the cached PIN hint is stale (a synchronized password store that gained a PIN
-while the daemon still believed there was none), passless refuses UV by policy to force the PIN,
-and every such refusal still spends a retry. The fix needs soft-fido2
-([pando85/soft-fido2#179](https://github.com/pando85/soft-fido2/pull/179)).
+Refusing by policy does not count either. When the cached PIN hint is stale (a synchronized
+password store that gained a PIN while the daemon still believed there was none), passless refuses
+built-in UV to force the PIN. That refusal spends no retry: requests keep answering
+`CTAP2_ERR_PUAT_REQUIRED` while a PIN is set, so the platform can fall back to the PIN, and
+`getPinUvAuthTokenUsingUv` answers `CTAP2_ERR_OPERATION_DENIED`. UV never becomes blocked this way.
 
 **Fix:**
 
