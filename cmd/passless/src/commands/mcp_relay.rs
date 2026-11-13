@@ -587,10 +587,12 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::os::unix::net::UnixStream;
 
+    type Reply = Box<dyn FnMut(&AccessCall) -> ToolResult + Send>;
+
     /// A tool that records its calls and answers from a script.
     struct FakeTool {
         calls: Mutex<Vec<AccessCall>>,
-        reply: Mutex<Box<dyn FnMut(&AccessCall) -> ToolResult + Send>>,
+        reply: Mutex<Reply>,
     }
 
     impl FakeTool {
