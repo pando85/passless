@@ -641,7 +641,7 @@ mod tests {
         assert!(refusals.park(&PrincipalSessionId::new()).is_none());
         drop(slots);
         assert!(refusals.park(&PrincipalSessionId::new()).is_some());
-        assert!(MAX_PARKED_PRE_REQUEST_CALLS < super::super::MAX_WORKERS);
+        const { assert!(MAX_PARKED_PRE_REQUEST_CALLS < super::super::MAX_WORKERS) };
     }
 
     #[test]

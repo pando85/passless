@@ -590,7 +590,7 @@ enum PreStatus {
     /// A registration ceremony adopted the escalation.
     Adopted,
     /// A `register` approval nobody adopted.
-    Token(PreApprovalToken),
+    Token(Box<PreApprovalToken>),
     /// Ended; reported once to the requester, then forgotten.
     Settled(PreRequestState),
 }
@@ -1602,7 +1602,7 @@ impl Inner {
                             "escalation {}: registration pre-approved for {}/{} ({} s)",
                             token.approval.escalation_id, key.1.profile, key.1.rp_id, ttl_secs
                         );
-                        record.status = PreStatus::Token(token);
+                        record.status = PreStatus::Token(Box::new(token));
                         record.settled_at = Some(now);
                         self.pre_requests.insert(key, record);
                         continue;
@@ -2888,7 +2888,7 @@ impl EscalationService {
                 Some(PreRequestRecord {
                     status: PreStatus::Token(token),
                     ..
-                }) => token,
+                }) => *token,
                 _ => return None,
             }
         };
