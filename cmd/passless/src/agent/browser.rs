@@ -1571,28 +1571,32 @@ impl BrowserProcessManager {
 
         // Wait for the entire process group to exit (children like zygote, crashpad, etc.)
         // This prevents orphaned processes from surviving after the main browser exits.
+        //
+        // Note: waitpid(-pgid, ...) can only reap direct children of this process. After the main
+        // browser exits, its children are reparented to init (PID 1), not to this daemon. So this
+        // loop is only effective when the main process hasn't been reaped yet (e.g., SIGKILL timeout).
+        // For complete cleanup, the daemon should be made a subreaper via PR_SET_CHILD_SUBREAPER.
         let group_cleanup_deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let mut status: libc::c_int = 0;
-            // Wait for any process in the process group
+            // Wait for any child process in the process group
             let ret = unsafe { libc::waitpid(-(pgid as i32), &mut status, libc::WNOHANG) };
-            if ret <= 0 {
-                // No more processes in the group (ret == 0 means none exited yet, ret < 0 with ECHILD means all gone)
+            if ret > 0 {
+                // A child process in the group exited, continue waiting for others
+                continue;
+            }
+            if ret < 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if ret < 0 && errno == libc::ECHILD {
-                    break; // All processes in the group have exited
-                }
-                if ret == 0 {
-                    // Some processes still exist but haven't exited yet
-                    if Instant::now() >= group_cleanup_deadline {
-                        break; // Timeout waiting for stragglers
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
+                if errno == libc::ECHILD {
+                    break; // No more children in the group
                 }
                 break; // Other error
             }
-            // A process in the group exited, continue waiting for others
+            // ret == 0: children exist but none have exited yet
+            if Instant::now() >= group_cleanup_deadline {
+                break; // Timeout waiting for stragglers
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
 
         entry.child = None;
@@ -3360,9 +3364,37 @@ fn terminate_failed_browser_spawn(child: &mut Child) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
-    signal_process_group(child.id(), libc::SIGKILL);
+    let pid = child.id();
+    signal_process_group(pid, libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
+
+    // Wait for the entire process group to exit (children like zygote, crashpad, etc.)
+    // This prevents orphaned processes from surviving after a failed browser launch.
+    //
+    // Note: waitpid(-pgid, ...) can only reap direct children of this process. After the main
+    // browser exits, its children are reparented to init (PID 1), not to this daemon. So this
+    // loop is only effective when the main process hasn't been reaped yet.
+    // For complete cleanup, the daemon should be made a subreaper via PR_SET_CHILD_SUBREAPER.
+    let group_cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(-(pid as i32), &mut status, libc::WNOHANG) };
+        if ret > 0 {
+            continue;
+        }
+        if ret < 0 {
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == libc::ECHILD {
+                break;
+            }
+            break;
+        }
+        if Instant::now() >= group_cleanup_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(test)]
