@@ -142,6 +142,36 @@ fn wildcard_registration_advice_is_reported_as_warnings() {
 }
 
 #[test]
+fn pre_request_actions_without_a_request_rule_are_reported_as_warnings() {
+    let fixture = Fixture::new();
+    let path = fixture.write(
+        "",
+        &profile(
+            "pre_request_actions = [\"authenticate\", \"register\"]",
+            "rp_id = \"example.com\"\nauthenticate = \"allow\"",
+        ),
+    );
+    let checked = check(&load(&path)).unwrap();
+    assert_eq!(checked.warnings.len(), 2, "{checked:?}");
+    assert!(checked.warnings.iter().any(|w| w.contains(
+        "pre_request_actions lists \"register\" but no rule has register = \"request\""
+    )));
+    assert!(checked.warnings.iter().any(|w| w.contains(
+        "pre_request_actions lists \"authenticate\" but no rule has authenticate = \"request\""
+    )));
+
+    // A duplicate is an error.
+    let path = fixture.write(
+        "",
+        &profile(
+            "pre_request_actions = [\"authenticate\", \"authenticate\"]",
+            "rp_id = \"example.com\"\nauthenticate = \"request\"",
+        ),
+    );
+    assert!(error_of(&path).contains("pre_request_actions lists 'authenticate' twice"));
+}
+
+#[test]
 fn the_acknowledgements_are_required() {
     let fixture = Fixture::new();
     let wildcard = fixture.write("", &profile("", "rp_id = \"*\"\nauthenticate = \"allow\""));

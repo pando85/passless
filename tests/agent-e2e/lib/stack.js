@@ -12,8 +12,9 @@ const { startNotifyDouble } = require('./notify-double');
 const { RpServer } = require('./rp-server');
 const { ensureTestTls, rpBrowserArgs } = require('./tls');
 const { variantArgs, connect, waitForExtensionWorker, launchPlain } = require('./browser');
-const { startAdapter } = require('./adapters');
-const { openPipe } = require('./pipe-driver');
+const { startAdapter, startPrincipalShell } = require('./adapters');
+const { openPipe, serveLines } = require('./pipe-driver');
+const { sessionRunner, ownedSessionScript } = require('./agent-session');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -156,6 +157,46 @@ async function createStack(label, variant, o) {
     b.blankPages = b.context.pages().filter(p => p !== b.page);
     await b.page.waitForLoadState('load');
     await b.page.bringToFront();
+    return b;
+  };
+
+  /**
+   * `stack.open` through a principal session of an agent's own, which owns the browser: the shape a `register` pre-request
+   * needs (its one-use approval binds to the session that owns the browser, ADR 0014 amendment section 2.3). The same `b` as
+   * `stack.open`, plus `b.session`: `session.cli(args)` and `session.requestAccess(rp, opts)` run `passless agent ...` inside
+   * that session (lib/agent-session.js). Pipe mode is `stack.open` (it already is such a session); port mode starts
+   * `passless agent run` that runs `agent browser --env --wait` and attaches Playwright to the endpoint it printed.
+   */
+  stack.openOwned = async (profile, url, { startUrl = true } = {}) => {
+    if (stack.exposeOf(profile) === 'pipe') {
+      const b = await stack.open(profile, url, { startUrl });
+      b.session = sessionRunner(stack, profile, b.pipe.dir);
+      return b;
+    }
+    const dir = fs.mkdtempSync(path.join(env.dirs.work, 'owned-agent-'));
+    const agent = startPrincipalShell(stack, profile, [ownedSessionScript(dir, profile, startUrl ? url : null, 'port'), ...serveLines].join('\n'));
+    stack.pipeAgents.push(agent);
+    try { await agent.waitForLine(/^AGENT-READY$/); } catch (e) { await agent.close(); throw e; }
+    const read = name => fs.readFileSync(path.join(dir, name), 'utf8');
+    if (read('browser.rc').trim() !== '0') throw new Error(`agent browser failed for ${profile}: ${read('browser.out').trim()}`);
+    const endpoint = (/^PASSLESS_CDP_URL=(\S+)$/m.exec(read('browser.out')) || [])[1];
+    if (!endpoint) throw new Error(`agent browser --env printed no endpoint: ${read('browser.out')}`);
+    const { browser, context } = await connect(endpoint);
+    const b = { lease: JSON.parse(read('status.json')).data, browser, context, cdpUrl: endpoint, profile, agent };
+    stack.browsers.push(b);
+    b.extensionWorker = await waitForExtensionWorker(b.browser);
+    if (startUrl) {
+      b.page = await waitForPage(b.context, url);
+    } else {
+      const pages = b.context.pages();
+      if (pages.length !== 1) throw new Error(`expected exactly the blank tab, got: ${pages.map(p => p.url()).join(', ')}`);
+      b.page = pages[0];
+      await b.page.goto(url);
+    }
+    b.blankPages = b.context.pages().filter(p => p !== b.page);
+    await b.page.waitForLoadState('load');
+    await b.page.bringToFront();
+    b.session = sessionRunner(stack, profile, dir);
     return b;
   };
 

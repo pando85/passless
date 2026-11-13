@@ -1477,6 +1477,9 @@ pub enum AgentCommand {
         /// The adapter the printed entry runs
         #[arg(long, value_enum, default_value_t = McpAdapterKind::Playwright, requires = "print_config")]
         server: McpAdapterKind,
+        /// Put `--with-access-tool` in the printed Playwright entry (see `agent mcp playwright --help`)
+        #[arg(long, requires = "print_config")]
+        with_access_tool: bool,
         #[command(subcommand)]
         adapter: Option<McpAdapter>,
     },
@@ -1509,6 +1512,43 @@ pub enum AgentCommand {
         #[arg(long, value_name = "URL")]
         url: Option<String>,
     },
+    /// Ask the human for passkey access to a site before navigating there
+    ///
+    /// Raises the same fixed system prompt a page-triggered `request` rule would, naming only the
+    /// site and the action, without a page: use it when a site will need passkey sign-in (or, with
+    /// --register, registration). The profile must list the action in `pre_request_actions` and the
+    /// live rules must resolve the site to `request`. Approval does not sign in for you: navigate
+    /// and use the site's normal WebAuthn flow afterwards. `pending` means the human has not
+    /// decided yet: run the same command again with the same arguments.
+    ///
+    /// Inside a principal session (`agent run`) it uses that session. Outside one it runs itself in
+    /// a fresh principal session, for `authenticate` only. `--register` needs the session that owns
+    /// the browser, because its one-use approval (10 minutes) is bound to that session.
+    ///
+    /// Every answer is a normal result and exits 0; read the `state` (`already_allowed`,
+    /// `pending`, `approved`, `denied`, `expired`, `cooldown`, `rate_limited`, `not_requestable`,
+    /// `not_enabled`, `unavailable`, `busy`).
+    RequestAccess {
+        /// The site's RP ID, a domain such as example.com
+        #[arg(value_name = "RP_ID")]
+        rp_id: String,
+        /// Ask for a one-time registration approval instead of a sign-in grant
+        #[arg(long)]
+        register: bool,
+        /// A short reason, recorded in the audit log only (sanitized, at most 200 bytes, marked
+        /// agent-supplied). It is NEVER shown to the human: explain in your own chat instead
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// Seconds to wait for the human's decision before answering `pending` (0 to 120)
+        #[arg(long, value_name = "SECS", default_value_t = 30, value_parser = clap::value_parser!(u32).range(0..=120))]
+        wait: u32,
+        /// Print the answer as one JSON object instead of text
+        #[arg(long)]
+        json: bool,
+        /// Internal: set when this command re-ran itself in a fresh principal session
+        #[arg(long, hide = true)]
+        fresh_session: bool,
+    },
     /// Launch a detached principal session
     Run {
         /// Profile to launch
@@ -1535,6 +1575,15 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Also expose the `passless_request_access` tool, which asks the human for passkey access
+        /// to a site before the agent navigates there (opt-in)
+        ///
+        /// The wrapper then relays the MCP stdio instead of handing it to Playwright MCP, adding
+        /// that one tool to `tools/list`; every other message passes through byte for byte. The
+        /// profile must list the action in `pre_request_actions`. The tool's note is recorded in
+        /// the audit log only and is never shown to the human.
+        #[arg(long)]
+        with_access_tool: bool,
         /// Print a ready-to-paste MCP server entry for a client instead of running the server
         #[arg(long, value_enum, value_name = "CLIENT")]
         print_config: Option<McpConfigTarget>,
@@ -1598,6 +1647,10 @@ pub enum McpAdapter {
         /// `PATH`, else this executable
         #[arg(long, value_name = "ABS")]
         passless_path: Option<std::path::PathBuf>,
+        /// Write `--with-access-tool` into the Playwright entries it rewrites or adds (an entry
+        /// that already runs through passless is not changed)
+        #[arg(long)]
+        with_access_tool: bool,
     },
 }
 
@@ -1953,6 +2006,153 @@ mod tests {
 
     #[cfg(feature = "agent")]
     #[test]
+    fn test_agent_request_access_parses() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "--profile",
+            "p",
+            "request-access",
+            "example.org",
+            "--register",
+            "--note",
+            "why",
+            "--wait",
+            "120",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Commands::Agent {
+            profile,
+            action:
+                AgentCommand::RequestAccess {
+                    rp_id,
+                    register,
+                    note,
+                    wait,
+                    json,
+                    fresh_session,
+                },
+            ..
+        }) = args.command
+        else {
+            panic!("not agent request-access");
+        };
+        assert_eq!(profile.as_deref(), Some("p"));
+        assert_eq!(rp_id, "example.org");
+        assert!(register && json && !fresh_session);
+        assert_eq!(note.as_deref(), Some("why"));
+        assert_eq!(wait, 120);
+
+        // The defaults: a sign-in request that waits 30 s.
+        let args =
+            Args::try_parse_from(["passless", "agent", "request-access", "example.org"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::RequestAccess {
+                    register: false,
+                    note: None,
+                    wait: 30,
+                    json: false,
+                    ..
+                },
+                ..
+            })
+        ));
+        // The wait is bounded like the protocol's `wait_ms`, and the RP ID is required.
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "request-access",
+                "a.b",
+                "--wait",
+                "121"
+            ])
+            .is_err()
+        );
+        assert!(Args::try_parse_from(["passless", "agent", "request-access"]).is_err());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_mcp_playwright_with_access_tool_parses() {
+        let on = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "p",
+            "--with-access-tool",
+        ])
+        .unwrap();
+        assert!(matches!(
+            on.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::Playwright {
+                        with_access_tool: true,
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            })
+        ));
+        // Off unless asked, and only the Playwright adapter has it.
+        let off =
+            Args::try_parse_from(["passless", "agent", "mcp", "playwright", "--profile", "p"])
+                .unwrap();
+        assert!(matches!(
+            off.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::Playwright {
+                        with_access_tool: false,
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "mcp",
+                "chrome-devtools",
+                "--with-access-tool"
+            ])
+            .is_err()
+        );
+        // The top-level print form takes it too, and only with --print-config.
+        let print = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "--print-config",
+            "claude-code",
+            "--with-access-tool",
+        ])
+        .unwrap();
+        assert!(matches!(
+            print.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Mcp {
+                    with_access_tool: true,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(Args::try_parse_from(["passless", "agent", "mcp", "--with-access-tool"]).is_err());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
     fn test_agent_browser_parses() {
         let args = Args::try_parse_from([
             "passless",
@@ -2143,6 +2343,7 @@ mod tests {
                         yes: false,
                         skill: false,
                         passless_path: None,
+                        with_access_tool: false,
                     }),
                     ..
                 },

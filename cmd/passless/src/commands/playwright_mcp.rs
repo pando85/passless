@@ -2,13 +2,18 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 
-use passless_core::agent::protocol::{PrincipalRequest, PrincipalResponse};
+use passless_core::agent::protocol::{
+    ErrorCode, PrincipalRequest, PrincipalResponse, ProtocolError, RecommendedAction,
+};
 use passless_core::agent::{AgentConfig, BrowserScope};
 use passless_core::{Error, Result};
 
 use crate::agent::cdp_bootstrap::CdpBootstrap;
 use crate::agent::client::{ClientError, PrincipalClient, resolve_runtime_base};
+
+use super::mcp_relay::{AccessCall, AccessTool, ToolResult};
 
 /// How often the adapters check that the browser they were given is still there.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -26,7 +31,7 @@ pub fn try_run_as_principal(
 ) -> Result<Option<()>> {
     let base = resolve_runtime_base().map_err(client_error)?;
     match PrincipalClient::connect_launched(&base, profile) {
-        Ok(_) => run_as_principal(profile, url, command).map(Some),
+        Ok(_) => run_as_principal(profile, url, command, false).map(Some),
         Err(ClientError::NoControlFd) => Ok(None),
         Err(e) => Err(client_error(e)),
     }
@@ -36,6 +41,7 @@ pub(super) fn run_as_principal(
     profile: &str,
     url: Option<&str>,
     command: &[PathBuf],
+    with_access_tool: bool,
 ) -> Result<()> {
     let executable = check_command(command)?;
     let token = bootstrap_token()?;
@@ -48,9 +54,51 @@ pub(super) fn run_as_principal(
     .map_err(|e| Error::Other(e.to_string()))?;
 
     let child_command = server_command(profile, command, &bootstrap.endpoint(), &token, true);
-    let result = supervise(child_command, "Playwright MCP", executable);
+    // This process is the principal session: with the opt-in flag it relays the client's stdio and
+    // asks the daemon itself (the capability never reaches the server, which has none).
+    let tool: Option<Arc<dyn AccessTool>> = with_access_tool.then(|| {
+        Arc::new(SessionTool {
+            profile: profile.to_string(),
+        }) as Arc<dyn AccessTool>
+    });
+    let result = supervise_watching(
+        child_command,
+        "Playwright MCP",
+        executable,
+        &mut || true,
+        tool,
+    );
     drop(bootstrap);
     result
+}
+
+/// `passless_request_access` through the principal session this process runs in.
+struct SessionTool {
+    profile: String,
+}
+
+impl AccessTool for SessionTool {
+    fn call(&self, call: AccessCall) -> ToolResult {
+        let failed = |message: String| {
+            ProtocolError::new(ErrorCode::Internal, message, RecommendedAction::Retry)
+        };
+        let base = resolve_runtime_base().map_err(|e| failed(e.to_string()))?;
+        let mut client = PrincipalClient::connect_launched(&base, &self.profile)
+            .map_err(|e| failed(e.to_string()))?;
+        match client.request(PrincipalRequest::RequestAccess {
+            rp_id: call.rp_id,
+            action: call.action,
+            note: call.note,
+            wait_ms: Some(call.wait_ms),
+        }) {
+            Ok(PrincipalResponse::AccessRequest(status)) => Ok(status),
+            Ok(_) => Err(failed(
+                "agent returned an unexpected RequestAccess response".to_string(),
+            )),
+            Err(ClientError::Protocol(error)) => Err(error),
+            Err(e) => Err(failed(e.to_string())),
+        }
+    }
 }
 
 /// The Playwright MCP command line must be an absolute executable and its arguments.
@@ -131,25 +179,23 @@ fn playwright_command(
     child
 }
 
-/// Run an MCP server child to completion; its exit status is ours.
-pub(super) fn supervise(
-    child_command: Command,
-    label: &str,
-    executable: &std::path::Path,
-) -> Result<()> {
-    supervise_watching(child_command, label, executable, &mut || true)
-}
-
-/// [`supervise`], also polling `browser_alive` every couple of seconds: when it reports the
-/// browser gone, the child is stopped and an error returned, so that an MCP client restarts the
-/// adapter and gets a fresh endpoint.
+/// Run an MCP server child to completion (its exit status is ours), polling `browser_alive`
+/// every couple of seconds: when it reports the browser gone, the child is stopped and an error
+/// returned, so that an MCP client restarts the adapter and gets a fresh endpoint. With `tool`
+/// the server's stdio goes through the access-tool relay ([`super::mcp_relay`]).
 pub(super) fn supervise_watching(
     mut child_command: Command,
     label: &str,
     executable: &std::path::Path,
     browser_alive: &mut dyn FnMut() -> bool,
+    tool: Option<Arc<dyn AccessTool>>,
 ) -> Result<()> {
-    let mut child = child_command.spawn().map_err(|e| {
+    let spawned = match tool {
+        Some(tool) => super::mcp_relay::spawn_relayed(&mut child_command, tool)
+            .map(|(child, handle)| (child, Some(handle))),
+        None => child_command.spawn().map(|child| (child, None)),
+    };
+    let (mut child, relay) = spawned.map_err(|e| {
         Error::Other(format!(
             "failed to start {label} executable '{}': {e}",
             executable.display()
@@ -177,6 +223,10 @@ pub(super) fn supervise_watching(
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
 
+    // The server's last output still reaches the client.
+    if let Some(relay) = relay {
+        relay.finish();
+    }
     exit_result(label, status)
 }
 
@@ -334,6 +384,7 @@ mod tests {
             "test MCP",
             std::path::Path::new("/bin/sleep"),
             &mut || false,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -350,6 +401,7 @@ mod tests {
             "test MCP",
             std::path::Path::new("/bin/true"),
             &mut || true,
+            None,
         )
         .unwrap();
     }

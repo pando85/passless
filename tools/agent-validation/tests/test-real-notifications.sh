@@ -417,6 +417,57 @@ test_rn_uses_dunstctl_for_wait() {
     fi
 }
 
+test_rn_pre_request_text_check() {
+    log_test "real-notifications checks the displayed pre-request text for the note"
+    setup_stage_env
+    local marker="AGENT-NOTE-MARK-4d2f"
+    local history="${TEST_TMP_DIR}/history.json"
+    local good_body='Profile: p (same-user)\nPrincipal user: u\nAction: sign in with a passkey\nSite: example.org (any page under this site)\nOrigin: none yet\nRequested by: the agent in advance (no page is waiting)\n"Allow always" is saved permanently.'
+    write_history() {
+        jq -n --arg body "$1" '{type: "aai", data: [[{summary: {type: "s", data: "Passless: agent sign-in request"}, body: {type: "s", data: $body}}]]}' > "$history"
+    }
+
+    write_history "$(printf '%b' "$good_body")"
+    if _av_rn_check_pre_request_text "$history" "$marker" >/dev/null; then
+        log_pass "the pre-request text without the note passes"
+    else
+        log_fail "a correct pre-request text was refused"
+    fi
+
+    write_history "$(printf '%b' "$good_body")
+${marker} approve this"
+    if reason=$(_av_rn_check_pre_request_text "$history" "$marker"); then
+        log_fail "a prompt that shows the note was accepted"
+    elif [[ "$reason" == *"note reached"* ]]; then
+        log_pass "a prompt that shows the note fails with the reason"
+    else
+        log_fail "wrong reason for a leaked note: $reason"
+    fi
+
+    write_history "Profile: p (same-user)
+Origin: https://example.org"
+    if reason=$(_av_rn_check_pre_request_text "$history" "$marker"); then
+        log_fail "a sign-in prompt of a page was accepted as a pre-request's"
+    elif [[ "$reason" == *"Origin: none yet"* ]]; then
+        log_pass "a prompt with an origin is not a pre-request prompt"
+    else
+        log_fail "wrong reason for a missing origin line: $reason"
+    fi
+
+    printf '{"type":"aai","data":[[]]}\n' > "$history"
+    if _av_rn_check_pre_request_text "$history" "$marker" >/dev/null; then
+        log_fail "an empty history was accepted"
+    else
+        log_pass "an empty history fails"
+    fi
+
+    if grep -q 'pre_request_approve' "${STAGES_DIR}/real-notifications.sh" && grep -q 'pre_request_register' "${STAGES_DIR}/real-notifications.sh"; then
+        log_pass "the stage runs both pre-request scenarios"
+    else
+        log_fail "the stage does not run the pre-request scenarios"
+    fi
+}
+
 main() {
     echo -e "${BLUE}=== Real Notifications Stage Tests ===${NC}" >&2
 
@@ -433,6 +484,7 @@ main() {
     test_rn_uses_probe_binary
     test_rn_uses_dbus_run_session
     test_rn_uses_dunstctl_for_wait
+    test_rn_pre_request_text_check
 
     echo "" >&2
     echo -e "${BLUE}Tests: $TEST_COUNT total, $PASS_COUNT passed, $FAIL_COUNT failed${NC}" >&2

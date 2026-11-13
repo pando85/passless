@@ -7,8 +7,8 @@
 - **Amended:** 2026-11-11, with maintainer-resolved decisions and the results of the browser and
   environment spikes (see [History](#20-history)); 2026-11-12, with
   [pins with the wildcard and registration at unlisted sites](0014-agent-delegation-amendment-new-sites.md)
-  (Phase 1, folded into §6.3, §6.4, §8, §10, §12, §14, §15, §17 and §19; agent pre-requests are
-  Phase 2 and not part of this text yet)
+  (Phase 1, folded into §6.3, §6.4, §8, §10, §12, §14, §15, §17 and §19), and with the same
+  amendment's Phase 2, agent pre-requests (folded into §8.1, §8.3, §8.4, §9, §12, §14, §18 and §19)
 
 This ADR is the single source of truth for letting AI and browser agents authenticate with
 passkeys through the Passless daemon. It replaces ADRs 0001, 0002 and 0004–0012 and the agent
@@ -624,6 +624,66 @@ chose `allow`.
    cooldown applies to that key. A queued entry is dequeued when its last waiter leaves, and an
    active prompt with zero waiters is withdrawn immediately.
 
+**Pre-requests (amendment, Phase 2).** A principal may ask for an escalation before it navigates:
+`PrincipalRequest::RequestAccess { rp_id, action, note, wait_ms }`, authenticated like every principal
+request (launcher capability, peer credentials, process identity; no bearer, no admin socket); the
+daemon identifies the requesting principal session from the connection. It is opt-in per profile
+(`pre_request_actions`, default `[]`, `authenticate` and `register`). A pre-request can only lead to an
+outcome that a ceremony-time `request` for the same `(profile, rp_id, action)` could lead to, and only
+where the live configuration resolves that key to `request`; it never widens policy, approves nothing
+and never reveals whether the human holds a credential.
+
+- **Order.** The action is listed in the profile's `pre_request_actions` (`not_enabled`); the RP ID
+  validates; the key resolves against the live rules and grants (`allow` is `already_allowed`, `deny`
+  or no rule `not_requestable`, neither prompts; only `request` continues); a `register` must come from
+  a principal session that owns the browser its ceremonies run in or will own the next one
+  (`not_requestable` otherwise); then the ceremony-time pre-checks in their usual order (cooldown, the
+  wildcard registration limits, grant cap and store, notification bus, queue, waiter caps), with the
+  pre-request occupying a waiter slot of its session, and per principal session one pending
+  pre-request and at most six per 10 minutes, and per profile, across its principal sessions (the
+  out-of-session CLI starts a fresh one per call), at most three pending and twelve per 10 minutes
+  (`rate_limited`). Refusals are audited as `policy.deny`
+  (`not_requestable`, `pre_request_rate_limited`, `pre_request_not_enabled`) and coalesced like any.
+- **`authenticate`.** Creates or joins the escalation for the key; ceremonies that arrive meanwhile join
+  it as usual. Approval persists the grant a ceremony-time approval would, with `source = "pre_request"`
+  and no origin. Deny or expiry starts the same per-key cooldown. A pending pre-request lives up to 10
+  minutes, or `agents.escalation_timeout` if shorter, and is withdrawn when its principal session ends.
+  Repeating the same request from the same session returns the state of the pending escalation (this is
+  how a client polls).
+- **`register`.** Raises a non-joinable escalation bound to `(profile, rp_id, principal session)`. The
+  first registration ceremony of a bearer session owned by that principal session at that RP adopts it
+  and waits on it as its creating ceremony; any other registration ceremony for the key is
+  `escalation_busy`. An approval that no ceremony has adopted becomes a **pre-approval token**: in
+  memory only, never persisted, not `Clone`, bound to the profile, the normalized RP ID, the principal
+  session, the revocation epoch and the RP's revoke token, valid 10 minutes at most and never past the
+  principal session's own deadline. The first registration ceremony that resolves to `request` at
+  exactly that RP from a bearer session of that principal session consumes it, after the option checks
+  (an unsupported request does not burn it) and before its replay key; from there the path is §8.3
+  unchanged (budget claim after approval, the pre-key-use re-check that the rule still resolves to
+  `request`, the grant persisted after the write). It is dropped on its TTL, the principal session's end,
+  lease revocation, a revocation-epoch bump, `grants revoke` for the RP and `grants clear`
+  (`pre_approval.expired` with `ttl`, `session_end`, `lease_revoked`, `policy_reload`, `grant_revoked`),
+  and a ceremony that fails after consuming it does not get it back.
+- **The prompt** is the usual one, with daemon-derived lines only: a sign-in prompt adds `Requested by:
+  the agent in advance (no page is waiting)` and its origin reads `Origin: none yet`; a registration
+  prompt says the same in its origin and requester lines. The actions and the nonced keys are unchanged.
+- **Agent-supplied text.** The note (`--note`, the MCP tool's `note`) is never shown in a prompt: the
+  prompt is the one interface the agent cannot write to, a label such as "agent-supplied" does not
+  neutralize persuasive text in it, and the agent has its own chat with the human. It is kept in the
+  audit log only, as `agent_note` on the pre-request's `escalation.requested`, sanitized with the
+  prompt's line rules and cut to 200 bytes, and labelled agent-supplied wherever `agent-admin` shows it
+  (the audit export names the field).
+- **Surfaces.** `passless agent request-access <rp_id> [--register] [--note T] [--wait S] [--json]`:
+  inside a principal session it uses that session; outside one it re-runs itself in a fresh principal
+  session for `authenticate`, and `--register` outside the session that owns the browser is an error. The
+  opt-in `passless agent mcp playwright --with-access-tool` adds one MCP tool, `passless_request_access`,
+  answered by the wrapper through its broker (broker protocol 2: `RequestAccess` maps one to one to the
+  principal request on the broker's own session, which owns the browser, so tokens bind correctly); the
+  wrapper relays the client's stdio byte for byte except the `tools/list` first page and that tool's
+  `tools/call`, and without the flag the server inherits the stdio. Every state is a normal result;
+  `isError` is only for a malformed call or a broken link. There is no standalone MCP server: it would be a
+  different principal session from the browser's.
+
 ### 8.2 Integrity and abuse limits
 
 - Approval comes only from the notification server's verified D-Bus sender: the prompt
@@ -693,7 +753,9 @@ raises its own escalation, and a concurrent duplicate for the same `(profile, rp
 Approving a registration escalation issues a one-use token that is bound to the creating ceremony;
 no other waiter can claim it. It permits exactly one registration, for exactly that RP, within that
 ceremony. The approval binds to that ceremony's session and is not a separate transferable
-credential. It does not persist `register = allow`. On successful creation it persists
+credential. (A registration pre-request, §8.1, is the one case where the approval comes before the
+ceremony: it is adopted by the first ceremony of the bound principal session's browser, or waits as a
+pre-approval token that only that session's browser can consume, once.) It does not persist `register = allow`. On successful creation it persists
 `authenticate = allow` for that exact RP with `kind = "registration"`, the matched rule (`exact`
 or `*`) and the new credential reference, and that credential reference joins the pinned set for the
 RP (§10.1). If registration fails after approval, nothing is persisted. The persisted grant
@@ -727,8 +789,16 @@ credential is being written. Exact-rule registrations are unaffected.
   user unit and to `/var/lib/passless-agent` (systemd `StateDirectory=`) in the system unit. The
   daemon never writes the operator's config file.
 - **Entry:** `rp_id` (exact), `action` (`authenticate`), `kind` (`escalation` or
-  `registration`), `granted_at`, approving `request_id`, origin at request time, and the
-  permitting config rule (`exact` or `*`).
+  `registration`), `granted_at`, approving `request_id`, origin at request time (absent for an
+  `authenticate` pre-request, which has no page), the permitting config rule (`exact` or `*`) and
+  `source` (`ceremony`, the default, or `pre_request`).
+- **Version.** The file is `version = 1` while every entry has an origin and `source = "ceremony"`,
+  and `version = 2` otherwise (amendment, Phase 2): the writer writes the lowest version that
+  represents its entries, so a store is rewritten as version 2 only once a pre-request grant exists
+  and a downgrade works until then. A version 1 file loads as version 2 with `source = "ceremony"`. An
+  older daemon that meets a version 2 file disables grants for that profile (unknown version, fail
+  closed) and `passless doctor` reports it. `grants_digest` covers `source`. Pre-approval tokens are
+  never persisted.
 - **Write:** temporary file, fsync, rename, fsync directory. A failed write fails the approval and
   the ceremony is denied. The store directory is opened once as a pinned handle (`safe_fs::Dir`:
   `openat` with `O_NOFOLLOW` below its parent, owner and mode checked on the descriptor), and the
@@ -767,8 +837,8 @@ credential is being written. Exact-rule registrations are unaffected.
 - **Cap:** `max_granted_rules` per profile, default 64; above it requests are denied. Wildcard
   registration grants (`kind = "registration"`, `rule = "*"`) also count against
   `max_wildcard_registrations` (§6.3); revoking one frees a slot, and the credential stays until
-  `agent-admin credential delete`. The format needs no change: `agent-admin grants list` shows each
-  grant's `rule` (`exact` or `*`) and `kind`.
+  `agent-admin credential delete`. `agent-admin grants list` shows each grant's `rule` (`exact` or `*`),
+  `kind` and `source`, and an empty origin as `-`.
 
 In shared-UID deployments the agent can write this file as it can write the config; that is inside
 the shared-UID trust boundary (§13). In distinct-UID deployments it must not be writable by the
@@ -810,7 +880,11 @@ The normative model is a bearer session, not a per-operation state machine.
 - **Revocation.** Browser exit, lease revocation, principal death, TTL expiry, config reload and
   grant revocation revoke both sign and registration bearers. Registration authority on the
   extension path is the session bearer itself; there is no separate registration grant (§10.3).
-  A registration escalation binds to the waiting ceremony's session.
+  A registration escalation binds to the waiting ceremony's session; a pre-approval token (§8.1) binds
+  to the principal session that owns the browser and dies with it: with the session, its lease, the
+  revocation epoch, or a grant revocation for its RP. Under `browser_scope = "profile"` any session
+  attached to the shared browser acts as its owner and can use the owner's token; only
+  `browser_scope = "session"` keeps one agent's token from another's browser.
 - **In flight.** An operation whose session or generation is no longer valid fails before key
   use. An additive grant (§8.4) does not count as a change.
 
@@ -999,6 +1073,19 @@ chosen (§10.1). `policy.deny` gains the reasons `wildcard_registration_cap`,
 registration carry `rule = "*"` and `action = "register"`. Readers accept every version and fields
 added later default when absent; the hash chain is unaffected.
 
+*Amendment (schema version 5, pre-requests).* Operation records add `approval_source`: `ceremony` or
+`pre_request` for an operation that ran on an escalation approval or a pre-approval token (a ceremony
+that joined or adopted a pre-request, a registration that consumed a token), null otherwise.
+Escalation records add `source` (`ceremony` or `pre_request`), `principal_session_id_hash` (a hash of the
+principal session that asked, or that owns the page's browser; never the session ID) and `agent_note`
+(sanitized, at most 200 bytes, only on a pre-request's `escalation.requested`, null elsewhere), and
+`origin` may be null for a pre-request. New kinds `pre_approval.issued` (with `ttl_secs`),
+`pre_approval.consumed` (with the consuming `request_id`) and `pre_approval.expired` (`reason`: `ttl`,
+`session_end`, `lease_revoked`, `policy_reload`, `grant_revoked`). New `policy.deny` reasons
+`not_requestable`, `pre_request_rate_limited` and `pre_request_not_enabled`, coalesced like every
+refusal. The audit export labels `agent_note` as agent-supplied (`agent_supplied` in the JSON rows and
+the CSV column), without changing the records or the chain.
+
 **Coalesced refusals** (final security review M2). Every record is fsynced, and a page can loop a
 refused request, so refusals are coalesced per `(session, RP ID, action, reason)` rather than
 written one for one. The first 16 of a key in a 60 second window are written in full, as above.
@@ -1134,7 +1221,10 @@ shared-UID case.
 9. Every operation resolves through exactly one rule. Exact rules beat granted rules, which beat
    wildcard rules. A wildcard match never uses the profile pins (`credential_refs`); an exact match
    always does when they are set.
-10. Only an explicit `request` rule can escalate. `deny` and unlisted RPs never prompt.
+10. Only an explicit `request` rule can escalate: a ceremony that resolves to `request`, or a
+    pre-request (§8.1) for a key that the live configuration also resolves to `request`. `deny` and
+    unlisted RPs never prompt, and a pre-request from a session that cannot run the ceremony is
+    refused, not issued.
 11. Escalations are approved only through the verified notification sender, never by the agent,
     extension, page, API or automatic interaction mode.
 12. Granted rules are exact-RP, additive only, persisted atomically, included in the digest, and
@@ -1164,9 +1254,15 @@ shared-UID case.
 
 26. A wildcard match never uses the profile pins: it discovers within the RP, or uses only the
     credentials registered there when there are any (§10.1).
+27. A pre-request never yields an outcome that a ceremony-time `request` for the same key could not,
+    never approves anything itself, and never reveals whether the human holds a credential. Its
+    pre-approval token is in memory only, single-use, bound to one principal session, RP and revocation
+    epoch, and never outlives any of them (§8.1).
+28. No agent-supplied text is shown in a prompt. The agent's note goes to the audit log only (§8.1,
+    §12).
 
 Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 replace its items 7–14;
-24 and 25 are new, and 26 comes from the new-site amendment.
+24 and 25 are new, 26 comes from the new-site amendment and 27 and 28 from its pre-request phase.
 
 **Invariant 23 and panics.** Same-user ceremonies hold the human operation lock and the shared
 credential storage for their key-use section (LOCKING.md rule 4). Release builds keep
@@ -1223,6 +1319,7 @@ reservation (§12).
 | Port-mode CDP reached by another local user | Loopback only; pipe mode for untrusted peers | Accepted in port mode |
 | Agent copies browser session material | CDP pipe mediation; short leases | Lease expiry is not RP-side revocation |
 | Agent suppresses audit | Audit outside principal; durable pre-write gate | Host root can rewrite local audit |
+| A prompt-injected agent asks in advance, or writes persuasion into its request (§8.1) | A pre-request raises only a prompt a page could raise, for a key the live rules resolve to `request`, behind `pre_request_actions`; one pending and six per 10 minutes per session, three pending and twelve per 10 minutes per profile across sessions, the shared cooldown and caps; the prompt text is daemon-derived and never shows the agent's note, which is audit-only and labelled agent-supplied; a `register` approval is one-use, in memory and bound to one principal session | A same-UID agent can still approve its own prompt (§8.2); an agent can cost the human up to six prompts per session and twelve per profile per 10 minutes, and the pre-request's site name is the agent's choice; under `browser_scope = "profile"` any session attached to the shared browser acts as its owner and can use the owner's pre-approval |
 
 ## 16. Consequences
 
@@ -1281,6 +1378,9 @@ sessions; external audit checkpoints; RP-integrated session revocation; remote p
   filter).
 - Granted-rules store: `cmd/passless/src/agent/granted_rules.rs`; principal identity and the
   admin authority token: `agent/identity.rs`.
+- Pre-requests: `agent/runtime/pre_request.rs` (the principal request), `agent/escalation.rs` (the
+  waiter, adoption and the pre-approval token), `commands/agent.rs` (`request-access`),
+  `commands/mcp_session.rs` and `commands/mcp_relay.rs` (broker protocol 2 and the opt-in stdio relay).
 - Configuration and policy digest: `passless-core/src/agent/config.rs`, `policy.rs`.
 - Extension: `cmd/passless/assets/agent-extension/`; native host: `cmd/passless/src/bin/sign-proxy.rs`.
 - Systemd units: `contrib/systemd/passless-agent.service`, `contrib/systemd/passless.service`.
@@ -1311,10 +1411,11 @@ References are `file:line` at commit `130eaa5`.
 | Operator-minted enrollment grants (#411) | **Done (P3).** `RegistrationGrantRegistry`, the `RequestRegistration` admin request, its CLI and handler are removed; registration authority is the exact-RP `register = "allow"` rule, or one human-approved registration through `register = "request"` (§8.3, P7), on an exact rule or on the acknowledged same-user `*` rule (new-site amendment, Phase 1); `register = "allow"` on `*` stays invalid | — |
 | Isolated UHID route | **Done (P3).** `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, `interaction.rs`, the endpoint wiring in `runtime.rs`, the agent UHID doctor check and the agent udev rule are removed; a legacy `[device]` key is warned about and ignored (R6). `agent/storage.rs` (ceremony-scoped storage views) is removed too. The `passless-uhid` crate and `tools/agent-uhid-feasibility` were removed in P11: the controlled RP, the lab udev policy and the permission probes moved to `tools/agent-validation`. The principal intent protocol was removed in P7. A cleanup after P11 removed the leftovers: `passless agent endpoint-status` and the `endpoint_id` plumbing (grants, leases, the browser manifest, the profile report), the principal delegation protocol (`passless agent delegation`, the `RequestDelegation`, `ShowDelegation`, `WaitDelegation`, `CancelDelegation` and `SignAssertion` principal requests, the pending-request registry in `policy_engine.rs`), `ErrorCode::InteractionRequired` and the legacy `Capabilities` principal request with its `registration_allowed` field (`passless agent capabilities` prints the `Authority` response, which carries each RP's `authenticate` and `register` rule). The `endpoint.*` and `intent.*` audit record kinds stay readable for old logs | — |
 | Principal digest at signing | **Done (P5).** The session records the principal digest; sign and registration deny `principal_mismatch` when it differs from the session grant's | — |
-| Policy digest | **Done (P4, P7; version 6 in the new-site amendment).** Version 6 adds `acknowledge_global_registration`, `max_wildcard_registrations` and `wildcard_registration_prompts_per_day` to what version 5 covers: version 5 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits, the browser fields, `max_granted_rules` and the escalation timeout and cooldown; a profile whose rules are all `deny` loads (B4). Granted rules have a separate `grants_digest` (§8.4) | — |
+| Policy digest | **Done (P4, P7; version 6 in the new-site amendment, version 7 for pre-requests).** Version 7 adds `pre_request_actions` to what version 6 covers (each upgrade revokes sessions once). Version 6 added `acknowledge_global_registration`, `max_wildcard_registrations` and `wildcard_registration_prompts_per_day` to what version 5 covers: version 5 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits, the browser fields, `max_granted_rules` and the escalation timeout and cooldown; a profile whose rules are all `deny` loads (B4). Granted rules have a separate `grants_digest` (§8.4) | — |
 | Audit content | **Done (P8).** Every operation record carries the §12 fields (`OperationRecord`, schema version 3; version 4 adds `credential_scope`, §12), including `top_origin = null` with `cross_origin`, the matched `rule` (`exact` or `*`) and `grant_source`, the live epochs, `backend`, `key_provider` and the counters; every reservation has exactly one `operation.terminal` record (`operation_audit.rs`). `backend` is the storage kind (`local`, `pass` or `tpm`): the human backend's kind for a same-user profile (passed from `main.rs` to the runtime), the profile's own storage for an isolated one; `daemon.start` now reports the human backend's kind too. Browser-lease records: `browser_lease.launch` is written once the lease is spawned and recorded (`audit_launch`, `runtime.rs`); every teardown goes through `close_lease_audited` (one `browser_lease.revoke` with a `reason`, then one `cleanup`), and a lease that ends on its own through `retire_dead_lease_audited` (`crash` with the exit code, or `expire`, then `cleanup`), also for an admin-launched lease that no profile tracks; a lease already gone writes nothing, so each event is audited once | — |
 | Escalation audit events | **Done (P7, P8).** `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted` or `server_lost`) and `revoked` (`reason = policy_reload`), plus `granted_rule.add` and `granted_rule.revoke`; a failed `requested` write fails the ceremony. P8: every escalation record carries `origin` and `rule`, `grant.request` and `grant.approve` carry `principal`, the RP scope and the TTL, and the schema version is 3 | — |
-| Pins with `*` and registration at unlisted sites (amendment, Phase 1) | **Done (v0.25.0).** `credential_refs` is valid with `*` and constrains exact rules only; the sign path chooses candidates by the matched rule from the live policy (`sign.rs`); `register = "request"` on the acknowledged same-user `*` rule with cap, daily limit and profile-wide cooldown (`escalation.rs`, `register.rs`); every registration prompt is "Register once" with the store's passkey count from the path index (`CredentialStorage::count_for_rp`; prompt protocol 2); audit schema 4. Operator surfaces: `profile check` and `doctor --agents` report pin coverage, inert or missing pins and the wildcard registration count (`doctor_pins.rs`); `agent capabilities` shows the credential scope; `agent-admin grants list` shows each grant's rule and kind. E2E-58 to E2E-62. Pre-requests are Phase 2 | — |
+| Pins with `*` and registration at unlisted sites (amendment, Phase 1) | **Done (v0.25.0).** `credential_refs` is valid with `*` and constrains exact rules only; the sign path chooses candidates by the matched rule from the live policy (`sign.rs`); `register = "request"` on the acknowledged same-user `*` rule with cap, daily limit and profile-wide cooldown (`escalation.rs`, `register.rs`); every registration prompt is "Register once" with the store's passkey count from the path index (`CredentialStorage::count_for_rp`; prompt protocol 2); audit schema 4. Operator surfaces: `profile check` and `doctor --agents` report pin coverage, inert or missing pins and the wildcard registration count (`doctor_pins.rs`); `agent capabilities` shows the credential scope; `agent-admin grants list` shows each grant's rule and kind. E2E-58 to E2E-62 | — |
+| Agent pre-requests (amendment, Phase 2) | **Done.** `passless agent request-access` and the opt-in MCP tool `passless_request_access` (`agent mcp playwright --with-access-tool`) ask for `authenticate` or `register` before the agent navigates, behind `pre_request_actions`; one-use pre-approval tokens bound to the principal session that owns the browser; the note is audit-only; granted-rules store version 2 (written only once a pre-request grant exists); audit schema 5; policy digest 7; principal protocol 1.3 and broker protocol 2. Operator surfaces: `grants list` shows `source` and `-` for an empty origin; the audit export labels `agent_note`. E2E-63 to E2E-66 | — |
 | Interception mechanism | **Done (P6).** Worker-only extension on `chrome.webAuthenticationProxy`; no content script; `main.js` and `broker.js` removed; manifest `key` fixes the extension ID; launch waits for the worker's attached `hello` and opens the start URL only then (B2) | — |
 | Origin source and `clientDataJSON` | **Done (P6).** Origin and `sameOriginWithAncestors` from `remoteDesktopClientOverride`, re-parsed by the daemon; the daemon builds `clientDataJSON` and the response JSON; the worker forwards it verbatim (§11) | — |
 | Conditional mediation and UVPAA | **Done (P6).** Unavailable while attached; `onIsUvpaaRequest` answered `false`; passkey autofill unsupported (§11) | — |
@@ -1377,7 +1478,8 @@ The agent implementation plans and verification matrices in `docs/plans/` and th
 
 On 2026-11-12 the accepted [amendment for new sites](0014-agent-delegation-amendment-new-sites.md)
 was folded in for Phase 1 (pins with `*`, registration at unlisted sites); the amendment document
-keeps the full rationale, threat analysis, rejected alternatives and Phase 2 (pre-requests).
+keeps the full rationale, threat analysis and rejected alternatives. Phase 2 (agent pre-requests) was
+folded in the same way once implemented.
 
 On 2026-11-11 the ADR was amended with maintainer-resolved decisions (replay coalescing, claim
 order, notification bus and state directory, `localhost`, epochs, containment, supported browsers,

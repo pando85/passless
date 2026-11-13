@@ -307,7 +307,7 @@ fn wrapped_entries_are_recognised_with_their_profile() {
 // ---- rewrite ----------------------------------------------------------------------------------
 
 fn rewritten(argv: &[&str]) -> Rewrite {
-    rewrite(&plain(argv), PASSLESS, "agent", &[])
+    rewrite(&plain(argv), PASSLESS, "agent", &[], false)
 }
 
 #[test]
@@ -548,6 +548,7 @@ fn chrome_devtools_flags_are_matched_in_camel_and_kebab_case() {
         PASSLESS,
         "agent",
         &[],
+        false,
     );
     assert_eq!(
         out.argv,
@@ -576,6 +577,7 @@ fn conflicting_environment_and_config_files_are_reported() {
         PASSLESS,
         "agent",
         &s(&["PLAYWRIGHT_MCP_BROWSER", "HTTPS_PROXY"]),
+        false,
     );
     assert!(
         out.notes
@@ -592,7 +594,7 @@ fn conflicting_environment_and_config_files_are_reported() {
 // ---- rewriting files --------------------------------------------------------------------------
 
 fn plan_of(client: McpInstallClient, text: &str) -> Plan {
-    plan(client, text, PASSLESS, "agent").expect("a plan")
+    plan(client, text, PASSLESS, "agent", false).expect("a plan")
 }
 
 #[test]
@@ -770,7 +772,7 @@ fn a_rewritten_file_is_already_wrapped_and_a_second_pass_changes_nothing() {
             second.entries
         );
         // Another profile does not rewrite a wrapped entry either.
-        let other = plan(client, &first, PASSLESS, "other").unwrap();
+        let other = plan(client, &first, PASSLESS, "other", false).unwrap();
         assert!(other.new_text.is_none());
     }
 }
@@ -803,12 +805,13 @@ fn text_that_is_not_json_is_an_error() {
             McpInstallClient::ClaudeCode,
             "{ not json",
             PASSLESS,
-            "agent"
+            "agent",
+            false
         ),
         Err(PlanError::Invalid(_))
     ));
     assert!(matches!(
-        plan(McpInstallClient::Opencode, "", PASSLESS, "agent"),
+        plan(McpInstallClient::Opencode, "", PASSLESS, "agent", false),
         Err(PlanError::Invalid(_))
     ));
 }
@@ -1066,7 +1069,7 @@ fn timestamps_are_utc_and_sortable() {
 // ---- adding an entry --------------------------------------------------------------------------
 
 fn added(client: McpInstallClient, text: &str) -> String {
-    plan_add(client, Some(text), PASSLESS, "agent")
+    plan_add(client, Some(text), PASSLESS, "agent", false)
         .unwrap()
         .new_text
         .unwrap()
@@ -1145,7 +1148,7 @@ fn a_server_of_the_same_name_that_is_not_ours_is_refused() {
             r#"{"mcp": {"servers": {"playwright": {"type": "local", "command": ["my-tool"]}}}}"#,
         ),
     ] {
-        let err = plan_add(client, Some(text), PASSLESS, "agent").unwrap_err();
+        let err = plan_add(client, Some(text), PASSLESS, "agent", false).unwrap_err();
         assert!(matches!(err, PlanError::Refused(_)), "{err}");
         assert!(err.to_string().contains("already exists"), "{err}");
     }
@@ -1153,7 +1156,13 @@ fn a_server_of_the_same_name_that_is_not_ours_is_refused() {
     for text in ["[]", r#"{"mcpServers": null}"#, r#"{"mcpServers": []}"#] {
         assert!(
             matches!(
-                plan_add(McpInstallClient::ClaudeCode, Some(text), PASSLESS, "agent"),
+                plan_add(
+                    McpInstallClient::ClaudeCode,
+                    Some(text),
+                    PASSLESS,
+                    "agent",
+                    false
+                ),
                 Err(PlanError::Refused(_))
             ),
             "{text}"
@@ -1189,6 +1198,7 @@ fn a_new_entry_reads_back_like_a_rewrite_produces_it() {
         Some("{ // c\n}"),
         PASSLESS,
         "agent",
+        false,
     )
     .unwrap();
     assert!(jsonc.jsonc && jsonc.new_text.is_none() && jsonc.snippet.contains("\"playwright\""));
@@ -1204,7 +1214,7 @@ fn local_scope_entries_of_the_user_file_are_found_and_rewritten() {
     "/work/other": {"mcpServers": {"fs": {"command": "x"}}}
   }
 }"#;
-    let plan = plan(McpInstallClient::ClaudeCode, text, PASSLESS, "agent").unwrap();
+    let plan = plan(McpInstallClient::ClaudeCode, text, PASSLESS, "agent", false).unwrap();
     assert_eq!(plan.entries.len(), 1);
     let entry = &plan.entries[0].entry;
     assert_eq!(entry.local_project(), Some("/work/app"));
@@ -1339,5 +1349,46 @@ fn a_project_opencode_json_may_shadow_the_global_one() {
     assert!(
         !shadows[0].certain,
         "opencode merges several files: only a soft warning"
+    );
+}
+
+#[test]
+fn with_access_tool_is_written_for_playwright_entries_only() {
+    let on = |argv: &[&str]| rewrite(&plain(argv), PASSLESS, "agent", &[], true).argv;
+    assert_eq!(
+        on(&["npx", "-y", "@playwright/mcp@latest"]),
+        s(&[
+            "/usr/bin/passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "agent",
+            "--with-access-tool"
+        ])
+        .into_iter()
+        .chain(s(&["--package", "@playwright/mcp@latest"]))
+        .collect::<Vec<_>>()
+    );
+    // The flag goes before `--`, so it is the wrapper's and never the server's.
+    let argv = on(&["npx", "@playwright/mcp", "--isolated"]);
+    let flag = argv.iter().position(|a| a == "--with-access-tool").unwrap();
+    let dashes = argv.iter().position(|a| a == "--").unwrap();
+    assert!(flag < dashes, "{argv:?}");
+    // chrome-devtools has no such tool.
+    assert!(
+        !on(&["npx", "chrome-devtools-mcp@latest"]).contains(&"--with-access-tool".to_string())
+    );
+    // Off by default.
+    assert!(
+        !rewrite(
+            &plain(&["npx", "@playwright/mcp"]),
+            PASSLESS,
+            "agent",
+            &[],
+            false
+        )
+        .argv
+        .contains(&"--with-access-tool".to_string())
     );
 }

@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use passless_core::agent::protocol::{
-    AUTHORITY_SCOPE_DISCOVERED, AUTHORITY_SCOPE_PINNED, AuthorityCredentialScope, AuthorityRisk,
-    PrincipalCredentialSummary,
+    AUTHORITY_SCOPE_DISCOVERED, AUTHORITY_SCOPE_PINNED, AccessRequestState, AccessRequestStatus,
+    AuthorityCredentialScope, AuthorityRisk, GrantAction, PrincipalCredentialSummary,
+    PrincipalRequest, PrincipalResponse,
 };
 use passless_core::{
     AgentCommand, AgentCredentialAction, CredentialRef, Error, OutputFormat, ProfileId, Result,
@@ -98,13 +99,34 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
         AgentCommand::Mcp {
             print_config,
             server,
+            with_access_tool,
             adapter,
         } => super::agent_browser::dispatch_mcp(
             profile,
             output,
             *print_config,
             *server,
+            *with_access_tool,
             adapter.as_ref(),
+        ),
+        AgentCommand::RequestAccess {
+            rp_id,
+            register,
+            note,
+            wait,
+            json,
+            fresh_session,
+        } => dispatch_request_access(
+            profile,
+            output,
+            &AccessArgs {
+                rp_id,
+                register: *register,
+                note: note.as_deref(),
+                wait: *wait,
+                json: *json,
+                fresh_session: *fresh_session,
+            },
         ),
         _ => {
             let profile = profile.ok_or_else(|| {
@@ -125,10 +147,159 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
                 | AgentCommand::Run { .. }
                 | AgentCommand::McpSessionBroker { .. }
                 | AgentCommand::Browser { .. }
-                | AgentCommand::Mcp { .. } => unreachable!(),
+                | AgentCommand::Mcp { .. }
+                | AgentCommand::RequestAccess { .. } => unreachable!(),
             }
         }
     }
+}
+
+/// The arguments of `passless agent request-access`.
+struct AccessArgs<'a> {
+    rp_id: &'a str,
+    register: bool,
+    note: Option<&'a str>,
+    wait: u32,
+    json: bool,
+    /// This command was re-run by itself in a fresh principal session, which ends with it.
+    fresh_session: bool,
+}
+
+/// `passless agent request-access <rp_id>` (ADR 0014 amendment section 2.3): ask the human for
+/// access before navigating. Inside a principal session it uses that session. Outside one it runs
+/// itself in a fresh principal session (like the MCP adapters), for `authenticate` only: a
+/// `register` approval is bound to the session that owns the browser, so a fresh one could never
+/// use it.
+fn dispatch_request_access(
+    profile: Option<&str>,
+    output: OutputFormat,
+    args: &AccessArgs,
+) -> Result<()> {
+    let profile = profile
+        .ok_or_else(|| Error::Other("--profile is required for principal commands".to_string()))?;
+    let base = resolve_runtime_base().map_err(client_error_to_result)?;
+    match PrincipalClient::connect_launched(&base, profile) {
+        Ok(mut client) => {
+            let status = request_access(&mut client, args)?;
+            print_access_status(&status, args.json, args.fresh_session)
+        }
+        Err(ClientError::NoControlFd) => {
+            if args.register {
+                return Err(Error::Other(
+                    "--register must run inside the principal session that owns the browser: its \
+                     one-use approval is bound to that session, and a fresh session started for \
+                     this command could never use it. Start the agent with `passless agent run \
+                     --profile <profile> -- <command>` and call this from there, or use the \
+                     `passless_request_access` MCP tool of `passless agent mcp playwright \
+                     --with-access-tool`"
+                        .to_string(),
+                ));
+            }
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::Other(format!("failed to resolve passless executable: {e}")))?;
+            let command: Vec<PathBuf> = request_access_argv(&exe, profile, args)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            run_in_principal_session(output, profile, &command, true)
+        }
+        Err(e) => Err(client_error_to_result(e)),
+    }
+}
+
+/// The command a fresh principal session runs for `request-access` (the executable, then the
+/// arguments that reproduce this call). The note goes in as `--note=<value>` and the RP ID after
+/// `--`, so neither can be read as a flag: a note such as `-urgent` or `--register` stays a value
+/// (review N4).
+fn request_access_argv(exe: &Path, profile: &str, args: &AccessArgs) -> Vec<String> {
+    let mut argv = vec![
+        exe.to_string_lossy().into_owned(),
+        "agent".to_string(),
+        "--profile".to_string(),
+        profile.to_string(),
+        "request-access".to_string(),
+        "--wait".to_string(),
+        args.wait.to_string(),
+    ];
+    if args.register {
+        argv.push("--register".to_string());
+    }
+    if let Some(note) = args.note {
+        argv.push(format!("--note={note}"));
+    }
+    if args.json {
+        argv.push("--json".to_string());
+    }
+    argv.push("--fresh-session".to_string());
+    argv.push("--".to_string());
+    argv.push(args.rp_id.to_string());
+    argv
+}
+
+fn request_access(client: &mut PrincipalClient, args: &AccessArgs) -> Result<AccessRequestStatus> {
+    let response = client
+        .request(PrincipalRequest::RequestAccess {
+            rp_id: args.rp_id.to_string(),
+            action: if args.register {
+                GrantAction::Register
+            } else {
+                GrantAction::Authenticate
+            },
+            note: args.note.map(str::to_string),
+            wait_ms: Some(u64::from(args.wait) * 1000),
+        })
+        .map_err(client_error_to_result)?;
+    match response {
+        PrincipalResponse::AccessRequest(status) => Ok(status),
+        _ => Err(Error::Other("unexpected response".to_string())),
+    }
+}
+
+/// `--json`: the status object as-is (the MCP tool's result is the same object); otherwise a few
+/// lines for a person or a shell agent.
+fn print_access_status(
+    status: &AccessRequestStatus,
+    json: bool,
+    fresh_session: bool,
+) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(status).map_err(|e| Error::Other(e.to_string()))?
+        );
+    } else {
+        print!("{}", format_access_status(status, fresh_session));
+    }
+    Ok(())
+}
+
+fn format_access_status(status: &AccessRequestStatus, fresh_session: bool) -> String {
+    let mut out = format!(
+        "state: {}\nrp_id: {}\naction: {}\n",
+        status.state.as_str(),
+        status.rp_id,
+        match status.action {
+            GrantAction::Register => "register",
+            GrantAction::Authenticate => "authenticate",
+        }
+    );
+    if let Some(secs) = status.expires_in_secs {
+        out.push_str(&format!("expires_in_secs: {secs}\n"));
+    }
+    if let Some(secs) = status.retry_after_secs {
+        out.push_str(&format!("retry_after_secs: {secs}\n"));
+    }
+    out.push_str(&format!("message: {}\n", status.message));
+    if status.state == AccessRequestState::Pending {
+        out.push_str(if fresh_session {
+            "This command's own principal session ended with it, which withdrew the request. \
+             Run the command inside your agent's principal session (`passless agent run`) to keep \
+             a request pending and poll it, or use a longer --wait.\n"
+        } else {
+            "Run the same command again later, with the same arguments, to see the decision.\n"
+        });
+    }
+    out
 }
 
 fn dispatch_playwright_mcp(
@@ -723,6 +894,128 @@ mod tests {
             lines[1],
             "credential_scope_wildcard: none: the profile has no `*` rule"
         );
+    }
+
+    fn status(state: AccessRequestState) -> AccessRequestStatus {
+        AccessRequestStatus {
+            state,
+            rp_id: "example.org".into(),
+            action: GrantAction::Authenticate,
+            expires_in_secs: None,
+            retry_after_secs: Some(60),
+            message: "Ask again later.".into(),
+        }
+    }
+
+    #[test]
+    fn request_access_text_lists_the_state_and_says_what_to_do_when_pending() {
+        let text = format_access_status(&status(AccessRequestState::Cooldown), false);
+        assert_eq!(
+            text,
+            "state: cooldown\nrp_id: example.org\naction: authenticate\nretry_after_secs: 60\n\
+             message: Ask again later.\n"
+        );
+        let pending = format_access_status(&status(AccessRequestState::Pending), false);
+        assert!(pending.contains("same command again"), "{pending}");
+        // Run in a session of its own, a pending request cannot be polled: it was withdrawn.
+        let fresh = format_access_status(&status(AccessRequestState::Pending), true);
+        assert!(fresh.contains("withdrew the request"), "{fresh}");
+        assert!(!fresh.contains("same command again"), "{fresh}");
+    }
+
+    #[test]
+    fn request_access_json_is_the_status_object_without_an_envelope() {
+        let json = serde_json::to_value(status(AccessRequestState::Approved)).unwrap();
+        assert_eq!(json["state"], "approved");
+        assert_eq!(json["rp_id"], "example.org");
+        assert!(json.get("version").is_none() && json.get("data").is_none());
+        // Every key of the object is present, null when it does not apply.
+        assert!(json["expires_in_secs"].is_null());
+    }
+
+    #[test]
+    fn a_fresh_session_reruns_the_same_request() {
+        let args = AccessArgs {
+            rp_id: "example.org",
+            register: false,
+            note: Some("why --register"),
+            wait: 45,
+            json: true,
+            fresh_session: false,
+        };
+        assert_eq!(
+            request_access_argv(Path::new("/usr/bin/passless"), "coding", &args),
+            [
+                "/usr/bin/passless",
+                "agent",
+                "--profile",
+                "coding",
+                "request-access",
+                "--wait",
+                "45",
+                "--note=why --register",
+                "--json",
+                "--fresh-session",
+                "--",
+                "example.org"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_note_that_looks_like_a_flag_survives_the_rerun() {
+        use clap::Parser;
+        use passless_core::config::{Args, Commands};
+
+        for note in ["-urgent", "--register", "-", "--", "--note=x", "a b"] {
+            for register in [false, true] {
+                let args = AccessArgs {
+                    rp_id: "example.org",
+                    register,
+                    note: Some(note),
+                    wait: 30,
+                    json: false,
+                    fresh_session: false,
+                };
+                let argv = request_access_argv(Path::new("/usr/bin/passless"), "coding", &args);
+                let parsed = Args::try_parse_from(&argv)
+                    .unwrap_or_else(|e| panic!("{note:?} {argv:?}: {e}"));
+                let Some(Commands::Agent {
+                    profile,
+                    action:
+                        passless_core::AgentCommand::RequestAccess {
+                            rp_id,
+                            register: parsed_register,
+                            note: parsed_note,
+                            wait,
+                            fresh_session,
+                            ..
+                        },
+                    ..
+                }) = parsed.command
+                else {
+                    panic!("not agent request-access: {argv:?}");
+                };
+                assert_eq!(profile.as_deref(), Some("coding"));
+                assert_eq!(rp_id, "example.org");
+                // The note is a value, whatever it starts with, and sets no flag.
+                assert_eq!(parsed_note.as_deref(), Some(note), "{argv:?}");
+                assert_eq!(parsed_register, register, "{note:?} {argv:?}");
+                assert_eq!(wait, 30);
+                assert!(fresh_session);
+            }
+        }
+        // An RP ID that starts with a hyphen is not read as a flag either.
+        let args = AccessArgs {
+            rp_id: "-example.org",
+            register: false,
+            note: None,
+            wait: 30,
+            json: false,
+            fresh_session: false,
+        };
+        let argv = request_access_argv(Path::new("/usr/bin/passless"), "coding", &args);
+        assert!(Args::try_parse_from(&argv).is_ok(), "{argv:?}");
     }
 
     #[test]

@@ -9,8 +9,8 @@ use passless_core::agent::protocol::GrantAction;
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
     GrantId, GrantSource, MatchedRule, NoGrantedRules, Policy, PolicyAction, PolicyDigest,
-    PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId, RuleAction, RuleIdentity,
-    resolve_rules,
+    PolicyGenerationId, PolicyParams, PreRequestAction, PrincipalSessionId, ProfileId, RuleAction,
+    RuleIdentity, resolve_rules,
 };
 
 use super::audit::AuditGate;
@@ -49,6 +49,8 @@ pub struct PolicySnapshot {
     pub max_wildcard_registrations: u16,
     /// Wildcard registration prompts per rolling 24 hours, read live.
     pub wildcard_registration_prompts_per_day: u16,
+    /// Actions the agent may pre-request (`pre_request_actions`), sorted and deduplicated.
+    pub pre_request_actions: Vec<PreRequestAction>,
 }
 
 impl PolicySnapshot {
@@ -128,6 +130,8 @@ pub struct EscalationProfile {
     pub max_wildcard_registrations: usize,
     /// The live `wildcard_registration_prompts_per_day`.
     pub wildcard_registration_prompts_per_day: usize,
+    /// The live `pre_request_actions`, sorted and deduplicated.
+    pub pre_request_actions: Vec<PreRequestAction>,
 }
 
 /// A profile's `credential_refs` as the sign path sees it.
@@ -190,6 +194,8 @@ pub struct GrantSignSnapshot {
     pub profile_id: ProfileId,
     /// Digest of the principal the grant was issued to; a session must match it (ADR 0014 section 7).
     pub principal_digest: [u8; 32],
+    /// The principal session the grant was issued to.
+    pub session_id: PrincipalSessionId,
     pub rp_ids: Vec<String>,
     pub credential_refs: Vec<CredentialRef>,
     pub state: super::grant::GrantState,
@@ -369,6 +375,10 @@ impl PolicyRuntime {
         let wildcard_registration_prompts_per_day =
             config.effective_wildcard_registration_prompts_per_day();
 
+        let mut pre_request_actions = config.pre_request_actions.clone();
+        pre_request_actions.sort();
+        pre_request_actions.dedup();
+
         let mut allowed_actions = BTreeSet::new();
         if rules
             .iter()
@@ -434,6 +444,10 @@ impl PolicyRuntime {
             acknowledged_global_registration: acknowledged.global_registration,
             max_wildcard_registrations: u64::from(max_wildcard_registrations),
             wildcard_registration_prompts_per_day: u64::from(wildcard_registration_prompts_per_day),
+            pre_request_actions: pre_request_actions
+                .iter()
+                .map(|action| action.as_str().to_string())
+                .collect(),
         };
 
         let policy = Policy::from_params(params)
@@ -460,6 +474,7 @@ impl PolicyRuntime {
             acknowledged_global_registration: acknowledged.global_registration,
             max_wildcard_registrations,
             wildcard_registration_prompts_per_day,
+            pre_request_actions,
         })
     }
 
@@ -527,6 +542,7 @@ impl PolicyRuntime {
                 wildcard_registration_prompts_per_day: usize::from(
                     snapshot.wildcard_registration_prompts_per_day,
                 ),
+                pre_request_actions: snapshot.pre_request_actions.clone(),
             })
     }
 
@@ -686,6 +702,7 @@ impl PolicyRuntime {
             grant_id: snap.grant_id,
             profile_id: snap.profile_id,
             principal_digest: snap.principal_digest,
+            session_id: snap.session_id,
             rp_ids: snap.rp_ids,
             credential_refs: snap.credential_refs,
             state: snap.state,
@@ -693,6 +710,16 @@ impl PolicyRuntime {
             is_revoked,
         })
     }
+    /// The principal session the session grant `grant_id` was issued to, whatever its state
+    /// (a revoked lease's grant still names its owner). `None` when no profile holds it.
+    pub fn grant_principal_session(&self, grant_id: &GrantId) -> Option<PrincipalSessionId> {
+        let grants_map = self.lock_grants();
+        grants_map
+            .values()
+            .find_map(|registry| registry.snapshot_for_sign(grant_id))
+            .map(|snap| snap.session_id)
+    }
+
     pub fn active_grant_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
         let grants = self.lock_grants();
         grants
@@ -931,6 +958,7 @@ mod tests {
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -1642,5 +1670,53 @@ mod tests {
             .unwrap()
             .digest;
         assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn test_pre_request_actions_reach_the_escalation_profile_and_the_digest() {
+        let config = make_isolated_config("pre", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        let id = ProfileId::new("pre").unwrap();
+        assert!(
+            runtime
+                .escalation_profile(&id)
+                .unwrap()
+                .pre_request_actions
+                .is_empty()
+        );
+        let before = runtime.digest();
+
+        // A reload that changes only `pre_request_actions` is a policy change.
+        let mut changed = config.clone();
+        changed.profiles.get_mut("pre").unwrap().pre_request_actions = vec![
+            PreRequestAction::Register,
+            PreRequestAction::Authenticate,
+            PreRequestAction::Register,
+        ];
+        let outcome = runtime.reload(&changed).unwrap();
+        assert!(outcome.changed);
+        assert_ne!(outcome.digest, before);
+        // Sorted and deduplicated in the live snapshot, the policy and the escalation profile.
+        let expected = vec![PreRequestAction::Authenticate, PreRequestAction::Register];
+        assert_eq!(
+            runtime.escalation_profile(&id).unwrap().pre_request_actions,
+            expected
+        );
+        let generation = runtime.current_generation();
+        let snapshot = generation.find_snapshot(&id).unwrap();
+        assert_eq!(snapshot.pre_request_actions, expected);
+        assert_eq!(
+            snapshot.policy.pre_request_actions,
+            vec!["authenticate", "register"]
+        );
+
+        // Listing the same actions in another order is not a change.
+        let mut reordered = changed.clone();
+        reordered
+            .profiles
+            .get_mut("pre")
+            .unwrap()
+            .pre_request_actions = vec![PreRequestAction::Authenticate, PreRequestAction::Register];
+        assert!(!runtime.reload(&reordered).unwrap().changed);
     }
 }

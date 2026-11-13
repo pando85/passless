@@ -2,8 +2,12 @@
 // Shared pieces of the P7 escalation scenarios (E2E-20/escalation, 21, 23 to 31, 43, 44, 48 to 50).
 
 const { execFile } = require('node:child_process');
+const fs = require('node:fs');
 const os = require('node:os');
+const path = require('node:path');
 const assert = require('node:assert/strict');
+
+const { REPO_ROOT } = require('./paths');
 
 const { waitFor, auditEvents, escalationEvents } = require('./helpers');
 
@@ -81,4 +85,29 @@ function assertRegistrationActions(n) {
   return nonce;
 }
 
-module.exports = { REGISTER_SUMMARY, registrationBody, humanStoreLine, assertRegistrationActions, requestProfile, start, settle, peek, abort, run, waitForAudit, waitForEscalation, dbusSendSignal, sleep };
+// The two lines a pre-request prompt adds (ADR 0014 amendment sections 5.1 and 5.3), read from the daemon's source so that
+// the text exists once: `ORIGIN_NONE_YET` and `REQUESTED_IN_ADVANCE` in cmd/passless/src/agent/escalation_prompt.rs.
+const PROMPT_SOURCE = path.join(REPO_ROOT, 'cmd', 'passless', 'src', 'agent', 'escalation_prompt.rs');
+function promptConst(name) {
+  const m = new RegExp(`pub const ${name}: &str = "([^"]*)";`).exec(fs.readFileSync(PROMPT_SOURCE, 'utf8'));
+  if (!m) throw new Error(`${name} not found in ${PROMPT_SOURCE}`);
+  return m[1];
+}
+const ORIGIN_NONE_YET = promptConst('ORIGIN_NONE_YET');
+const REQUESTED_IN_ADVANCE = promptConst('REQUESTED_IN_ADVANCE');
+
+/** The sign-in prompt's summary and the body of a pre-request one: seven lines, "Origin: none yet" and who asked. */
+const SIGN_IN_SUMMARY = 'Passless: agent sign-in request';
+function preRequestSignInBody({ profile, site, mode = 'same-user', principal = os.userInfo().username }) {
+  return `Profile: ${profile} (${mode})\nPrincipal user: ${principal}\nAction: sign in with a passkey\nSite: ${site} (any page under this site)\n` +
+    `Origin: ${ORIGIN_NONE_YET}\nRequested by: ${REQUESTED_IN_ADVANCE}\n"Allow always" is saved permanently.`;
+}
+
+/** The registration prompt's body for a pre-request: no origin yet, and asked in advance (`registrationBody` is the ceremony form). */
+function preRequestRegistrationBody({ site, siteRule = 'exact', stored, principal = os.userInfo().username }) {
+  const rule = siteRule === 'wildcard' ? 'NOT on your list; matched by the * rule' : 'your rule for this site';
+  return `Action: create a new passkey and register it at this site\nSite: ${site} (${rule})\nOrigin: ${ORIGIN_NONE_YET}\nStored in: ${stored}\n` +
+    `Approving allows this one registration, then lets the agent sign in here without asking.\nRequested by: ${REQUESTED_IN_ADVANCE}, principal user ${principal}`;
+}
+
+module.exports = { ORIGIN_NONE_YET, REQUESTED_IN_ADVANCE, SIGN_IN_SUMMARY, preRequestSignInBody, preRequestRegistrationBody, REGISTER_SUMMARY, registrationBody, humanStoreLine, assertRegistrationActions, requestProfile, start, settle, peek, abort, run, waitForAudit, waitForEscalation, dbusSendSignal, sleep };

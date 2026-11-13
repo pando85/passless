@@ -632,6 +632,7 @@ mod tests {
         let profile = AgentProfileConfig {
             max_wildcard_registrations: None,
             wildcard_registration_prompts_per_day: None,
+            pre_request_actions: Vec::new(),
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
@@ -675,6 +676,7 @@ mod tests {
         let profile = AgentProfileConfig {
             max_wildcard_registrations: None,
             wildcard_registration_prompts_per_day: None,
+            pre_request_actions: Vec::new(),
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,

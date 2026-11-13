@@ -28,7 +28,8 @@ session, and the audit records the source as `agent`.
 A `request` rule raises an escalation when the agent makes a request:
 
 1. The daemon shows a notification with daemon-derived text only: profile, mode, principal, action, RP
-   ID, origin and whether the approval is persistent. Nothing the page or the agent wrote is shown.
+   ID, origin and whether the approval is persistent. Nothing the page or the agent wrote is shown. (An
+   agent can also ask before it navigates: [Asking in advance](#asking-in-advance).)
 2. The notification has two actions: **Allow always** and **Deny**. A registration prompt has
    **Register once** and **Deny** instead (see [Registration](#registration)). Only a click on the
    real notification server counts; no API, CLI or extension message can approve.
@@ -79,16 +80,20 @@ passless agent-admin grants clear --profile coding --confirm
 ```
 
 `grants list` prints one table per profile with a header. `KIND` is `escalation` (an approved
-sign-in) or `registration` (a credential the agent created, shown in `CREDENTIAL`), and `RULE` is the
-configured rule that permitted it: `exact`, or `*` for a grant under the wildcard rule. Wildcard
-registration grants count against `max_wildcard_registrations`; revoking one frees a slot (the
-credential stays until `agent-admin credential delete`).
+sign-in) or `registration` (a credential the agent created, shown in `CREDENTIAL`), `RULE` is the
+configured rule that permitted it: `exact`, or `*` for a grant under the wildcard rule, and `SOURCE`
+says who raised the escalation: `ceremony` (a page did) or `pre_request` (the agent asked in advance,
+see [Asking in advance](#asking-in-advance)). A grant that no page was behind has no origin, shown as
+`-`; the JSON output has the same `source` and `origin` values. Wildcard registration grants count
+against `max_wildcard_registrations`; revoking one frees a slot (the credential stays until
+`agent-admin credential delete`).
 
 ```text
-coding: 2 rule(s), digest 5c1f...
-  RP_ID            ACTION        KIND          RULE   GRANTED_AT            REQUEST   ORIGIN                   CREDENTIAL
-  github.com       authenticate  escalation    exact  2026-11-12T10:00:00Z  esc-0a1f  https://github.com       -
-  new.example.org  authenticate  registration  *      2026-11-12T10:05:00Z  esc-77aa  https://new.example.org  3b9c...
+coding: 3 rule(s), digest 5c1f...
+  RP_ID            ACTION        KIND          RULE   SOURCE       GRANTED_AT            REQUEST   ORIGIN                   CREDENTIAL
+  github.com       authenticate  escalation    exact  ceremony     2026-11-12T10:00:00Z  esc-0a1f  https://github.com       -
+  new.example.org  authenticate  registration  *      ceremony     2026-11-12T10:05:00Z  esc-77aa  https://new.example.org  3b9c...
+  docs.example.net authenticate  escalation    *      pre_request  2026-11-12T10:07:00Z  esc-91c0  -                        -
 ```
 
 Revoking a grant revokes every active agent session (the next request prompts again), the same as a
@@ -203,6 +208,89 @@ who owns the notification bus ([Containment](containment.md#same-user-and-differ
 Residuals: a passkey added to a real account at the site stays there after you revoke it locally, so
 remove it at the site too. With the `pass` backend, Git history keeps the credential file and its site
 name. The prompt cannot show which account at the site the passkey is for.
+
+## Asking in advance
+
+By default a prompt appears only when a page's WebAuthn call reaches a `request` rule. A profile can
+also let the agent ask first, before it navigates, so that you see one clear prompt instead of a page
+that hangs. It is off until you list the actions in the profile:
+
+```toml
+[agents.profiles.coding]
+pre_request_actions = ["authenticate", "register"]   # default []; either or both
+```
+
+A pre-request can only lead to an outcome that a `request` at the site could lead to, and only where
+the live rules resolve the action at that site to `request`. It never widens a rule, never approves
+anything by itself and never says whether you hold a passkey. The agent asks with the CLI, from any
+shell tool, or with an MCP tool:
+
+```bash
+passless agent request-access example.org --profile coding --note "need to sign in to the docs"
+passless agent request-access example.org --profile coding --register --json
+```
+
+```text
+state: approved
+rp_id: example.org
+action: authenticate
+message: ...
+```
+
+`--json` prints the status object (the MCP tool returns the same object): `state`, `rp_id`, `action`,
+`expires_in_secs`, `retry_after_secs` and a daemon-written `message`. Every state is a normal answer
+and exits 0:
+
+| `state` | Meaning |
+|---|---|
+| `approved` | You approved. For `authenticate` a persistent grant exists (`SOURCE` = `pre_request`, no origin); for `register` a one-use approval waits (below). |
+| `pending` | You have not decided yet. Run the same command again, with the same arguments, to see the decision: a repeat returns the state of the pending request and shows no second prompt. |
+| `denied` | You denied it. The per-site cooldown starts, as for a page. |
+| `expired` | It ended without a decision (timeout after 10 minutes or `agents.escalation_timeout`, a lost notification server, a policy change). |
+| `already_allowed` | An `allow` rule or a grant already covers it; nothing was prompted. |
+| `cooldown` | The site and action are in their cooldown after a recent deny or timeout. |
+| `rate_limited` | This session has a request pending already, or asked more than 6 times in 10 minutes. |
+| `not_requestable` | The live rules do not resolve the action at the site to `request` (a `deny`, no rule, or a localhost or invalid site), or, for `register`, this session does not own the browser. |
+| `not_enabled` | The profile does not list the action in `pre_request_actions`. |
+| `unavailable` | No usable notification server. |
+| `busy` | Another request for the site is in progress, or a queue limit was reached. |
+
+`--wait <secs>` (0 to 120, default 30) is how long the command waits for you before answering
+`pending`. Inside a principal session (`passless agent run`) the call uses that session. Outside one,
+the command runs itself in a fresh principal session for `authenticate`; such a session ends with the
+command, which withdraws a request that is still pending, so use a longer `--wait` or call it from
+inside the agent's own session. `--register` outside the session that owns the browser is an error.
+
+The prompt is the usual one, with two daemon-written lines that say what is different. A sign-in
+prompt adds `Requested by: the agent in advance (no page is waiting)` and its origin reads
+`Origin: none yet`; a registration prompt says the same in its origin and requester lines. Nothing
+the agent wrote is shown. `--note` (at most 200 bytes) is recorded in the audit log only, sanitized,
+labelled agent-supplied wherever `agent-admin` shows it, and never put in a prompt: the prompt is the
+one place the agent cannot write to, and a persuasive sentence in it would borrow its authority. The
+agent has its own chat with you for explanations.
+
+**Registration (`register`).** Approval is a one-use pre-approval token, in memory only. It is bound to
+your profile, the site, the revocation epoch and the principal session that owns the browser, so the
+request is only accepted from that session (or, under `browser_scope = "session"`, from any session
+for its own browser). The first registration ceremony of that browser at that site consumes it (or
+adopts the request while it is still pending), with no second prompt; a second registration prompts
+again. It lasts 10 minutes at most and never outlives its principal session. It is dropped when its
+session ends, its browser lease is revoked, the policy reloads with a change, or `grants revoke` or
+`grants clear` reaches the site. The audit records each token as `pre_approval.issued`, `consumed` or
+`expired` with the reason.
+
+**Limits.** One pending pre-request and six per 10 minutes per principal session, and at most three
+pending and twelve per 10 minutes per profile across all its sessions (a shell agent calling
+`passless agent request-access` outside a session starts a new session each time, so only the
+profile's bounds apply to it), and the same cooldown, caps, queue and daily limits as a page-raised
+prompt. A pre-request occupies a waiting slot of its session.
+
+**Shared browser.** With `browser_scope = "profile"`, every session attached to the shared browser
+acts as the session that launched it, so any of them can use that session's pre-approval. Only
+`browser_scope = "session"` keeps one agent's approval from another agent's browser.
+
+**Same-UID caveat.** An agent that shares your Unix user can approve its own prompt (see above).
+Asking in advance is a usability and audit feature, not a security boundary, in that deployment.
 
 ## The wildcard rule
 

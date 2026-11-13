@@ -32,8 +32,13 @@ use super::lock_order::{self, LockLevel};
 use super::policy_engine::PolicyRuntime;
 use super::safe_fs::Dir;
 
-/// The only store format version.
-pub const GRANTED_RULES_VERSION: u32 = 1;
+/// The newest store format version (ADR 0014 amendment section 7). Version 2 adds `source` and
+/// makes `origin` optional; the writer writes the lowest version that represents its entries
+/// ([`store_version_for`]), so a store without a pre-request grant stays readable by a daemon
+/// that knows version 1 only.
+pub const GRANTED_RULES_VERSION: u32 = 2;
+/// The original store format version: every entry has an origin and came from a ceremony.
+pub const GRANTED_RULES_VERSION_1: u32 = 1;
 /// Largest store file that is loaded; a larger one disables the profile's grants.
 pub const MAX_STORE_FILE_BYTES: u64 = 256 * 1024;
 /// The store's directory under `agents.state_dir`.
@@ -74,6 +79,32 @@ impl GrantKind {
     }
 }
 
+/// Who raised the escalation behind a granted rule (store version 2, audit version 5).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestSource {
+    /// A ceremony (a page's WebAuthn call) that resolved to `request`.
+    #[default]
+    Ceremony,
+    /// The agent asked in advance (`PrincipalRequest::RequestAccess`; ADR 0014 amendment 2.3).
+    PreRequest,
+}
+
+impl RequestSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ceremony => "ceremony",
+            Self::PreRequest => "pre_request",
+        }
+    }
+
+    pub fn is_ceremony(&self) -> bool {
+        *self == Self::Ceremony
+    }
+}
+
 /// The configured rule that permitted the escalation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PermittingRule {
@@ -106,12 +137,17 @@ pub struct GrantedRule {
     pub granted_at: String,
     /// The approving escalation's ID.
     pub request_id: String,
-    /// The origin of the ceremony that requested the escalation.
-    pub origin: String,
+    /// The origin of the ceremony that requested the escalation. Absent only for an
+    /// `authenticate` pre-request, which has no page (store version 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub rule: PermittingRule,
     /// The credential a registration grant pins (ADR 0014 section 8.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<CredentialRef>,
+    /// Who raised the escalation (store version 2); `ceremony` when absent.
+    #[serde(default, skip_serializing_if = "RequestSource::is_ceremony")]
+    pub source: RequestSource,
 }
 
 impl GrantedRule {
@@ -130,10 +166,39 @@ impl GrantedRule {
             kind,
             granted_at: rfc3339_utc(SystemTime::now()),
             request_id: request_id.to_string(),
-            origin: origin.to_string(),
+            origin: Some(origin.to_string()),
             rule,
             credential_ref,
+            source: RequestSource::Ceremony,
         }
+    }
+
+    /// The grant of an escalation raised by `source`, with `origin` when a page was involved
+    /// (ADR 0014 amendment section 7: only an `authenticate` pre-request has none).
+    pub fn from_escalation(
+        rp_id: &str,
+        kind: GrantKind,
+        request_id: &str,
+        origin: Option<&str>,
+        rule: PermittingRule,
+        credential_ref: Option<CredentialRef>,
+        source: RequestSource,
+    ) -> Self {
+        Self {
+            origin: origin.map(str::to_string),
+            source,
+            ..Self::new(rp_id, kind, request_id, "", rule, credential_ref)
+        }
+    }
+
+    /// Whether store version 1 can represent this entry (an origin, from a ceremony).
+    pub fn fits_version_1(&self) -> bool {
+        self.origin.is_some() && self.source == RequestSource::Ceremony
+    }
+
+    /// The origin as shown by the admin listings (empty when the entry has none).
+    pub fn origin_or_empty(&self) -> &str {
+        self.origin.as_deref().unwrap_or("")
     }
 
     /// Two entries with the same key are duplicates. A registration grant per credential may sit
@@ -612,7 +677,7 @@ impl GrantedRulesStore {
     ) -> Result<(), GrantStoreError> {
         rules.sort_by_key(GrantedRule::key);
         let file = StoreFile {
-            version: GRANTED_RULES_VERSION,
+            version: store_version_for(&rules),
             profile: profile.as_str().to_string(),
             grants: rules,
         };
@@ -889,11 +954,32 @@ fn check_dir_handle(handle: &Dir, dir: &Path, owner_uid: u32) -> Result<(), Stri
     Ok(())
 }
 
+/// The lowest store version that represents `rules` (ADR 0014 amendment section 7): version 1
+/// while every entry has an origin and came from a ceremony, version 2 otherwise. A store is
+/// rewritten as version 2 only once a pre-request grant exists, so a downgrade works until then.
+pub fn store_version_for(rules: &[GrantedRule]) -> u32 {
+    if rules.iter().all(GrantedRule::fits_version_1) {
+        GRANTED_RULES_VERSION_1
+    } else {
+        GRANTED_RULES_VERSION
+    }
+}
+
 fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, String> {
     let text = std::str::from_utf8(content).map_err(|_| "not UTF-8".to_string())?;
     let file: StoreFile = toml::from_str(text).map_err(|e| format!("does not parse: {}", e))?;
-    if file.version != GRANTED_RULES_VERSION {
+    if file.version != GRANTED_RULES_VERSION_1 && file.version != GRANTED_RULES_VERSION {
         return Err(format!("unknown version {}", file.version));
+    }
+    // A version 1 file loads as version 2 with `source = "ceremony"`; it may not use a field
+    // that version 1 does not have (an older daemon would refuse it, so this one does too).
+    if file.version == GRANTED_RULES_VERSION_1
+        && let Some(rule) = file.grants.iter().find(|rule| !rule.fits_version_1())
+    {
+        return Err(format!(
+            "version 1 entry for '{}' has no origin or a source other than ceremony",
+            rule.rp_id
+        ));
     }
     if file.profile != profile.as_str() {
         return Err(format!(
@@ -918,6 +1004,15 @@ fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, 
         if rule.kind == GrantKind::Registration && rule.credential_ref.is_none() {
             return Err(format!(
                 "registration grant for '{}' has no credential_ref",
+                rule.rp_id
+            ));
+        }
+        // Only an `authenticate` pre-request has no page: a registration always has an origin.
+        if rule.origin.is_none()
+            && (rule.kind != GrantKind::Escalation || rule.source != RequestSource::PreRequest)
+        {
+            return Err(format!(
+                "grant for '{}' has no origin and is not an authenticate pre-request",
                 rule.rp_id
             ));
         }
@@ -981,7 +1076,7 @@ fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
                     rule.kind.as_str(),
                     rule.granted_at.as_str(),
                     rule.request_id.as_str(),
-                    rule.origin.as_str(),
+                    rule.origin_or_empty(),
                     rule.rule.as_str(),
                     &rule
                         .credential_ref
@@ -991,6 +1086,15 @@ fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
                 ] {
                     hasher.update((field.len() as u64).to_le_bytes());
                     hasher.update(field.as_bytes());
+                }
+                // Version 2 fields (amendment section 7). An entry version 1 can represent adds
+                // nothing, so the digest of a version 1 store is unchanged.
+                if !rule.fits_version_1() {
+                    let origin_present = if rule.origin.is_some() { "1" } else { "0" };
+                    for field in ["v2", rule.source.as_str(), origin_present] {
+                        hasher.update((field.len() as u64).to_le_bytes());
+                        hasher.update(field.as_bytes());
+                    }
                 }
             }
         }
@@ -1360,10 +1464,10 @@ rule = "exact"
         let tmp = tempfile::tempdir().unwrap();
         seed(
             tmp.path(),
-            &VALID.replace("version = 1", "version = 2"),
+            &VALID.replace("version = 1", "version = 3"),
             0o600,
         );
-        assert_disabled(tmp.path(), "unknown version 2");
+        assert_disabled(tmp.path(), "unknown version 3");
     }
 
     #[test]
@@ -1862,5 +1966,157 @@ rule = "exact"
             rfc3339_utc(SystemTime::UNIX_EPOCH + Duration::from_secs(951_782_400)),
             "2000-02-29T00:00:00Z"
         );
+    }
+
+    /// An `authenticate` pre-request's grant: no origin, `source = "pre_request"`.
+    fn pre_request_grant(rp_id: &str) -> GrantedRule {
+        GrantedRule::from_escalation(
+            rp_id,
+            GrantKind::Escalation,
+            "esc-pre",
+            None,
+            PermittingRule::Wildcard,
+            None,
+            RequestSource::PreRequest,
+        )
+    }
+
+    #[test]
+    fn a_version_1_store_loads_as_version_2_with_ceremony_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), VALID, 0o600);
+        let store = open(tmp.path());
+        let rules = store.profile(&profile()).unwrap().rules().to_vec();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].source, RequestSource::Ceremony);
+        assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn the_writer_keeps_version_1_until_a_pre_request_grant_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let store = open(tmp.path());
+        let file = store.path_for(&profile());
+        store
+            .add(&policy, &profile(), escalation("example.com"), 64)
+            .unwrap();
+        let v1 = fs::read_to_string(&file).unwrap();
+        assert!(v1.starts_with("version = 1\n"), "{v1}");
+        assert!(!v1.contains("source"), "{v1}");
+        let v1_digest = store.grants_digest(&profile());
+
+        store
+            .add(&policy, &profile(), pre_request_grant("other.example"), 64)
+            .unwrap();
+        let v2 = fs::read_to_string(&file).unwrap();
+        assert!(v2.starts_with("version = 2\n"), "{v2}");
+        assert!(v2.contains("source = \"pre_request\""), "{v2}");
+        // The pre-request entry has no origin line; the ceremony entry keeps its own and writes
+        // no source (the default).
+        assert_eq!(v2.matches("origin = ").count(), 1, "{v2}");
+        assert_eq!(v2.matches("source = ").count(), 1, "{v2}");
+
+        // Version 2 round trip.
+        let reopened = open(tmp.path());
+        let rules = reopened.profile(&profile()).unwrap().rules().to_vec();
+        let pre = rules.iter().find(|r| r.rp_id == "other.example").unwrap();
+        assert_eq!(pre.source, RequestSource::PreRequest);
+        assert_eq!(pre.origin, None);
+        assert!(reopened.is_granted(&profile(), "other.example", &RuleIdentity::Wildcard));
+        assert_eq!(
+            reopened.grants_digest(&profile()),
+            store.grants_digest(&profile())
+        );
+        assert_ne!(store.grants_digest(&profile()), v1_digest);
+
+        // Revoking the only pre-request grant writes version 1 again (a downgrade works).
+        store
+            .revoke(
+                &policy,
+                &profile(),
+                "other.example",
+                GrantedAction::Authenticate,
+            )
+            .unwrap();
+        let again = fs::read_to_string(&file).unwrap();
+        assert!(again.starts_with("version = 1\n"), "{again}");
+        assert_eq!(store.grants_digest(&profile()), v1_digest);
+    }
+
+    #[test]
+    fn the_lowest_version_follows_the_entries() {
+        let ceremony = escalation("example.com");
+        assert_eq!(store_version_for(&[]), 1);
+        assert_eq!(store_version_for(std::slice::from_ref(&ceremony)), 1);
+        // A pre-request with an origin (a registration it led to) still needs version 2.
+        let with_origin = GrantedRule::from_escalation(
+            "example.com",
+            GrantKind::Registration,
+            "esc-3",
+            Some("https://example.com"),
+            PermittingRule::Exact,
+            Some(CredentialRef::with_default_domain(b"c")),
+            RequestSource::PreRequest,
+        );
+        assert_eq!(store_version_for(&[ceremony.clone(), with_origin]), 2);
+        assert_eq!(
+            store_version_for(&[ceremony, pre_request_grant("other.example")]),
+            2
+        );
+    }
+
+    #[test]
+    fn a_version_1_file_with_a_version_2_field_disables_the_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!("{VALID}source = \"pre_request\"\n"),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "version 1 entry");
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &VALID.replace("origin = \"https://example.com\"\n", ""),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "version 1 entry");
+    }
+
+    #[test]
+    fn only_an_authenticate_pre_request_may_lack_an_origin() {
+        let base = VALID
+            .replace("version = 1", "version = 2")
+            .replace("origin = \"https://example.com\"\n", "");
+        // An origin-less ceremony grant.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &base, 0o600);
+        assert_disabled(tmp.path(), "no origin");
+        // An origin-less registration grant, even from a pre-request.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!(
+                "{}source = \"pre_request\"\ncredential_ref = \"{}\"\n",
+                base.replace("kind = \"escalation\"", "kind = \"registration\""),
+                CredentialRef::with_default_domain(b"c").to_hex()
+            ),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "no origin");
+        // An authenticate pre-request without an origin loads.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!("{base}source = \"pre_request\"\n"),
+            0o600,
+        );
+        let store = open(tmp.path());
+        assert!(store.is_granted(&profile(), "example.com", &exact("example.com")));
+        // An unknown source value disables the profile.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &format!("{base}source = \"agent\"\n"), 0o600);
+        assert_disabled(tmp.path(), "does not parse");
     }
 }

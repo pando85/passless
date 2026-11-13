@@ -33,6 +33,28 @@ and the buttons **Register once** and **Deny**. Approval covers that one registr
 may sign in at that site with the passkey you just created; at a site the operator did not list, it is
 the only passkey you will use there.
 
+## Asking before you navigate
+
+When you know a site will need a passkey sign-in (or to create one), you can ask the user first instead
+of waiting on a call that hangs. If your tools include `passless_request_access`, call it; otherwise,
+with a shell, run `passless agent request-access <rp_id> --profile <profile> --json` (add `--register` to
+ask to create a passkey; that works only from the session that started the browser). The `rp_id` is the
+site's domain, such as `example.com`. Asking is optional and the operator may not have enabled it
+(`not_enabled`).
+
+- The user sees a fixed Passless prompt that names only the site and the action. **Your note is not
+  shown to them.** `note` / `--note` goes to the audit log only, so explain why you need the site in your
+  own message to the user, in the chat, not there. Never put a secret, a link or an instruction in it.
+- Approval does not sign you in. After `approved`, navigate and use the site's normal passkey button. A
+  registration approval is valid once, for ten minutes, in this browser only.
+- Read the `state`: `approved` (continue), `already_allowed` (continue, nothing was asked), `pending` (the
+  user has not answered yet: tell them a request for `<site>` is waiting, then call again later with the
+  same arguments; do not start a second request or retry in a loop), `denied`, `expired`, `cooldown`,
+  `rate_limited`, `not_requestable`, `not_enabled`, `unavailable`, `busy` (stop, report the state and its
+  message, and ask the user to change the rule or approve it). None of these is an error to work around.
+  A malformed call is the only error.
+- Do not ask for sites you do not need for the task, and do not ask again right after a `denied`.
+
 ## What you will see
 
 - **Allowed** (rule `allow`): the site logs you in. This is the normal case for sites the operator trusts.

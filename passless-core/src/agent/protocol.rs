@@ -14,7 +14,8 @@ const MAX_CDP_REQUEST_LEN: usize = 8 * 1024;
 const MAX_CDP_TIMEOUT_MS: u32 = 30_000;
 const MAX_START_URL_LEN: usize = 2048;
 
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+/// Minor 3 (ADR 0014 amendment section 2.3): `PrincipalRequest::RequestAccess`.
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 const MAX_RP_ID_LEN: usize = 253;
 const MAX_USER_NAME_LEN: usize = 256;
@@ -25,6 +26,13 @@ const MAX_REG_CHALLENGE_B64U_LEN: usize = 1376;
 const MAX_REG_USER_ID_B64U_LEN: usize = 88;
 const MAX_REG_EXCLUDE_CREDENTIALS: usize = 64;
 const MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN: usize = 344;
+/// Longest `RequestAccess.note` accepted on the wire. The daemon sanitizes it and keeps at most
+/// [`MAX_ACCESS_NOTE_BYTES`] for the audit log; anything longer is refused rather than cut silently.
+pub const MAX_ACCESS_NOTE_WIRE_LEN: usize = 1024;
+/// The bytes of an agent note the audit record keeps (ADR 0014 amendment section 2.3).
+pub const MAX_ACCESS_NOTE_BYTES: usize = 200;
+/// Longest a `RequestAccess` call waits for the human before it answers `pending`.
+pub const MAX_ACCESS_WAIT_MS: u64 = 120_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -521,12 +529,95 @@ pub enum PrincipalRequest {
         request_json: String,
         timeout_ms: u32,
     },
+    /// Ask the human, before navigating, for `action` at `rp_id` (ADR 0014 amendment section
+    /// 2.3). It can only lead to what a ceremony-time `request` for the same key could lead to,
+    /// and only where the live policy resolves the key to `request`. `note` goes to the audit log
+    /// only (sanitized, at most [`MAX_ACCESS_NOTE_BYTES`]) and is never shown in a prompt.
+    /// `wait_ms` bounds how long this call waits for a decision (at most
+    /// [`MAX_ACCESS_WAIT_MS`]); the request stays pending after it, and repeating the same call
+    /// from the same principal session reports its state.
+    RequestAccess {
+        rp_id: String,
+        action: GrantAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
+}
+
+/// The state a `RequestAccess` call reports (ADR 0014 amendment section 2.3). Every value is a
+/// normal answer; only a malformed request or a broken connection is an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessRequestState {
+    /// The live policy already allows the action at the site; nothing was prompted.
+    AlreadyAllowed,
+    /// The human has not decided yet: call again later with the same arguments.
+    Pending,
+    /// Approved. For `authenticate` the grant is persisted; for `register` a one-use approval
+    /// waits for this principal session's next registration at the site.
+    Approved,
+    /// The human denied it.
+    Denied,
+    /// It ended without a decision (timeout, the notification server went away, or a policy
+    /// change cancelled it).
+    Expired,
+    /// The site and action are in their cooldown after a recent deny or timeout.
+    Cooldown,
+    /// This principal session has a pending pre-request already, or asked too often.
+    RateLimited,
+    /// The live policy does not resolve the action at the site to `request`, or this session
+    /// cannot run the ceremony (a `register` from a session that does not own the browser).
+    NotRequestable,
+    /// The profile does not list the action in `pre_request_actions`.
+    NotEnabled,
+    /// No prompt can be shown (no usable notification server).
+    Unavailable,
+    /// Another request for the site and action is in progress, or a limit of the escalation
+    /// queue was reached.
+    Busy,
+}
+
+impl AccessRequestState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyAllowed => "already_allowed",
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Cooldown => "cooldown",
+            Self::RateLimited => "rate_limited",
+            Self::NotRequestable => "not_requestable",
+            Self::NotEnabled => "not_enabled",
+            Self::Unavailable => "unavailable",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+/// The answer to `PrincipalRequest::RequestAccess`. The CLI's `--json` output and the MCP tool's
+/// result carry the same object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRequestStatus {
+    pub state: AccessRequestState,
+    /// The normalized RP ID the request was decided for (the input when it did not validate).
+    pub rp_id: String,
+    pub action: GrantAction,
+    /// For an approved `register`: seconds until the one-use approval lapses.
+    pub expires_in_secs: Option<u64>,
+    /// For `cooldown` and `rate_limited`, when known: seconds before asking again can help.
+    pub retry_after_secs: Option<u64>,
+    /// A daemon-written sentence for the agent; it never contains agent-supplied text.
+    pub message: String,
 }
 
 /// The action a rule or a granted rule applies to. The wire form is `register` or `authenticate`
 /// (it was `IntentAction` before the principal intent protocol was removed; the names on the wire
 /// did not change).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum GrantAction {
     Register,
@@ -546,6 +637,7 @@ pub enum PrincipalResponse {
     BrowserEnsured(BrowserStatusResponse),
     BrowserControl { messages: Vec<String> },
     SignAssertionResult(SignAssertionResponse),
+    AccessRequest(AccessRequestStatus),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -806,12 +898,17 @@ pub struct GrantedRuleInfo {
     pub granted_at: String,
     /// The approving escalation's ID.
     pub request_id: String,
-    /// The origin of the ceremony that requested it.
+    /// The origin of the ceremony that requested it; empty for an `authenticate` pre-request,
+    /// which has no page (granted-rules store version 2).
     pub origin: String,
     /// The permitting configuration rule: the exact RP ID or `*`.
     pub rule: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// Who raised the escalation: `ceremony` or `pre_request` (ADR 0014 amendment section 7).
+    /// Absent from an older daemon's answer, which means `ceremony`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// The granted rules of one profile. A store that failed to load is disabled (fail closed) and
@@ -1429,6 +1526,29 @@ impl Validate for PrincipalRequest {
                     ));
                 }
             }
+            Self::RequestAccess {
+                rp_id,
+                note,
+                wait_ms,
+                ..
+            } => {
+                check_str(rp_id, "request_access: rp_id", MAX_RP_ID_LEN, &mut errors);
+                if let Some(note) = note
+                    && note.len() > MAX_ACCESS_NOTE_WIRE_LEN
+                {
+                    errors.push(format!(
+                        "request_access: note exceeds maximum length {} (got {})",
+                        MAX_ACCESS_NOTE_WIRE_LEN,
+                        note.len()
+                    ));
+                }
+                if wait_ms.is_some_and(|wait| wait > MAX_ACCESS_WAIT_MS) {
+                    errors.push(format!(
+                        "request_access: wait_ms must be at most {}",
+                        MAX_ACCESS_WAIT_MS
+                    ));
+                }
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -1857,7 +1977,7 @@ mod tests {
     #[test]
     fn version_current_is_1_2() {
         assert_eq!(CURRENT_VERSION.major, 1);
-        assert_eq!(CURRENT_VERSION.minor, 2);
+        assert_eq!(CURRENT_VERSION.minor, 3);
     }
 
     #[test]
@@ -1877,7 +1997,7 @@ mod tests {
     fn version_negotiate_higher_minor_clamped() {
         let offer = ProtocolVersion::new(1, 5);
         let negotiated = ProtocolVersion::negotiate(offer).unwrap();
-        assert_eq!(negotiated, ProtocolVersion::new(1, 2));
+        assert_eq!(negotiated, ProtocolVersion::new(1, 3));
     }
 
     #[test]
@@ -1897,7 +2017,7 @@ mod tests {
 
     #[test]
     fn version_display() {
-        assert_eq!(CURRENT_VERSION.to_string(), "1.2");
+        assert_eq!(CURRENT_VERSION.to_string(), "1.3");
         assert_eq!(ProtocolVersion::new(2, 3).to_string(), "2.3");
     }
 
@@ -2106,6 +2226,7 @@ mod tests {
                         origin: "https://example.com".into(),
                         rule: "example.com".into(),
                         credential_ref: Some("ab".repeat(16)),
+                        source: Some("pre_request".into()),
                     }],
                 },
                 ProfileGrantedRules {
@@ -3148,5 +3269,124 @@ mod tests {
         assert!(json.contains("cdp_endpoint"));
         let decoded: BrowserLaunchedResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn request_access_round_trips_and_refuses_unknown_fields() {
+        let request = PrincipalRequest::RequestAccess {
+            rp_id: "example.org".into(),
+            action: GrantAction::Register,
+            note: Some("need to sign up".into()),
+            wait_ms: Some(30_000),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"request_access":{"rp_id":"example.org","action":"register","note":"need to sign up","wait_ms":30000}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PrincipalRequest>(&json).unwrap(),
+            request
+        );
+        // Optional fields may be left out.
+        let minimal: PrincipalRequest = serde_json::from_str(
+            r#"{"request_access":{"rp_id":"example.org","action":"authenticate"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            minimal,
+            PrincipalRequest::RequestAccess {
+                rp_id: "example.org".into(),
+                action: GrantAction::Authenticate,
+                note: None,
+                wait_ms: None,
+            }
+        );
+        for bad in [
+            r#"{"request_access":{"rp_id":"example.org","action":"authenticate","extra":1}}"#,
+            r#"{"request_access":{"rp_id":"example.org","action":"sign"}}"#,
+            r#"{"request_access":{"action":"authenticate"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PrincipalRequest>(bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_access_validation_bounds_the_rp_id_note_and_wait() {
+        let request = |rp_id: &str, note: Option<String>, wait_ms: Option<u64>| {
+            PrincipalRequest::RequestAccess {
+                rp_id: rp_id.into(),
+                action: GrantAction::Authenticate,
+                note,
+                wait_ms,
+            }
+        };
+        assert!(request("example.org", None, None).validate().is_ok());
+        assert!(
+            request(
+                "example.org",
+                Some("x".repeat(MAX_ACCESS_NOTE_WIRE_LEN)),
+                Some(MAX_ACCESS_WAIT_MS)
+            )
+            .validate()
+            .is_ok()
+        );
+        assert!(request("", None, None).validate().is_err());
+        assert!(request(&"a".repeat(254), None, None).validate().is_err());
+        assert!(request("exa\0mple.org", None, None).validate().is_err());
+        assert!(
+            request(
+                "example.org",
+                Some("x".repeat(MAX_ACCESS_NOTE_WIRE_LEN + 1)),
+                None
+            )
+            .validate()
+            .is_err()
+        );
+        assert!(
+            request("example.org", None, Some(MAX_ACCESS_WAIT_MS + 1))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn access_request_status_round_trips_with_every_state() {
+        for state in [
+            AccessRequestState::AlreadyAllowed,
+            AccessRequestState::Pending,
+            AccessRequestState::Approved,
+            AccessRequestState::Denied,
+            AccessRequestState::Expired,
+            AccessRequestState::Cooldown,
+            AccessRequestState::RateLimited,
+            AccessRequestState::NotRequestable,
+            AccessRequestState::NotEnabled,
+            AccessRequestState::Unavailable,
+            AccessRequestState::Busy,
+        ] {
+            let status = AccessRequestStatus {
+                state,
+                rp_id: "example.org".into(),
+                action: GrantAction::Register,
+                expires_in_secs: Some(597),
+                retry_after_secs: None,
+                message: "m".into(),
+            };
+            let response = PrincipalResponse::AccessRequest(status.clone());
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(json["access_request"]["state"], state.as_str());
+            assert!(json["access_request"]["retry_after_secs"].is_null());
+            let decoded: PrincipalResponse = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded, response);
+        }
+        let unknown = serde_json::json!({
+            "state": "pending", "rp_id": "example.org", "action": "authenticate",
+            "expires_in_secs": null, "retry_after_secs": null, "message": "m", "extra": true
+        });
+        assert!(serde_json::from_value::<AccessRequestStatus>(unknown).is_err());
     }
 }

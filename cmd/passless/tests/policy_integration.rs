@@ -8,6 +8,7 @@ use passless_core::agent::{
 fn base_params() -> PolicyParams {
     PolicyParams {
         wildcard_registration_prompts_per_day: 3,
+        pre_request_actions: vec![],
         acknowledged_global_registration: false,
         credential_refs_configured: false,
         max_wildcard_registrations: 4,
@@ -45,7 +46,7 @@ fn base_params() -> PolicyParams {
 fn policy_from_params_round_trip() {
     let params = base_params();
     let policy = Policy::from_params(params.clone()).unwrap();
-    assert_eq!(policy.version, 6);
+    assert_eq!(policy.version, 7);
     assert_eq!(policy.profile_id, "testprofile");
     assert_eq!(policy.mode, "isolated");
     assert_eq!(policy.normalized_rp_ids, vec!["example.com"]);

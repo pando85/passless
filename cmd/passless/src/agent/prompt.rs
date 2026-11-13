@@ -1767,7 +1767,8 @@ mod dbus_tests {
             principal_user: "agent".to_string(),
             verb: PromptVerb::Authenticate,
             rp_id: "bücher.example".to_string(),
-            origin: "https://bücher.example".to_string(),
+            origin: Some("https://bücher.example".to_string()),
+            requested_in_advance: false,
             rule: PromptRule::Exact,
             store_count: None,
         }
@@ -1780,7 +1781,8 @@ mod dbus_tests {
             principal_user: "alice".to_string(),
             verb: PromptVerb::Register,
             rp_id: "example.org".to_string(),
-            origin: "https://www.example.org".to_string(),
+            origin: Some("https://www.example.org".to_string()),
+            requested_in_advance: false,
             rule: PromptRule::Wildcard,
             store_count: Some(1),
         }

@@ -1,13 +1,13 @@
 # ADR 0014 amendment: pins with the wildcard, registration at unlisted sites, agent pre-requests
 
-- **Status:** Accepted (2026-11-12); Phase 1 implemented and folded into ADR 0014
+- **Status:** Accepted (2026-11-12); Phase 1 and Phase 2 (steps 1 and 2) implemented and folded into ADR 0014
 - **Date:** 2026-11-12
 - **Amends:** [ADR 0014](0014-agent-delegation.md) §6.2, §6.3, §6.4, §8.1 to §8.4, §9, §10.1, §10.3, §12,
   §14, §15, §17
 - **Base:** master at v0.23.0 (`9ffc776`)
 - **Decision owners:** Passless maintainers
-- **Delivery:** Phase 1 (v0.25.0): changes 1 and 2. Phase 2: change 3, steps 1 and 2. See
-  [§13](#13-implementation-plan).
+- **Delivery:** Phase 1 (v0.25.0): changes 1 and 2. Phase 2: change 3, steps 1 and 2, implemented on
+  the pre-requests branch after v0.26.0. See [§13](#13-implementation-plan).
 
 This amendment records three related decisions. Each has its own rationale and threat analysis. The
 accepted answers to the questions raised during review are listed in [§14](#14-decisions-taken-in-review).
@@ -261,7 +261,9 @@ connection.
 - `register` (step 2): allowed only from a principal session that owns a browser lease or will own
   the next one (`browser_scope = "session"`, or the owner under `"profile"`). The token binds to that
   principal session, so a request from a session that cannot run the ceremony is refused
-  (`not_requestable`, with a message), not issued.
+  (`not_requestable`, with a message), not issued. Under `browser_scope = "profile"` the token is
+  the owner's: any session attached to the shared browser acts as its owner (its ceremonies run on
+  the owner's session grant) and can use the owner's pre-approval.
 
 Surfaces:
 
@@ -276,8 +278,11 @@ Surfaces:
   Without the flag the wrapper behaves exactly as today: Playwright MCP inherits the stdio and no
   tool is added. Since the broker owns the browser's session, `register` tokens issued this way are
   consumable by that browser's ceremonies. Each of the motivating user's three agents has its own
-  wrapper and principal session, so tokens never cross between them. Whether the flag becomes the
-  default is a later decision.
+  wrapper and principal session, so with `browser_scope = "session"` tokens never cross between
+  them. With `browser_scope = "profile"` the agents attached to the shared browser ride on its
+  owner's session grant, so any of them acts as the owner for a registration ceremony and can use
+  the owner's pre-approval; the token is bound to the owner's principal session, not to the agent
+  that asked. Whether the flag becomes the default is a later decision.
 - No standalone MCP server: it would be a different principal session from the browser's, so it
   could only ever do `authenticate`, which the CLI already covers for agents with a shell.
 
@@ -304,7 +309,11 @@ Surfaces:
   token at issue. TTL 10 minutes, capped by the principal session's remaining TTL. Consumed by the
   first registration ceremony that resolves to `request` at exactly that RP from a bearer session
   owned by that principal session, at the point where `Escalation::prepare` would run (after the
-  option checks, so an unsupported request does not burn it). Consumption turns it into the
+  option checks, so an unsupported request does not burn it) and once its replay key is fresh (a
+  duplicate, joined or rejected ceremony only checks that a token exists and does not spend it;
+  if the token is gone by then the ceremony escalates as usual). A token is usable only after its
+  `pre_approval.issued` record is written; if that cannot be written there is no token and the
+  agent is told `unavailable`. Consumption turns it into the
   ceremony's `RegistrationApproval`; from there the path is §8.3 unchanged (budget claim after
   approval, pre-key-use re-check that the rule still resolves to `request`, grant persisted after
   the write). It is dropped on TTL, principal session end, lease revocation, revocation-epoch bump,
@@ -315,8 +324,11 @@ Surfaces:
   cancel request.
 - *Idempotent.* Repeating the same request from the same principal session returns the state of its
   pending escalation or token instead of raising a new one. This is how a client polls.
-- *Rate limits.* Per principal session: 1 pending pre-request, at most 6 per 10 minutes; beyond
-  that `rate_limited`, without a prompt.
+- *Rate limits.* Per principal session: 1 pending pre-request, at most 6 per 10 minutes. Per
+  profile, across all its principal sessions: at most 3 pending and at most 12 per 10 minutes
+  (the out-of-session CLI starts a fresh principal session for every call, so the per-session
+  bounds alone never apply to it, and the profile's count survives those sessions' ends). Beyond
+  either bound `rate_limited`, without a prompt (`pre_request_rate_limited`).
 
 **Agent-supplied text (`--note`).** Never shown in the notification. Reasons:
 
@@ -672,7 +684,7 @@ text).
 
 | Deployment | New capability | Bound |
 |---|---|---|
-| any | Raise prompts without a page or navigation, so faster and cheaper | Opt-in per profile; 1 pending and 6 per 10 minutes per session; shared per-key cooldown; one prompt per profile; queue and waiter caps; the change 2 limits for wildcard registration |
+| any | Raise prompts without a page or navigation, so faster and cheaper | Opt-in per profile; 1 pending and 6 per 10 minutes per session, and 3 pending and 12 per 10 minutes per profile across sessions; shared per-key cooldown; one prompt per profile; queue and waiter caps; the change 2 limits for wildcard registration |
 | any | Time a prompt to coincide with one the human expects (confusion) | The prompt says "requested in advance, no page is waiting" and names the site; minimum review delay |
 | any | Learn whether an RP is already allowed (`already_allowed`) | Rules are already visible through `Authority`; granted state is new but low value. No credential-existence oracle: the store count is shown to the human only, and the pre-request never reports it |
 | any | Put text in front of the human | Not possible: the note goes to the audit only |
@@ -939,6 +951,26 @@ Sonnet:
   created; exact rules are unchanged (§2.2 item 3).
 - **Agent-supplied note:** audit only, sanitized, at most 200 bytes, never shown in the prompt.
 - **MCP relay:** opt-in with `--with-access-tool`; making it the default is a later decision.
+
+### 14.1 Implementation notes (Phase 2)
+
+What the implementation settled where this text left room:
+
+- A registration approved through a pre-request (adopted or by token) persists its grant with
+  `source = "pre_request"` and the ceremony's origin; only an `authenticate` pre-request's grant has no
+  origin. Both force store version 2.
+- A ceremony's escalation records carry `principal_session_id_hash` too: the principal session that owns
+  the page's browser. It is a pre-request's requester for the records the pre-request raised.
+- `cooldown` answers carry `retry_after_secs` only when the daemon knows it (it does not for a per-key
+  cooldown today); `rate_limited` carries it when it does.
+- A token capped by a short principal session ends with the session, and the audit usually records
+  `session_end` rather than `ttl`; `ttl` is the 10 minute case.
+- The CLI's `--wait` defaults to 30 seconds, like the tool's `wait_seconds`, and every state exits 0.
+  Outside a principal session the command runs itself in a fresh session, which ends with it and so
+  withdraws a request that is still pending; its text output says so.
+- `agent-admin` prints `SOURCE` (after `RULE`) in the grants table, with `-` for an empty origin, and the
+  JSON carries the same values. The audit export labels `agent_note`: an `agent_supplied` key in the JSON
+  rows and a last CSV column of that name.
 
 ## 15. Future work
 

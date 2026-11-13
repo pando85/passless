@@ -2,13 +2,14 @@ use std::fmt;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use passless_core::agent::{
     BrowserLeaseId, CredentialRef, GrantId, IntentId, PrincipalSessionId, ProfileId,
 };
 
 use super::grant::{CeremonyId, GrantRequestId};
-use super::granted_rules::{GrantKind, PermittingRule};
+use super::granted_rules::{GrantKind, PermittingRule, RequestSource};
 use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 
 /// The audit event schema version, written as `v` in every record.
@@ -26,9 +27,16 @@ use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 ///   `credential_scope` (`pinned`, `discovered`, `registration_pinned`, or null before the
 ///   candidate set was chosen), and `policy.deny` gains the reasons `wildcard_registration_cap`,
 ///   `wildcard_registration_rate` and `wildcard_registration_cooldown`.
+/// - 5 (ADR 0014 amendment section 8, Phase 2): operation records carry `approval_source`
+///   (`ceremony` or `pre_request` for an operation that ran on an escalation approval or a
+///   pre-approval, null otherwise); escalation records carry `source`,
+///   `principal_session_id_hash` and `agent_note` (only on a pre-request's `requested`), and
+///   their `origin` may be null; new kinds `pre_approval.issued`, `pre_approval.consumed` and
+///   `pre_approval.expired`; `policy.deny` gains `not_requestable`, `pre_request_rate_limited`
+///   and `pre_request_not_enabled`.
 ///
 /// Readers accept every version: fields added in a later version default when absent.
-pub const AUDIT_SCHEMA_VERSION: u32 = 4;
+pub const AUDIT_SCHEMA_VERSION: u32 = 5;
 
 /// ADR 0014 section 12: the fields every operation record carries. This is the single canonical
 /// list: `OperationRecord` serializes exactly these keys, and the field-presence tests check
@@ -54,6 +62,7 @@ const SECTION_12_OPERATION_FIELDS: &[&str] = &[
     "evidence_source",
     "credential_ref",
     "credential_scope",
+    "approval_source",
     "selection_rule",
     "backend",
     "key_provider",
@@ -98,6 +107,9 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
             "rp_id",
             "origin",
             "rule",
+            "source",
+            "principal_session_id_hash",
+            "agent_note",
         ],
     ),
     (
@@ -109,6 +121,9 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
             "rp_id",
             "origin",
             "rule",
+            "source",
+            "principal_session_id_hash",
+            "agent_note",
             "latency_ms",
         ],
     ),
@@ -121,6 +136,9 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
             "rp_id",
             "origin",
             "rule",
+            "source",
+            "principal_session_id_hash",
+            "agent_note",
             "cause",
         ],
     ),
@@ -133,6 +151,9 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
             "rp_id",
             "origin",
             "rule",
+            "source",
+            "principal_session_id_hash",
+            "agent_note",
             "reason",
         ],
     ),
@@ -145,6 +166,9 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
             "rp_id",
             "origin",
             "rule",
+            "source",
+            "principal_session_id_hash",
+            "agent_note",
             "reason",
         ],
     ),
@@ -160,6 +184,39 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
         ],
     ),
     ("granted_rule.revoke", &["profile_id", "rp_id", "revoked"]),
+    (
+        "pre_approval.issued",
+        &[
+            "escalation_id",
+            "profile_id",
+            "rp_id",
+            "rule",
+            "principal_session_id_hash",
+            "ttl_secs",
+        ],
+    ),
+    (
+        "pre_approval.consumed",
+        &[
+            "escalation_id",
+            "profile_id",
+            "rp_id",
+            "rule",
+            "principal_session_id_hash",
+            "request_id",
+        ],
+    ),
+    (
+        "pre_approval.expired",
+        &[
+            "escalation_id",
+            "profile_id",
+            "rp_id",
+            "rule",
+            "principal_session_id_hash",
+            "reason",
+        ],
+    ),
     (
         "grant.request",
         &[
@@ -275,6 +332,21 @@ impl AuditEvent {
 
     pub fn kind_name(&self) -> &'static str {
         self.payload.kind_name()
+    }
+
+    /// The names of the fields of this record that hold agent-supplied text: `agent_note`, the
+    /// note of a pre-request (schema 5), when the record has one. The export labels them so that
+    /// a reader sees which words are the agent's, not the daemon's (ADR 0014 amendment section
+    /// 2.3); the record itself, and so the hash chain, is unchanged.
+    pub fn agent_supplied_fields(&self) -> Vec<&'static str> {
+        const FIELDS: [&str; 1] = ["agent_note"];
+        let Ok(value) = serde_json::to_value(self) else {
+            return Vec::new();
+        };
+        FIELDS
+            .into_iter()
+            .filter(|field| value.get(field).is_some_and(|v| !v.is_null()))
+            .collect()
     }
 
     /// The request ID of an operation reservation (`policy.allow`), if this is one.
@@ -475,6 +547,17 @@ pub enum AuditPayload {
     /// A pending escalation was cancelled by a policy reload.
     #[serde(rename = "escalation.revoked")]
     EscalationRevoked(EscalationRevokedMeta),
+    /// A `register` pre-request was approved before a ceremony adopted it: a one-use pre-approval
+    /// now waits for its principal session's next registration at the RP (ADR 0014 amendment
+    /// section 2.3).
+    #[serde(rename = "pre_approval.issued")]
+    PreApprovalIssued(PreApprovalIssuedMeta),
+    /// A registration ceremony consumed a pre-approval.
+    #[serde(rename = "pre_approval.consumed")]
+    PreApprovalConsumed(PreApprovalConsumedMeta),
+    /// A pre-approval was dropped unused.
+    #[serde(rename = "pre_approval.expired")]
+    PreApprovalExpired(PreApprovalExpiredMeta),
 
     #[serde(rename = "admin.profile_enable")]
     AdminProfileEnable(AdminProfileEnableMeta),
@@ -566,6 +649,9 @@ impl AuditPayload {
             Self::EscalationDenied(_) => "escalation.denied",
             Self::EscalationExpired(_) => "escalation.expired",
             Self::EscalationRevoked(_) => "escalation.revoked",
+            Self::PreApprovalIssued(_) => "pre_approval.issued",
+            Self::PreApprovalConsumed(_) => "pre_approval.consumed",
+            Self::PreApprovalExpired(_) => "pre_approval.expired",
             Self::AdminProfileEnable(_) => "admin.profile_enable",
             Self::AdminProfileDisable(_) => "admin.profile_disable",
             Self::AdminProfileDisableRequest(_) => "admin.profile_disable_request",
@@ -1051,7 +1137,10 @@ impl OperationResult {
             | R::CredentialUnavailable
             | R::InternalFailure
             | R::Abandoned => Self::Error,
+            R::PreRequestRateLimited => Self::Busy,
             R::DefaultDeny
+            | R::NotRequestable
+            | R::PreRequestNotEnabled
             | R::ActionNotAllowed
             | R::RpIdNotMatch
             | R::CredentialNotMatch
@@ -1128,6 +1217,10 @@ pub struct OperationRecord {
     /// set was chosen, and for registrations.
     #[serde(default)]
     credential_scope: Option<CredentialScope>,
+    /// What approved the operation (schema version 5): `ceremony` or `pre_request` when it ran on
+    /// an escalation approval or a pre-approval, null otherwise.
+    #[serde(default)]
+    approval_source: Option<RequestSource>,
     #[serde(default)]
     selection_rule: Option<String>,
     /// The storage backend the operation used (`local`, `pass` or `tpm`): the human backend's
@@ -1167,6 +1260,7 @@ impl OperationRecord {
             evidence_source: None,
             credential_ref: None,
             credential_scope: None,
+            approval_source: None,
             selection_rule: None,
             backend: None,
             key_provider: None,
@@ -1244,6 +1338,11 @@ impl OperationRecord {
 
     pub fn credential_scope(mut self, scope: Option<CredentialScope>) -> Self {
         self.credential_scope = scope;
+        self
+    }
+
+    pub fn approval_source(mut self, source: Option<RequestSource>) -> Self {
+        self.approval_source = source;
         self
     }
 
@@ -1430,6 +1529,15 @@ pub enum PolicyDenyReason {
     /// escalation of the profile was denied, timed out or withdrawn too often recently, which
     /// starts a profile-wide cooldown of `agents.escalation_cooldown` (item 6).
     WildcardRegistrationCooldown,
+    /// A pre-request (ADR 0014 amendment section 2.3) for a site and action that the live policy
+    /// does not resolve to `request`, or a `register` pre-request from a principal session that
+    /// cannot run the ceremony. Nothing was prompted.
+    NotRequestable,
+    /// A pre-request beyond its principal session's limits: one pending, at most six per ten
+    /// minutes. Nothing was prompted.
+    PreRequestRateLimited,
+    /// A pre-request for an action the profile does not list in `pre_request_actions`.
+    PreRequestNotEnabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1599,11 +1707,130 @@ pub enum EscalationExpireReason {
     ServerLost,
 }
 
+/// Who raised an escalation (schema version 5). Every key is always written.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EscalationRequesterMeta {
+    /// `ceremony` or `pre_request`; `ceremony` in a record written before version 5.
+    #[serde(default)]
+    source: RequestSource,
+    /// [`principal_session_id_hash`] of the principal session that raised a pre-request, or that
+    /// owns the bearer of the ceremony that raised the escalation; null when unknown.
+    #[serde(default)]
+    principal_session_id_hash: Option<String>,
+    /// The agent's note, sanitized and at most
+    /// [`passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES`] bytes: agent-supplied,
+    /// untrusted text, recorded for the operator and never shown in a prompt. Only on a
+    /// pre-request's `escalation.requested`; null elsewhere.
+    #[serde(default)]
+    agent_note: Option<String>,
+}
+
+/// A principal session's identity in audit records (schema version 5): the hex SHA-256 of its
+/// identifier, under a domain separator. The `principal.launch` record names the identifier, so
+/// an operator can correlate them; the hash alone reveals nothing else.
+pub fn principal_session_id_hash(session_id: &PrincipalSessionId) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"passless-principal-session-audit-id\0");
+    hasher.update(session_id.as_str().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Why a pre-approval was dropped unused (ADR 0014 amendment section 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreApprovalExpireReason {
+    /// Its time to live passed.
+    Ttl,
+    /// Its principal session ended.
+    SessionEnd,
+    /// A browser lease of its principal session was revoked.
+    LeaseRevoked,
+    /// The revocation epoch moved (a policy reload or a granted-rule revocation).
+    PolicyReload,
+    /// `grants revoke` for its RP, or `grants clear`.
+    GrantRevoked,
+}
+
+/// The fields every `pre_approval.*` record carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreApprovalMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    rp_id: String,
+    /// The permitting rule: `exact` or `*`.
+    rule: String,
+    principal_session_id_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreApprovalIssuedMeta {
+    #[serde(flatten)]
+    pre_approval: PreApprovalMeta,
+    /// How long the pre-approval may wait for its ceremony.
+    ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreApprovalConsumedMeta {
+    #[serde(flatten)]
+    pre_approval: PreApprovalMeta,
+    /// The `request_id` of the registration ceremony that consumed it.
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreApprovalExpiredMeta {
+    #[serde(flatten)]
+    pre_approval: PreApprovalMeta,
+    reason: PreApprovalExpireReason,
+}
+
+impl PreApprovalMeta {
+    pub fn new(
+        escalation_id: &str,
+        profile_id: ProfileId,
+        rp_id: &str,
+        rule: PermittingRule,
+        principal: &PrincipalSessionId,
+    ) -> Self {
+        Self {
+            escalation_id: escalation_id.to_string(),
+            profile_id,
+            rp_id: rp_id.to_string(),
+            rule: rule.as_str().to_string(),
+            principal_session_id_hash: principal_session_id_hash(principal),
+        }
+    }
+
+    pub fn issued(&self, ttl_secs: u64) -> AuditEvent {
+        AuditEvent::new(AuditPayload::PreApprovalIssued(PreApprovalIssuedMeta {
+            pre_approval: self.clone(),
+            ttl_secs,
+        }))
+    }
+
+    pub fn consumed(&self, request_id: &str) -> AuditEvent {
+        AuditEvent::new(AuditPayload::PreApprovalConsumed(PreApprovalConsumedMeta {
+            pre_approval: self.clone(),
+            request_id: request_id.to_string(),
+        }))
+    }
+
+    pub fn expired(&self, reason: PreApprovalExpireReason) -> AuditEvent {
+        AuditEvent::new(AuditPayload::PreApprovalExpired(PreApprovalExpiredMeta {
+            pre_approval: self.clone(),
+            reason,
+        }))
+    }
+}
+
 /// Why a pending escalation was revoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationRevokeReason {
     PolicyReload,
+    /// `grants revoke` for its RP or `grants clear` (schema version 5).
+    GrantRevoked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1612,9 +1839,14 @@ pub struct EscalationRequestedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
-    origin: String,
+    /// The origin of the ceremony; null for a pre-request no ceremony joined (version 5).
+    #[serde(default)]
+    origin: Option<String>,
     /// The matched rule: `exact` or `*`.
+    #[serde(default)]
     rule: String,
+    #[serde(flatten)]
+    requester: EscalationRequesterMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1623,10 +1855,14 @@ pub struct EscalationApprovedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    /// The origin of the ceremony; null for a pre-request no ceremony joined (version 5).
     #[serde(default)]
-    origin: String,
+    origin: Option<String>,
+    /// The matched rule: `exact` or `*`.
     #[serde(default)]
     rule: String,
+    #[serde(flatten)]
+    requester: EscalationRequesterMeta,
     latency_ms: u64,
 }
 
@@ -1636,10 +1872,14 @@ pub struct EscalationDeniedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    /// The origin of the ceremony; null for a pre-request no ceremony joined (version 5).
     #[serde(default)]
-    origin: String,
+    origin: Option<String>,
+    /// The matched rule: `exact` or `*`.
     #[serde(default)]
     rule: String,
+    #[serde(flatten)]
+    requester: EscalationRequesterMeta,
     cause: EscalationDenyCause,
 }
 
@@ -1649,10 +1889,14 @@ pub struct EscalationExpiredMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    /// The origin of the ceremony; null for a pre-request no ceremony joined (version 5).
     #[serde(default)]
-    origin: String,
+    origin: Option<String>,
+    /// The matched rule: `exact` or `*`.
     #[serde(default)]
     rule: String,
+    #[serde(flatten)]
+    requester: EscalationRequesterMeta,
     reason: EscalationExpireReason,
 }
 
@@ -1662,10 +1906,14 @@ pub struct EscalationRevokedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    /// The origin of the ceremony; null for a pre-request no ceremony joined (version 5).
     #[serde(default)]
-    origin: String,
+    origin: Option<String>,
+    /// The matched rule: `exact` or `*`.
     #[serde(default)]
     rule: String,
+    #[serde(flatten)]
+    requester: EscalationRequesterMeta,
     reason: EscalationRevokeReason,
 }
 
@@ -3008,14 +3256,56 @@ pub struct EscalationAuditContext {
     pub profile_id: ProfileId,
     pub action: AuditAction,
     pub rp_id: String,
-    /// The origin of the ceremony that raised the escalation.
-    pub origin: String,
+    /// The origin of the ceremony that raised (or adopted) the escalation; `None` for a
+    /// pre-request no page is behind yet.
+    pub origin: Option<String>,
     pub rule: PermittingRule,
+    /// Who raised the escalation (schema version 5).
+    pub source: RequestSource,
+    /// The principal session that raised the pre-request, or owns the raising ceremony's bearer.
+    pub principal: Option<PrincipalSessionId>,
+    /// The sanitized agent note of a pre-request; written on `escalation.requested` only.
+    pub agent_note: Option<String>,
 }
 
 impl EscalationAuditContext {
+    /// A ceremony's escalation context with no principal session known (tests and callers that
+    /// predate audit version 5).
+    pub fn ceremony(
+        escalation_id: &str,
+        profile_id: ProfileId,
+        action: AuditAction,
+        rp_id: &str,
+        origin: &str,
+        rule: PermittingRule,
+    ) -> Self {
+        Self {
+            escalation_id: escalation_id.to_string(),
+            profile_id,
+            action,
+            rp_id: rp_id.to_string(),
+            origin: Some(origin.to_string()),
+            rule,
+            source: RequestSource::Ceremony,
+            principal: None,
+            agent_note: None,
+        }
+    }
+
     fn rule_name(&self) -> String {
         self.rule.as_str().to_string()
+    }
+
+    fn requester(&self, with_note: bool) -> EscalationRequesterMeta {
+        EscalationRequesterMeta {
+            source: self.source,
+            principal_session_id_hash: self.principal.as_ref().map(principal_session_id_hash),
+            agent_note: if with_note {
+                self.agent_note.clone()
+            } else {
+                None
+            },
+        }
     }
 
     pub fn requested(&self) -> AuditEvent {
@@ -3026,6 +3316,7 @@ impl EscalationAuditContext {
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
             rule: self.rule_name(),
+            requester: self.requester(true),
         }))
     }
 
@@ -3037,6 +3328,7 @@ impl EscalationAuditContext {
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
             rule: self.rule_name(),
+            requester: self.requester(false),
             latency_ms,
         }))
     }
@@ -3049,6 +3341,7 @@ impl EscalationAuditContext {
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
             rule: self.rule_name(),
+            requester: self.requester(false),
             cause,
         }))
     }
@@ -3061,6 +3354,7 @@ impl EscalationAuditContext {
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
             rule: self.rule_name(),
+            requester: self.requester(false),
             reason,
         }))
     }
@@ -3073,6 +3367,7 @@ impl EscalationAuditContext {
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
             rule: self.rule_name(),
+            requester: self.requester(false),
             reason,
         }))
     }
@@ -3351,14 +3646,24 @@ mod tests {
     }
 
     fn escalation_context(pid: &ProfileId) -> EscalationAuditContext {
-        EscalationAuditContext {
-            escalation_id: "esc-1".to_string(),
-            profile_id: pid.clone(),
-            action: AuditAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            origin: "https://example.com".to_string(),
-            rule: PermittingRule::Exact,
-        }
+        EscalationAuditContext::ceremony(
+            "esc-1",
+            pid.clone(),
+            AuditAction::Authenticate,
+            "example.com",
+            "https://example.com",
+            PermittingRule::Exact,
+        )
+    }
+
+    fn pre_approval_meta(pid: &ProfileId) -> PreApprovalMeta {
+        PreApprovalMeta::new(
+            "esc-2",
+            pid.clone(),
+            "example.org",
+            PermittingRule::Wildcard,
+            &test_session_id(),
+        )
     }
 
     /// An operation record with every field set.
@@ -3376,6 +3681,7 @@ mod tests {
             .epochs(3, 2)
             .matched(Some("*".to_string()), Some(RuleGrantSource::Granted))
             .credential(Some(cred.clone()), Some("single".to_string()))
+            .approval_source(Some(RequestSource::PreRequest))
             .counters(Some(4), Some(5))
     }
 
@@ -3460,6 +3766,9 @@ mod tests {
             escalation_context(&pid).denied(EscalationDenyCause::User),
             escalation_context(&pid).expired(EscalationExpireReason::Aborted),
             escalation_context(&pid).revoked(EscalationRevokeReason::PolicyReload),
+            pre_approval_meta(&pid).issued(600),
+            pre_approval_meta(&pid).consumed("req-1"),
+            pre_approval_meta(&pid).expired(PreApprovalExpireReason::Ttl),
             PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com")
                 .evidence_sources("allow", "agent", "agent")
                 .operation(full_operation_record(&pid, &cred))
@@ -3649,8 +3958,9 @@ mod tests {
     #[test]
     fn test_schema_version_is_bumped_for_the_section_12_records() {
         assert_eq!(
-            AUDIT_SCHEMA_VERSION, 4,
-            "operation records gained `credential_scope` (ADR 0014 amendment section 8)"
+            AUDIT_SCHEMA_VERSION, 5,
+            "operation records gained `approval_source` and escalation records `source` \
+             (ADR 0014 amendment section 8, Phase 2)"
         );
     }
 
@@ -3731,6 +4041,115 @@ mod tests {
     }
 
     #[test]
+    fn test_version_5_escalation_and_pre_approval_records() {
+        let pid = test_profile_id();
+        let principal = test_session_id();
+        let pre_request = EscalationAuditContext {
+            origin: None,
+            source: RequestSource::PreRequest,
+            principal: Some(principal.clone()),
+            agent_note: Some("because".to_string()),
+            ..escalation_context(&pid)
+        };
+        let requested = serde_json::to_value(pre_request.requested()).unwrap();
+        assert_eq!(requested["v"], 5);
+        assert_eq!(requested["source"], "pre_request");
+        assert!(requested["origin"].is_null());
+        assert_eq!(requested["agent_note"], "because");
+        let hash = principal_session_id_hash(&principal);
+        assert_eq!(hash.len(), 64);
+        assert_ne!(hash, principal.as_str());
+        assert_eq!(requested["principal_session_id_hash"], hash.as_str());
+        // The note is on `requested` only.
+        for event in [
+            pre_request.approved(1),
+            pre_request.denied(EscalationDenyCause::User),
+            pre_request.expired(EscalationExpireReason::Timeout),
+            pre_request.revoked(EscalationRevokeReason::PolicyReload),
+        ] {
+            let json = serde_json::to_value(event).unwrap();
+            assert!(json["agent_note"].is_null(), "{json}");
+            assert_eq!(json["source"], "pre_request");
+            assert_eq!(json["principal_session_id_hash"], hash.as_str());
+        }
+        // The export labels the note as agent-supplied, on that record only.
+        assert_eq!(
+            pre_request.requested().agent_supplied_fields(),
+            ["agent_note"]
+        );
+        assert!(pre_request.approved(1).agent_supplied_fields().is_empty());
+        assert!(
+            escalation_context(&pid)
+                .requested()
+                .agent_supplied_fields()
+                .is_empty()
+        );
+        // A ceremony's records say so, with null for what does not apply.
+        let ceremony = serde_json::to_value(escalation_context(&pid).requested()).unwrap();
+        assert_eq!(ceremony["source"], "ceremony");
+        assert!(ceremony["principal_session_id_hash"].is_null());
+        assert!(ceremony["agent_note"].is_null());
+        assert_eq!(ceremony["origin"], "https://example.com");
+
+        let meta = PreApprovalMeta::new(
+            "esc-9",
+            pid.clone(),
+            "example.org",
+            PermittingRule::Exact,
+            &principal,
+        );
+        let consumed = serde_json::to_value(meta.consumed("req-7")).unwrap();
+        assert_eq!(consumed["kind"], "pre_approval.consumed");
+        assert_eq!(consumed["request_id"], "req-7");
+        assert_eq!(consumed["principal_session_id_hash"], hash.as_str());
+        for (reason, wire) in [
+            (PreApprovalExpireReason::Ttl, "ttl"),
+            (PreApprovalExpireReason::SessionEnd, "session_end"),
+            (PreApprovalExpireReason::LeaseRevoked, "lease_revoked"),
+            (PreApprovalExpireReason::PolicyReload, "policy_reload"),
+            (PreApprovalExpireReason::GrantRevoked, "grant_revoked"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(meta.expired(reason)).unwrap()["reason"],
+                wire
+            );
+        }
+        for (reason, wire) in [
+            (PolicyDenyReason::NotRequestable, "not_requestable"),
+            (
+                PolicyDenyReason::PreRequestRateLimited,
+                "pre_request_rate_limited",
+            ),
+            (
+                PolicyDenyReason::PreRequestNotEnabled,
+                "pre_request_not_enabled",
+            ),
+        ] {
+            let deny = serde_json::to_value(
+                PolicyDenyBuilder::new(pid.clone(), AuditAction::Register, "example.org", reason)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(deny["reason"], wire);
+            assert!(deny["approval_source"].is_null());
+        }
+    }
+
+    #[test]
+    fn test_version_4_escalation_records_still_read() {
+        let old = serde_json::json!({
+            "v": 4, "ts": 1, "kind": "escalation.requested", "escalation_id": "esc-1",
+            "profile_id": "agent", "action": "register", "rp_id": "example.org",
+            "origin": "https://example.org", "rule": "*"
+        });
+        let event: AuditEvent = serde_json::from_value(old).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["source"], "ceremony");
+        assert!(json["agent_note"].is_null());
+        assert_eq!(json["origin"], "https://example.org");
+    }
+
+    #[test]
     fn test_section_12_lists_cover_every_escalation_kind() {
         for kind in [
             "escalation.requested",
@@ -3740,6 +4159,9 @@ mod tests {
             "escalation.revoked",
             "granted_rule.add",
             "granted_rule.revoke",
+            "pre_approval.issued",
+            "pre_approval.consumed",
+            "pre_approval.expired",
         ] {
             assert!(
                 SECTION_12_OTHER_RECORD_FIELDS
@@ -3929,12 +4351,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 62);
+        assert_eq!(events.len(), 65);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 62, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 65, "duplicate kind names detected");
     }
 
     #[test]
@@ -4176,6 +4598,9 @@ mod tests {
             "prompt.deny",
             "prompt.timeout",
             "prompt.error",
+            "pre_approval.issued",
+            "pre_approval.consumed",
+            "pre_approval.expired",
         ];
         let events = all_test_events();
         let mut actual_kinds: Vec<&str> = events.iter().map(|e| e.kind_name()).collect();

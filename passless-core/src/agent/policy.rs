@@ -37,9 +37,10 @@ impl std::error::Error for PolicyError {}
 /// cooldown; version 6 (ADR 0014 amendment section 3): `acknowledge_global_registration`,
 /// `max_wildcard_registrations`, `wildcard_registration_prompts_per_day`, and whether
 /// `credential_refs` is configured at all, which an empty list does not tell apart from an absent
-/// one). Granted rules themselves are not in this digest: they have their own `grants_digest`, so
+/// one; version 7 (ADR 0014 amendment section 3, Phase 2): `pre_request_actions`). Granted rules
+/// themselves are not in this digest: they have their own `grants_digest`, so
 /// a reload compares configuration only.
-pub const CURRENT_POLICY_VERSION: u8 = 6;
+pub const CURRENT_POLICY_VERSION: u8 = 7;
 const MAX_TTL: u64 = 86400 * 365;
 const MAX_CONCURRENT_GRANTS_LIMIT: u64 = 1000;
 
@@ -87,6 +88,8 @@ pub struct PolicyParams {
     pub max_wildcard_registrations: u64,
     /// The profile's `wildcard_registration_prompts_per_day` in force.
     pub wildcard_registration_prompts_per_day: u64,
+    /// The profile's `pre_request_actions` as wire strings (sorted and deduplicated on build).
+    pub pre_request_actions: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +126,7 @@ pub struct Policy {
     pub acknowledged_global_registration: bool,
     pub max_wildcard_registrations: u64,
     pub wildcard_registration_prompts_per_day: u64,
+    pub pre_request_actions: Vec<String>,
 }
 
 impl Policy {
@@ -139,6 +143,10 @@ impl Policy {
         let mut sorted_actions = params.allowed_actions;
         sorted_actions.sort();
         sorted_actions.dedup();
+
+        let mut sorted_pre_requests = params.pre_request_actions;
+        sorted_pre_requests.sort();
+        sorted_pre_requests.dedup();
 
         let mut sorted_rules = params.rules;
         sorted_rules.sort_by_key(|rule| rule.rp_id.trim().to_ascii_lowercase());
@@ -176,6 +184,7 @@ impl Policy {
             acknowledged_global_registration: params.acknowledged_global_registration,
             max_wildcard_registrations: params.max_wildcard_registrations,
             wildcard_registration_prompts_per_day: params.wildcard_registration_prompts_per_day,
+            pre_request_actions: sorted_pre_requests,
         };
         policy.validate()?;
         Ok(policy)
@@ -219,6 +228,7 @@ impl Policy {
             acknowledged_global_registration: false,
             max_wildcard_registrations: 0,
             wildcard_registration_prompts_per_day: 0,
+            pre_request_actions: vec![],
         })
     }
 
@@ -563,6 +573,16 @@ pub mod cbor {
                 "wildcard_registration_prompts_per_day".to_string(),
                 encode_uint(policy.wildcard_registration_prompts_per_day),
             ),
+            (
+                "pre_request_actions".to_string(),
+                encode_text_array(
+                    &policy
+                        .pre_request_actions
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
         ];
         encode_map_sorted(&entries)
     }
@@ -646,6 +666,7 @@ pub mod cbor {
             "acknowledged_global_registration",
             "max_wildcard_registrations",
             "wildcard_registration_prompts_per_day",
+            "pre_request_actions",
         ];
         keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         keys
@@ -677,10 +698,10 @@ mod tests {
         Policy::new(&ProfileId::new("a").unwrap(), vec!["act".to_string()], 1, 1).unwrap()
     }
 
-    /// The policy map has 32 entries: one byte of length follows the map header (`0xb8`).
+    /// The policy map has 33 entries: one byte of length follows the map header (`0xb8`).
     fn assert_map_header(cbor: &[u8]) {
         assert_eq!(cbor[0], 0xb8, "map header with one length byte");
-        assert_eq!(cbor[1], 32, "map of 32 entries");
+        assert_eq!(cbor[1], 33, "map of 33 entries");
     }
 
     #[test]
@@ -1177,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_policy_version_constant() {
-        assert_eq!(CURRENT_POLICY_VERSION, 6);
+        assert_eq!(CURRENT_POLICY_VERSION, 7);
     }
 
     #[test]
@@ -1188,7 +1209,7 @@ mod tests {
     #[test]
     fn test_sorted_keys_complete() {
         let keys = cbor::sorted_keys_for_policy();
-        assert_eq!(keys.len(), 32);
+        assert_eq!(keys.len(), 33);
         for key in [
             "version",
             "profile_id",
@@ -1222,6 +1243,7 @@ mod tests {
             "acknowledged_global_registration",
             "max_wildcard_registrations",
             "wildcard_registration_prompts_per_day",
+            "pre_request_actions",
         ] {
             assert!(keys.contains(&key), "missing policy key {key}");
         }
@@ -1258,6 +1280,7 @@ mod tests {
                 "browser_cdp_expose",
                 "escalation_timeout",
                 "escalation_cooldown",
+                "pre_request_actions",
                 "browser_runtime_root",
                 "credential_selection",
                 "max_concurrent_grants",
@@ -1347,6 +1370,7 @@ mod tests {
             acknowledged_global_registration: false,
             max_wildcard_registrations: 4,
             wildcard_registration_prompts_per_day: 3,
+            pre_request_actions: vec![],
         }
     }
 
@@ -1425,6 +1449,9 @@ mod tests {
             }),
             ("wildcard_registration_prompts_per_day", |p| {
                 p.wildcard_registration_prompts_per_day += 1
+            }),
+            ("pre_request_actions", |p| {
+                p.pre_request_actions.push("authenticate".to_string())
             }),
             ("rules: add a rule", |p| {
                 p.rules
@@ -1515,10 +1542,12 @@ mod tests {
         a.normalized_rp_ids = vec!["a.example".to_string(), "b.example".to_string()];
         a.allowed_actions = vec!["authenticate".to_string(), "register".to_string()];
         a.credential_refs = vec![ref_a.clone(), ref_b.clone()];
+        a.pre_request_actions = vec!["authenticate".to_string(), "register".to_string()];
         let mut b = base_params();
         b.normalized_rp_ids = vec!["b.example".to_string(), "a.example".to_string()];
         b.allowed_actions = vec!["register".to_string(), "authenticate".to_string()];
         b.credential_refs = vec![ref_b, ref_a];
+        b.pre_request_actions = vec!["register".to_string(), "authenticate".to_string()];
         assert_eq!(digest_of(a), digest_of(b));
     }
 
@@ -1536,14 +1565,15 @@ mod tests {
         assert!(!policy.acknowledged_global_registration);
         assert_eq!(policy.max_wildcard_registrations, 0);
         assert_eq!(policy.wildcard_registration_prompts_per_day, 0);
-        assert_eq!(policy.version, 6);
+        assert!(policy.pre_request_actions.is_empty());
+        assert_eq!(policy.version, 7);
     }
 
     #[test]
     fn policy_rejects_previous_version() {
         let mut policy = test_policy();
-        policy.version = 5;
-        assert_eq!(policy.validate(), Err(PolicyError::InvalidVersion(5)));
+        policy.version = 6;
+        assert_eq!(policy.validate(), Err(PolicyError::InvalidVersion(6)));
     }
 
     #[test]
@@ -1575,5 +1605,32 @@ mod tests {
         empty_pins.credential_refs = vec![];
         empty_pins.credential_refs_configured = true;
         assert_ne!(digest_of(empty_pins), base);
+    }
+
+    #[test]
+    fn digest_version_7_covers_pre_request_actions() {
+        let with = |actions: &[&str]| {
+            let mut params = base_params();
+            params.pre_request_actions = actions.iter().map(|a| a.to_string()).collect();
+            digest_of(params)
+        };
+        let base = digest_of(base_params());
+        // Any change of the list changes the digest.
+        assert_ne!(with(&["authenticate"]), base);
+        assert_ne!(with(&["register"]), base);
+        assert_ne!(with(&["authenticate", "register"]), with(&["authenticate"]));
+        assert_ne!(with(&["authenticate"]), with(&["register"]));
+        // The order of the input list does not, and neither does a repeated value.
+        assert_eq!(
+            with(&["authenticate", "register"]),
+            with(&["register", "authenticate"])
+        );
+        assert_eq!(with(&["register", "register"]), with(&["register"]));
+        let policy = {
+            let mut params = base_params();
+            params.pre_request_actions = vec!["register".to_string(), "authenticate".to_string()];
+            Policy::from_params(params).unwrap()
+        };
+        assert_eq!(policy.pre_request_actions, vec!["authenticate", "register"]);
     }
 }

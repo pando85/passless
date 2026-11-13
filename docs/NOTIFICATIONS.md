@@ -46,6 +46,26 @@ It is shown to you only and never reaches the agent or the page.
 A decision that does not belong to the prompt counts as a deny: `Register once` can only approve a
 registration prompt and `Allow always` only a sign-in prompt. The minimum review delay applies to both.
 
+## Prompts the agent asked for in advance
+
+When an agent asks before it navigates ([Asking in advance](agents/rules.md#asking-in-advance)), the
+prompt is the same one with no page behind it. The sign-in prompt's body gains one line, so it is seven
+lines in all, and its origin line reads `none yet`:
+
+```text
+Profile: coding (same-user)
+Principal user: alice
+Action: sign in with a passkey
+Site: example.org (any page under this site)
+Origin: none yet
+Requested by: the agent in advance (no page is waiting)
+"Allow always" is saved permanently.
+```
+
+A registration prompt keeps its six lines, with `Origin: none yet` and `Requested by: the agent in
+advance (no page is waiting), principal user alice`. The buttons, keys and nonces do not change. Nothing
+the agent wrote is shown: the `--note` of `passless agent request-access` goes to the audit log only.
+
 ## Supported notification servers
 
 Agent `request` rules (escalation prompts) need a server that can show two distinct actions, **Allow
