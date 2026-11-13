@@ -284,6 +284,22 @@ fn refused_status(
     status(state, rp_id, action, message)
 }
 
+/// Whether `session` may hold a registration pre-approval (ADR 0014 amendment section 2.3): it
+/// owns the browser its registrations run in, or will own the next one. Under
+/// `browser_scope = "session"` every session gets its own browser; under `"profile"` only the
+/// session that launched the shared browser (`shared_owner`) owns it, and while none runs any
+/// session may launch it.
+pub(crate) fn owns_or_will_own_browser(
+    scope: BrowserScope,
+    shared_owner: Option<&PrincipalSessionId>,
+    session: &PrincipalSessionId,
+) -> bool {
+    match scope {
+        BrowserScope::Session => true,
+        BrowserScope::Profile => shared_owner.is_none_or(|owner| owner == session),
+    }
+}
+
 impl AgentRuntime {
     /// `PrincipalRequest::RequestAccess` (see the module documentation). Called with no lock held.
     pub(super) fn handle_request_access(
@@ -472,28 +488,21 @@ impl AgentRuntime {
         respond(access_status(&state, rp_id, action))
     }
 
-    /// Whether `session` owns, or would own, the browser its registrations run in: always under
-    /// `browser_scope = "session"`; under `"profile"`, when it launched the shared browser or no
-    /// shared browser runs (it would launch the next one).
+    /// Whether `session` owns, or would own, the browser its registrations run in (see
+    /// [`owns_or_will_own_browser`]). A poisoned bookkeeping lock fails closed.
     fn may_own_browser(
         &self,
         profile: &ProfileRuntime,
         scope: &BrowserScope,
         session: &PrincipalSessionId,
     ) -> bool {
-        match scope {
-            BrowserScope::Session => true,
-            BrowserScope::Profile => profile
-                .shared_browsers
-                .lock()
-                .map(|shared| {
-                    shared
-                        .get(&profile.profile_id)
-                        .is_none_or(|lease| lease.owner_session == *session)
-                })
-                // Fail closed on a poisoned bookkeeping lock.
-                .unwrap_or(false),
-        }
+        let Ok(shared) = profile.shared_browsers.lock() else {
+            return false;
+        };
+        let owner = shared
+            .get(&profile.profile_id)
+            .map(|lease| &lease.owner_session);
+        owns_or_will_own_browser(*scope, owner, session)
     }
 
     /// Whether `session` is still a live principal session of `profile_id`. Takes the
@@ -573,6 +582,31 @@ mod tests {
     use passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES;
 
     const RP: &str = "example.org";
+
+    #[test]
+    fn only_the_browser_owner_may_hold_a_registration_pre_approval() {
+        let me = PrincipalSessionId::new();
+        let other = PrincipalSessionId::new();
+        // Session scope: every session owns its own browser.
+        assert!(owns_or_will_own_browser(BrowserScope::Session, None, &me));
+        assert!(owns_or_will_own_browser(
+            BrowserScope::Session,
+            Some(&other),
+            &me
+        ));
+        // Profile scope: the owner of the shared browser, or anyone while none runs.
+        assert!(owns_or_will_own_browser(BrowserScope::Profile, None, &me));
+        assert!(owns_or_will_own_browser(
+            BrowserScope::Profile,
+            Some(&me),
+            &me
+        ));
+        assert!(!owns_or_will_own_browser(
+            BrowserScope::Profile,
+            Some(&other),
+            &me
+        ));
+    }
 
     #[test]
     fn the_agent_note_is_sanitized_and_bounded() {

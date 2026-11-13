@@ -3370,4 +3370,216 @@ mod tests {
             crate::agent::granted_rules::PermittingRule::Exact
         );
     }
+
+    /// ADR 0014 amendment section 2.3: a `register` pre-request and its pre-approval, end to end
+    /// through the registration ceremony.
+    mod pre_approval {
+        use super::*;
+
+        use passless_core::agent::PrincipalSessionId;
+
+        use crate::agent::escalation::{
+            EscalationRequest, PreRequestParams, PreRequestState, WaiterSession,
+        };
+
+        /// A bearer session owned by `principal` through an active session grant, as the
+        /// browser launch binds it.
+        fn owned_ctx(f: &RegisterTestFixture, principal: &PrincipalSessionId) -> RegisterContext {
+            let ctx = f.make_ctx();
+            let request = f
+                .policy_runtime
+                .admin_request_session_grant(
+                    crate::agent::grant::GrantRequestParams {
+                        profile_id: f.profile_id.clone(),
+                        session_id: principal.clone(),
+                        principal_digest: [0u8; 32],
+                        rp_ids: vec!["example.com".to_string()],
+                        credentials: vec![],
+                        requested_ttl_secs: 60,
+                    },
+                    true,
+                )
+                .unwrap();
+            let grant_id = f
+                .policy_runtime
+                .admin_approve_grant(&request, &crate::agent::identity::admin_authority())
+                .unwrap();
+            ctx.session.bind_grant(grant_id).unwrap();
+            ctx
+        }
+
+        fn pre_register(
+            f: &RegisterTestFixture,
+            principal: &PrincipalSessionId,
+        ) -> PreRequestState {
+            let profile = f.policy_runtime.escalation_profile(&f.profile_id).unwrap();
+            f.escalation.pre_request(PreRequestParams {
+                request: EscalationRequest {
+                    profile: f.profile_id.clone(),
+                    rp_id: "example.com".to_string(),
+                    action: CeremonyAction::Register,
+                    origin: None,
+                    rule: PermittingRule::Exact,
+                    session: WaiterSession::of_principal(principal),
+                    source: RequestSource::PreRequest,
+                    principal: Some(principal.clone()),
+                    agent_note: None,
+                    mode: profile.mode,
+                    principal_user: profile.principal_user,
+                    max_granted_rules: profile.max_granted_rules,
+                    max_wildcard_registrations: profile.max_wildcard_registrations,
+                    wildcard_registration_prompts_per_day: profile
+                        .wildcard_registration_prompts_per_day,
+                    store_counter: None,
+                },
+                pending_for: std::time::Duration::from_secs(600),
+                session_remaining: std::time::Duration::from_secs(3600),
+            })
+        }
+
+        fn pre_approved(f: &RegisterTestFixture, principal: &PrincipalSessionId) {
+            assert_eq!(pre_register(f, principal), PreRequestState::Pending);
+            f.prompter.approve(1);
+            assert!(matches!(
+                pre_register(f, principal),
+                PreRequestState::PreApproved { .. }
+            ));
+        }
+
+        fn kinds(f: &RegisterTestFixture, kind: &str) -> Vec<serde_json::Value> {
+            read_audit_events(&f.audit_dir)
+                .into_iter()
+                .filter(|e| e["kind"] == kind)
+                .collect()
+        }
+
+        #[test]
+        fn the_owning_sessions_registration_consumes_the_pre_approval_without_a_prompt() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            let response = f
+                .make_handler()
+                .register(&ctx, &f.make_req())
+                .expect("the pre-approved registration");
+            assert_eq!(f.prompter.shown(), 1, "no second prompt");
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+            assert_eq!(ctx.session.operations_used(), 1);
+
+            let rules = f.store.profile(&f.profile_id).unwrap().rules().to_vec();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].kind, GrantKind::Registration);
+            assert_eq!(rules[0].source, RequestSource::PreRequest);
+            assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+            let credential_id = b64u_decode(&response.credential_id_b64u).unwrap();
+            assert_eq!(
+                rules[0].credential_ref,
+                Some(CredentialRef::with_default_domain(&credential_id))
+            );
+
+            let reservation = kinds(&f, "policy.allow").pop().unwrap();
+            assert_eq!(reservation["approval_source"], "pre_request");
+            let consumed = kinds(&f, "pre_approval.consumed").pop().unwrap();
+            assert_eq!(consumed["request_id"], reservation["request_id"]);
+            assert_eq!(consumed["escalation_id"], reservation["escalation_id"]);
+
+            // One use: the next registration escalates again.
+            let again = register_on_thread(&f, &ctx, req_with_challenge(&f, b"again"));
+            f.prompter.wait_shown(2);
+            f.prompter.decide(deny());
+            assert!(again.join().unwrap().is_err());
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+        }
+
+        #[test]
+        fn another_sessions_bearer_or_an_unowned_bearer_cannot_use_it() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            // Another principal session's bearer escalates like any ceremony; the human denies.
+            let other = owned_ctx(&f, &PrincipalSessionId::new());
+            let ceremony = register_on_thread(&f, &other, f.make_req());
+            f.prompter.wait_shown(2);
+            f.prompter.decide(deny());
+            assert!(ceremony.join().unwrap().is_err());
+            // A bearer with no session grant has no owner: it is refused (here by the cooldown
+            // that deny started) and consumes nothing either.
+            let unowned = f.make_ctx();
+            assert!(f.make_handler().register(&unowned, &f.make_req()).is_err());
+            assert_eq!(f.prompter.shown(), 2);
+            assert!(kinds(&f, "pre_approval.consumed").is_empty());
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+            // The token is still there for its own session.
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+        }
+
+        #[test]
+        fn an_unsupported_request_does_not_spend_the_pre_approval() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            let unsupported = RegisterCredentialRequest {
+                attestation: Some("enterprise".to_string()),
+                ..f.make_req()
+            };
+            let err = f.make_handler().register(&ctx, &unsupported).unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotSupported);
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+            f.make_handler()
+                .register(&ctx, &f.make_req())
+                .expect("the pre-approval still works");
+        }
+
+        #[test]
+        fn a_revoked_session_grant_cannot_use_the_pre_approval() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            // The principal exits: its grants are revoked and the token dropped.
+            f.policy_runtime.principal_exit(&principal);
+            f.escalation.principal_session_ended(&principal);
+            assert_eq!(
+                kinds(&f, "pre_approval.expired").pop().unwrap()["reason"],
+                "session_end"
+            );
+            let err = f.make_handler().register(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+            assert!(kinds(&f, "pre_approval.consumed").is_empty());
+        }
+
+        #[test]
+        fn a_ceremony_of_the_owning_session_adopts_a_pending_pre_request() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            assert_eq!(pre_register(&f, &principal), PreRequestState::Pending);
+            f.prompter.wait_shown(1);
+            let ctx = owned_ctx(&f, &principal);
+            let ceremony = register_on_thread(&f, &ctx, f.make_req());
+            // Wait until the ceremony has adopted it, then approve the prompt it waits on.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while pre_register(&f, &principal) != PreRequestState::Adopted {
+                assert!(std::time::Instant::now() < deadline, "never adopted");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            f.prompter.decide(PromptEvent::Approved);
+            ceremony.join().unwrap().expect("the adopted registration");
+            assert_eq!(f.prompter.shown(), 1);
+            assert!(kinds(&f, "pre_approval.issued").is_empty());
+            let rules = f.store.profile(&f.profile_id).unwrap().rules().to_vec();
+            assert_eq!(rules[0].source, RequestSource::PreRequest);
+            assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+            let reservation = kinds(&f, "policy.allow").pop().unwrap();
+            assert_eq!(reservation["approval_source"], "pre_request");
+        }
+    }
 }

@@ -2877,6 +2877,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_registry_tells_the_lease_observer_the_revoked_grants() {
+        let registry = SignContextRegistry::new();
+        let seen: Arc<Mutex<Vec<passless_core::agent::GrantId>>> = Arc::default();
+        {
+            let seen = Arc::clone(&seen);
+            registry.set_lease_observer(Box::new(move |grants| {
+                assert!(
+                    lock_order::held_levels().is_empty(),
+                    "the observer runs with no registry lock held"
+                );
+                seen.lock().unwrap().extend_from_slice(grants);
+            }));
+        }
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        let grant = ctx.active_grant_id.clone();
+        let t1 = generate_bearer_token().unwrap();
+        let t2 = generate_bearer_token().unwrap();
+        registry
+            .register_pending(t1.clone(), ctx.clone(), handler.clone())
+            .unwrap();
+        registry.register_pending(t2.clone(), ctx, handler).unwrap();
+        registry.bind_lease(&t1, "lease-x".to_string()).unwrap();
+        registry.bind_lease(&t2, "lease-y".to_string()).unwrap();
+        // A lease with no bearer tells it nothing.
+        registry.revoke_by_lease("lease-none");
+        assert!(seen.lock().unwrap().is_empty());
+        registry.revoke_by_lease("lease-x");
+        assert_eq!(*seen.lock().unwrap(), vec![grant]);
+    }
+
+    #[test]
     fn test_registry_revoke_all() {
         let registry = SignContextRegistry::new();
         let f = sign_handler_tests::TestFixture::new(true);
