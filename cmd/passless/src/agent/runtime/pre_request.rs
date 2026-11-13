@@ -54,16 +54,56 @@ use crate::agent::refusal_ledger::{RefusalKey, RefusalLedger, SummaryTemplate};
 use crate::agent::register::StorageCounter;
 use crate::agent::session::CeremonyAction;
 
-/// The refusal ledgers of principal sessions' pre-requests (ADR 0014 sections 9 and 12, review
-/// M2: refusals are coalesced per session). A plain bookkeeping mutex: only the map is touched
-/// under it, never held across another lock, and a removed ledger is dropped (which writes its
-/// pending counts) after it is released.
+/// Per principal session bookkeeping of pre-requests: the refusal ledgers (ADR 0014 sections 9
+/// and 12, review M2: refusals are coalesced per session) and the parked calls. Plain
+/// bookkeeping mutexes: only the map or set is touched under each, never held across another
+/// lock, and a removed ledger is dropped (which writes its pending counts) after it is released.
 #[derive(Default)]
 pub(crate) struct PreRequestRefusals {
     ledgers: Mutex<HashMap<PrincipalSessionId, Arc<RefusalLedger>>>,
+    /// Principal sessions with a `RequestAccess` call parked in [`EscalationService::wait_pre_request`].
+    /// A parked call holds a principal worker thread (the runtime has [`super::MAX_WORKERS`],
+    /// shared with the admin socket), so each session parks at most one call and the daemon at
+    /// most [`MAX_PARKED_PRE_REQUEST_CALLS`]; any other call answers the state at once.
+    parked: Mutex<std::collections::HashSet<PrincipalSessionId>>,
+}
+
+/// `RequestAccess` calls that may wait for the human at once, daemon-wide: a quarter of the
+/// worker threads, so waiting agents never starve the admin socket.
+pub(crate) const MAX_PARKED_PRE_REQUEST_CALLS: usize = super::MAX_WORKERS / 4;
+
+/// A parked call's slot; released on drop.
+pub(crate) struct ParkedCall<'a> {
+    refusals: &'a PreRequestRefusals,
+    session: PrincipalSessionId,
+}
+
+impl Drop for ParkedCall<'_> {
+    fn drop(&mut self) {
+        self.refusals
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session);
+    }
 }
 
 impl PreRequestRefusals {
+    /// A slot for one parked call of `session`, if neither it nor the daemon is at its limit.
+    pub(crate) fn park(&self, session: &PrincipalSessionId) -> Option<ParkedCall<'_>> {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if parked.len() >= MAX_PARKED_PRE_REQUEST_CALLS || !parked.insert(session.clone()) {
+            return None;
+        }
+        Some(ParkedCall {
+            refusals: self,
+            session: session.clone(),
+        })
+    }
+
     fn ledger(&self, session: &PrincipalSessionId) -> Arc<RefusalLedger> {
         self.ledgers
             .lock()
@@ -455,7 +495,10 @@ impl AgentRuntime {
 
         // 6. Wait for the decision, if asked to, holding no lock.
         let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(MAX_ACCESS_WAIT_MS));
-        if state == PreRequestState::Pending && !wait.is_zero() {
+        if state == PreRequestState::Pending
+            && !wait.is_zero()
+            && let Some(_parked) = self.pre_request_refusals.park(&requester.session_id)
+        {
             let still_valid = || self.principal_session_alive(profile_id, &requester.session_id);
             state = self.escalation.wait_pre_request(
                 &requester.session_id,
@@ -582,6 +625,24 @@ mod tests {
     use passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES;
 
     const RP: &str = "example.org";
+
+    #[test]
+    fn a_session_parks_one_call_and_the_daemon_a_quarter_of_its_workers() {
+        let refusals = PreRequestRefusals::default();
+        let me = PrincipalSessionId::new();
+        let first = refusals.park(&me).expect("a slot");
+        assert!(refusals.park(&me).is_none(), "one parked call per session");
+        drop(first);
+        assert!(refusals.park(&me).is_some());
+        let sessions: Vec<_> = (0..MAX_PARKED_PRE_REQUEST_CALLS)
+            .map(|_| PrincipalSessionId::new())
+            .collect();
+        let slots: Vec<_> = sessions.iter().map(|s| refusals.park(s).unwrap()).collect();
+        assert!(refusals.park(&PrincipalSessionId::new()).is_none());
+        drop(slots);
+        assert!(refusals.park(&PrincipalSessionId::new()).is_some());
+        assert!(MAX_PARKED_PRE_REQUEST_CALLS < super::super::MAX_WORKERS);
+    }
 
     #[test]
     fn only_the_browser_owner_may_hold_a_registration_pre_approval() {

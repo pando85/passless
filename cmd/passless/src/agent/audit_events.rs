@@ -4026,6 +4026,103 @@ mod tests {
     }
 
     #[test]
+    fn test_version_5_escalation_and_pre_approval_records() {
+        let pid = test_profile_id();
+        let principal = test_session_id();
+        let pre_request = EscalationAuditContext {
+            origin: None,
+            source: RequestSource::PreRequest,
+            principal: Some(principal.clone()),
+            agent_note: Some("because".to_string()),
+            ..escalation_context(&pid)
+        };
+        let requested = serde_json::to_value(pre_request.requested()).unwrap();
+        assert_eq!(requested["v"], 5);
+        assert_eq!(requested["source"], "pre_request");
+        assert!(requested["origin"].is_null());
+        assert_eq!(requested["agent_note"], "because");
+        let hash = principal_session_id_hash(&principal);
+        assert_eq!(hash.len(), 64);
+        assert_ne!(hash, principal.as_str());
+        assert_eq!(requested["principal_session_id_hash"], hash.as_str());
+        // The note is on `requested` only.
+        for event in [
+            pre_request.approved(1),
+            pre_request.denied(EscalationDenyCause::User),
+            pre_request.expired(EscalationExpireReason::Timeout),
+            pre_request.revoked(EscalationRevokeReason::PolicyReload),
+        ] {
+            let json = serde_json::to_value(event).unwrap();
+            assert!(json["agent_note"].is_null(), "{json}");
+            assert_eq!(json["source"], "pre_request");
+            assert_eq!(json["principal_session_id_hash"], hash.as_str());
+        }
+        // A ceremony's records say so, with null for what does not apply.
+        let ceremony = serde_json::to_value(escalation_context(&pid).requested()).unwrap();
+        assert_eq!(ceremony["source"], "ceremony");
+        assert!(ceremony["principal_session_id_hash"].is_null());
+        assert!(ceremony["agent_note"].is_null());
+        assert_eq!(ceremony["origin"], "https://example.com");
+
+        let meta = PreApprovalMeta::new(
+            "esc-9",
+            pid.clone(),
+            "example.org",
+            PermittingRule::Exact,
+            &principal,
+        );
+        let consumed = serde_json::to_value(meta.consumed("req-7")).unwrap();
+        assert_eq!(consumed["kind"], "pre_approval.consumed");
+        assert_eq!(consumed["request_id"], "req-7");
+        assert_eq!(consumed["principal_session_id_hash"], hash.as_str());
+        for (reason, wire) in [
+            (PreApprovalExpireReason::Ttl, "ttl"),
+            (PreApprovalExpireReason::SessionEnd, "session_end"),
+            (PreApprovalExpireReason::LeaseRevoked, "lease_revoked"),
+            (PreApprovalExpireReason::PolicyReload, "policy_reload"),
+            (PreApprovalExpireReason::GrantRevoked, "grant_revoked"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(meta.expired(reason)).unwrap()["reason"],
+                wire
+            );
+        }
+        for (reason, wire) in [
+            (PolicyDenyReason::NotRequestable, "not_requestable"),
+            (
+                PolicyDenyReason::PreRequestRateLimited,
+                "pre_request_rate_limited",
+            ),
+            (
+                PolicyDenyReason::PreRequestNotEnabled,
+                "pre_request_not_enabled",
+            ),
+        ] {
+            let deny = serde_json::to_value(
+                PolicyDenyBuilder::new(pid.clone(), AuditAction::Register, "example.org", reason)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(deny["reason"], wire);
+            assert!(deny["approval_source"].is_null());
+        }
+    }
+
+    #[test]
+    fn test_version_4_escalation_records_still_read() {
+        let old = serde_json::json!({
+            "v": 4, "ts": 1, "kind": "escalation.requested", "escalation_id": "esc-1",
+            "profile_id": "agent", "action": "register", "rp_id": "example.org",
+            "origin": "https://example.org", "rule": "*"
+        });
+        let event: AuditEvent = serde_json::from_value(old).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["source"], "ceremony");
+        assert!(json["agent_note"].is_null());
+        assert_eq!(json["origin"], "https://example.org");
+    }
+
+    #[test]
     fn test_section_12_lists_cover_every_escalation_kind() {
         for kind in [
             "escalation.requested",

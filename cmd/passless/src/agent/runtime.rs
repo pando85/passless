@@ -52,7 +52,7 @@ mod gates;
 mod interception;
 mod pre_request;
 
-const MAX_WORKERS: usize = 16;
+pub(crate) const MAX_WORKERS: usize = 16;
 const MAX_COMPLETED_SESSIONS: usize = 256;
 const COMPLETED_SESSION_TTL: Duration = Duration::from_secs(600);
 const WAIT_PRINCIPAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
