@@ -1,13 +1,13 @@
 # ADR 0014 amendment: pins with the wildcard, registration at unlisted sites, agent pre-requests
 
-- **Status:** Accepted (2026-11-12); Phase 1 implemented and folded into ADR 0014
+- **Status:** Accepted (2026-11-12); Phase 1 and Phase 2 (steps 1 and 2) implemented and folded into ADR 0014
 - **Date:** 2026-11-12
 - **Amends:** [ADR 0014](0014-agent-delegation.md) §6.2, §6.3, §6.4, §8.1 to §8.4, §9, §10.1, §10.3, §12,
   §14, §15, §17
 - **Base:** master at v0.23.0 (`9ffc776`)
 - **Decision owners:** Passless maintainers
-- **Delivery:** Phase 1 (v0.25.0): changes 1 and 2. Phase 2: change 3, steps 1 and 2. See
-  [§13](#13-implementation-plan).
+- **Delivery:** Phase 1 (v0.25.0): changes 1 and 2. Phase 2: change 3, steps 1 and 2, implemented on
+  the pre-requests branch after v0.26.0. See [§13](#13-implementation-plan).
 
 This amendment records three related decisions. Each has its own rationale and threat analysis. The
 accepted answers to the questions raised during review are listed in [§14](#14-decisions-taken-in-review).
@@ -939,6 +939,26 @@ Sonnet:
   created; exact rules are unchanged (§2.2 item 3).
 - **Agent-supplied note:** audit only, sanitized, at most 200 bytes, never shown in the prompt.
 - **MCP relay:** opt-in with `--with-access-tool`; making it the default is a later decision.
+
+### 14.1 Implementation notes (Phase 2)
+
+What the implementation settled where this text left room:
+
+- A registration approved through a pre-request (adopted or by token) persists its grant with
+  `source = "pre_request"` and the ceremony's origin; only an `authenticate` pre-request's grant has no
+  origin. Both force store version 2.
+- A ceremony's escalation records carry `principal_session_id_hash` too: the principal session that owns
+  the page's browser. It is a pre-request's requester for the records the pre-request raised.
+- `cooldown` answers carry `retry_after_secs` only when the daemon knows it (it does not for a per-key
+  cooldown today); `rate_limited` carries it when it does.
+- A token capped by a short principal session ends with the session, and the audit usually records
+  `session_end` rather than `ttl`; `ttl` is the 10 minute case.
+- The CLI's `--wait` defaults to 30 seconds, like the tool's `wait_seconds`, and every state exits 0.
+  Outside a principal session the command runs itself in a fresh session, which ends with it and so
+  withdraws a request that is still pending; its text output says so.
+- `agent-admin` prints `SOURCE` (after `RULE`) in the grants table, with `-` for an empty origin, and the
+  JSON carries the same values. The audit export labels `agent_note`: an `agent_supplied` key in the JSON
+  rows and a last CSV column of that name.
 
 ## 15. Future work
 

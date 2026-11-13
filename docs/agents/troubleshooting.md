@@ -160,6 +160,34 @@ Common causes:
 - **Registration from a background tab**: bring the page to the front; the daemon may have created
   the credential anyway (see [Browser tools](browser-tools.md#limits)).
 
+## `passless agent request-access` or `passless_request_access` does not do what I expect
+
+Every answer is a `state` ([Asking in advance](rules.md#asking-in-advance)); the audit has a
+`policy.deny` record with the reason for each refusal:
+
+| `state` | What to check |
+|---|---|
+| `not_enabled` | The profile does not list the action in `pre_request_actions`. Add it, then `agent-admin policy reload <profile>`. The CLI and the tool both need it. |
+| `not_requestable` | The live rules do not resolve the action at that site to `request` (an exact `deny`, no rule, or `allow`, which answers `already_allowed`). `localhost` and invalid sites too. For `register`: another session owns the profile's browser (`browser_scope = "profile"`); ask from the session that launched it, e.g. through `passless agent mcp playwright --with-access-tool`, or the one running `passless agent browser`. |
+| `rate_limited` | This principal session has a request pending (answer it, or wait for it to end) or asked more than 6 times in 10 minutes. |
+| `cooldown` | A recent deny or timeout at that site, from a page or an earlier request. `agents.escalation_cooldown`. |
+| `pending` | You have not answered the notification. Run the same call again; it reports the same request and shows no second prompt. |
+| `unavailable` | No notification server with action support: see "No notification" above. |
+
+- `--register` outside a principal session is an error: the one-use approval is bound to the session
+  that owns the browser. Run it from `passless agent run ...`, or use the MCP tool.
+- Without `--with-access-tool` the MCP tool does not exist: `agent mcp playwright` must be started with
+  the flag (`agent mcp install --with-access-tool` writes it). The CLI works with or without.
+- An `approved` `register` that the browser did not use within 10 minutes, or whose session ended, was
+  dropped (`pre_approval.expired` in the audit); ask again. A second registration needs a second
+  request.
+- A request run outside a principal session starts a session of its own that ends with the command, which
+  withdraws a request still pending: use `--wait` up to 120 seconds, or call it from inside the agent's
+  session.
+- A sign-in is still denied after `approved`? Approval does not sign in. The page must call WebAuthn at
+  that RP; `grants list` should show a `pre_request` grant for it. If the grant was revoked, the policy
+  was reloaded with a change (every session ends) or the browser was restarted, ask again.
+
 ## Authentication stops after some requests
 
 `replayed_operation` and `operation_budget_exhausted` are terminal for that operation or session

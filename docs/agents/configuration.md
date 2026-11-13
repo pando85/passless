@@ -64,6 +64,7 @@ credential_selection = "single"
 | `max_granted_rules` | Granted rules per profile (default 64, 1 to 256). |
 | `max_wildcard_registrations` | Wildcard registration grants (`kind = registration`, `rule = *`) the profile may hold: 1 to 32, default 4. At the cap a registration at an unlisted site is refused without a prompt. A value below the number already stored is valid; revoke grants to free slots. A warning when the profile's `*` rule does not request registration. |
 | `wildcard_registration_prompts_per_day` | Registration prompts for unlisted sites per profile in a rolling 24 hours: 1 to 24, default 3. Beyond it the request is refused without a prompt. In memory; restarts with the daemon. A warning when the profile's `*` rule does not request registration. |
+| `pre_request_actions` | Actions the agent may ask for before it navigates, with `passless agent request-access` or the `passless_request_access` MCP tool: a list of `"authenticate"` and `"register"` (no duplicates), default `[]` (off). It only lets the agent raise the usual prompt without a page: each action must still resolve to `request` at the site. A warning when no rule has the matching `request` action. See [Asking in advance](rules.md#asking-in-advance). |
 | `browser_scope` | `session` (default; each session owns its browser) or `profile` (sessions share one; it closes when its owner session ends, and the others start their own on their next browser call). |
 | `browser_command` | Browser executable and arguments. Optional: see `browser_path`. |
 | `browser_user` | Unix user for the browser (needs a root daemon). Not allowed for `isolated`. In pipe mode under a root daemon it must differ from `principal_user` and the daemon user and must not be root. A non-root daemon cannot switch users, so there the browser runs as the daemon user (which is also the principal's): pipe mode then mediates and audits CDP but does not separate the browser from the agent. |
@@ -123,6 +124,8 @@ Important fail-closed checks:
   `authenticate = "deny"` is invalid.
 - `max_wildcard_registrations` and `wildcard_registration_prompts_per_day` outside their ranges are
   invalid.
+- `pre_request_actions` with an unknown value or a duplicate is invalid; listing an action that no rule
+  sets to `request` is a warning.
 - RP IDs are exact DNS names: partial wildcards, IP addresses, public suffixes, schemes, ports and
   paths are rejected. `localhost` is allowed for exact rules only.
 - A profile may have at most 32 RP rules unless it has a `*` rule.
@@ -157,7 +160,8 @@ startup, and `config check` says so.
   or `max_concurrent_sessions`) is rejected the same way.
 - An **unchanged** effective policy changes nothing and live sessions continue.
 - A **changed** policy revokes every session, closes the managed browsers, and cancels pending
-  escalations. Operations in flight fail before key use.
+  escalations and drops registration pre-approvals. Operations in flight fail before key use. Every
+  profile key is part of the policy digest, `pre_request_actions` included.
 
 ## Pre-flight
 
