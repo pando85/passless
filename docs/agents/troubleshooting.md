@@ -180,7 +180,8 @@ Every answer is a `state` ([Asking in advance](rules.md#asking-in-advance)); the
   the flag (`agent mcp install --with-access-tool` writes it). The CLI works with or without.
 - An `approved` `register` that the browser did not use within 10 minutes, or whose session ended, was
   dropped (`pre_approval.expired` in the audit); ask again. A second registration needs a second
-  request.
+  request. A lost approval still uses one of the profile's `wildcard_registration_prompts_per_day`
+  prompts; `agent-admin profile check <profile>` shows the count used in the last 24 hours.
 - A request run outside a principal session starts a session of its own that ends with the command, which
   withdraws a request still pending: use `--wait` up to 120 seconds, or call it from inside the agent's
   session.

@@ -226,7 +226,7 @@ The tool takes `rp_id` (required), `action` (`authenticate`, the default, or `re
 only for a malformed call (the text is a `ProtocolError`) or a broken link to the daemon. `pending`
 means call again later with the same arguments. Approval does not sign in: the agent navigates and uses
 the site's normal WebAuthn flow afterwards. A `register` approval is valid once, for 10 minutes, in this
-browser only, because the wrapper's own principal session owns the browser.
+browser only, and ends earlier when the wrapper exits, because the wrapper's own principal session owns the browser.
 
 With the flag the wrapper no longer hands its stdio to Playwright MCP but relays it: newline-delimited
 JSON-RPC passes in both directions unchanged, except that the first page of `tools/list` gets the extra

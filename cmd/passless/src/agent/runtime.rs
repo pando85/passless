@@ -3112,6 +3112,10 @@ impl AgentRuntime {
                     profile_config,
                     grants.as_deref(),
                     store_view,
+                    Some(
+                        self.escalation
+                            .wildcard_registration_prompts_used(profile_id),
+                    ),
                 ));
             }
         }
