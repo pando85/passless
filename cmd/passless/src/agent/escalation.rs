@@ -1553,6 +1553,13 @@ impl Inner {
             }
             let request = entry.request.clone();
             let profile = request.profile.clone();
+            if was_prompting && departure == Departure::Timeout {
+                info!(
+                    "escalation {}: the prompt reached its timeout without an answer; withdrawing it \
+                     and denying the request",
+                    entry.id
+                );
+            }
             info!(
                 "escalation {}: last waiter left ({:?}); {}",
                 entry.id,

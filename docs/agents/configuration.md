@@ -22,7 +22,7 @@ audit_path = "/home/alice/.local/state/passless/agent-audit"
 | `browser_path` | Browser binary for profiles that set no `browser_command`. Unset, Passless detects one ([Containment](containment.md#supported-browsers)). |
 | `notify_user` | The user whose session bus receives escalation prompts. A root daemon needs it for `request` rules and it must differ from every `principal_user` and `browser_user`; a non-root daemon may only name its own user. Restart-only. |
 | `state_dir` | Absolute path for persistent agent state, such as granted rules. Default `$XDG_STATE_HOME/passless/agent`, or `/var/lib/passless-agent` for a root daemon. Restart-only. |
-| `escalation_timeout` | Seconds (1 to 72000) capping how long a request waits for a decision. Unset, the page's own timeout applies. |
+| `escalation_timeout` | Seconds (1 to 72000) capping how long a request waits for a decision. Unset, the page's own timeout applies (up to 20 hours). Set it so a prompt nobody can answer, such as a closed or hidden dialog, ends in minutes. The human `security.notification_timeout` does not apply to agent prompts. |
 | `escalation_cooldown` | Seconds (60 to 86400, default 600) during which a denied or expired escalation is denied without a prompt. |
 | `allow_automatic_human_path` | Default `false`. See [Containment](containment.md#automatic-interaction-mode). |
 | `acknowledge_global_same_user` | Profile names allowed to use a `*` rule. |

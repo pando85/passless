@@ -18,6 +18,8 @@ notify-osd (Ubuntu) does not advertise the `actions` capability, but it shows a 
 
 notify-osd cannot close the dialog on Passless's behalf. When an escalation is withdrawn (the page aborted, the request timed out) its dialog may stay on screen; clicking it then does nothing. Every prompt has its own action keys, so an old dialog never answers a newer prompt.
 
+Only a mouse click on **Allow always**, **Register once** or **Deny** answers a prompt. A keypress that lands on the dialog (Enter or space on the focused button, Escape, the window's close button, **Cancel**, or notify-osd's own **OK**) closes it and is treated as a dismissal: the request is denied, and the denial puts it in the escalation cooldown. A keypress never approves. The dialog takes focus when it opens, so Enter typed in another window at that moment can dismiss it.
+
 ## Agent registration prompt
 
 A `register = "request"` rule (on an exact RP or on the `*` rule, see
