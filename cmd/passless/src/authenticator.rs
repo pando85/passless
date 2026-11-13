@@ -4734,6 +4734,7 @@ mod tests {
                         max_uv_retries: MAX_RETRIES,
                         ..Default::default()
                     },
+                    UvConfig::default(),
                 )
                 .expect("create authenticator service");
                 let verifications = Arc::new(Mutex::new(0));
