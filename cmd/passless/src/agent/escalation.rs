@@ -2570,6 +2570,13 @@ impl EscalationService {
                 token_reason,
                 &mut effects,
             );
+            // An unreported outcome from before the change (an approval whose grant was just
+            // revoked) must not be reported as the state of a new request.
+            inner.pre_requests.retain(|(_, key), record| {
+                !(key.profile == *profile
+                    && matches(&key.rp_id)
+                    && matches!(record.status, PreStatus::Settled(_)))
+            });
             let serials: Vec<u64> = inner
                 .entries
                 .iter()
@@ -6583,6 +6590,18 @@ mod tests {
                     .precheck(&ceremony_register("r.example", 1, &a))
                     .is_ok()
             );
+        }
+
+        #[test]
+        fn a_grant_revocation_forgets_an_unreported_approval() {
+            let h = harness();
+            let a = principal(1);
+            pre_auth(&h, "a.example", &a);
+            approve_last(&h);
+            // The operator revokes the grant before the agent polled: the next request is new.
+            h.service.cancel_rp(&profile("p"), "a.example");
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Pending);
+            assert_eq!(h.prompter.shown().len(), 2);
         }
 
         #[test]
