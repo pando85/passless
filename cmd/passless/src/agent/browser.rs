@@ -1526,6 +1526,7 @@ impl BrowserProcessManager {
         let sigterm_deadline = start + self.sigterm_timeout;
         let mut exit_status = None;
 
+        // Wait for the main process to exit
         loop {
             let mut status: libc::c_int = 0;
             let ret = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
@@ -1566,6 +1567,32 @@ impl BrowserProcessManager {
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
+        }
+
+        // Wait for the entire process group to exit (children like zygote, crashpad, etc.)
+        // This prevents orphaned processes from surviving after the main browser exits.
+        let group_cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut status: libc::c_int = 0;
+            // Wait for any process in the process group
+            let ret = unsafe { libc::waitpid(-(pgid as i32), &mut status, libc::WNOHANG) };
+            if ret <= 0 {
+                // No more processes in the group (ret == 0 means none exited yet, ret < 0 with ECHILD means all gone)
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if ret < 0 && errno == libc::ECHILD {
+                    break; // All processes in the group have exited
+                }
+                if ret == 0 {
+                    // Some processes still exist but haven't exited yet
+                    if Instant::now() >= group_cleanup_deadline {
+                        break; // Timeout waiting for stragglers
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                break; // Other error
+            }
+            // A process in the group exited, continue waiting for others
         }
 
         entry.child = None;
