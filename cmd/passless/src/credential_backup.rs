@@ -38,7 +38,7 @@ const WRAPPING_KEY_SUFFIX: &str = ".key";
 const NONCE_SIZE: usize = 12;
 const WRAPPING_KEY_SIZE: usize = 32;
 const MAX_WRAPPING_KEY_FILE_SIZE: usize = 128;
-const PASSLESS_AAGUID: [u8; 16] = [
+pub const PASSLESS_AAGUID: [u8; 16] = [
     0x66, 0x69, 0x64, 0x6f, 0x2e, 0x70, 0x61, 0x73, 0x73, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x72, 0x73,
 ];
 
