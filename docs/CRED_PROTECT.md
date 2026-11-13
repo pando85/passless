@@ -70,13 +70,14 @@ It is not announced in `authenticatorGetInfo`, and standard credential managemen
 ## SSH keys and always_uv
 
 OpenSSH `ed25519-sk` and `ecdsa-sk` keys are enrolled with `ssh-keygen -t ed25519-sk -O resident`.
-If user verification ran during enrollment, the key is stored with credProtect level 3. That
-happens with `security.always_uv = true` (the default), and with every release build from v0.16
-to v0.21 because of a bug. A level 3 credential needs UV for every signature, however
-`always_uv` is set later.
+From this release, a key enrolled with user verification and no credProtect request is stored
+with level 2 (UV optional with the credential ID list), so SSH signs with presence only. Keys
+created by earlier versions keep level 3: that happened with `security.always_uv = true` (the
+default), and with every release build from v0.16 to v0.21 because of a bug. A level 3
+credential needs UV for every signature, however `always_uv` is set later.
 
-If you then set `always_uv = false` and have a PIN, each SSH signature with such a key asks for
-the PIN. Two ways out:
+If you then set `always_uv = false` and have a PIN, each SSH signature with such a level 3 key
+asks for the PIN. Two ways out:
 
 - **Re-enroll the key** (`ssh-keygen -t ed25519-sk -O resident` again, replace the public key
   where it is installed) after changing the setting. Check the result with

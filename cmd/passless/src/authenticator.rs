@@ -1377,9 +1377,10 @@ impl<
 
     /// Decide what to do after soft-fido2 answered a GetAssertion with CTAP2_ERR_NO_CREDENTIALS.
     ///
-    /// When MakeCredential performs UV and the client sent no credProtect extension, soft-fido2
-    /// stores credProtect level 3 (userVerificationRequired). `alwaysUv` makes every enrollment
-    /// do so, including a plain `ssh-keygen -t ed25519-sk` key, and release builds from v0.16.0
+    /// Before soft-fido2 0.18, MakeCredential with UV and no credProtect extension stored credProtect
+    /// level 3 (userVerificationRequired); 0.18 stores level 2, so only credentials created by
+    /// earlier passless versions need this. `alwaysUv` made every enrollment do so, including a
+    /// plain `ssh-keygen -t ed25519-sk` key, and release builds from v0.16.0
     /// to v0.21.0 forced `alwaysUv` regardless of `security.always_uv`. Once
     /// `always_uv = false` is honored, OpenSSH's `{"up": true}` assertion for such a key filters
     /// it out and fails with CTAP2_ERR_NO_CREDENTIALS (issue #588).
@@ -3477,7 +3478,7 @@ mod tests {
 
 /// Issue #588: credentials minted while `alwaysUv` was in effect (the default, and forced in
 /// v0.16.0 to v0.21.0 release builds regardless of `security.always_uv`) carry credProtect level 3
-/// without the client asking for it. An OpenSSH GetAssertion (`up` only, no `uv`, allowList with
+/// without the client asking for it (soft-fido2 before 0.18 defaulted to level 3 after UV). An OpenSSH GetAssertion (`up` only, no `uv`, allowList with
 /// the key handle) must still sign with them after `always_uv = false`, without changing any other
 /// answer and without revealing which RPs hold protected credentials.
 #[cfg(test)]
@@ -3750,17 +3751,19 @@ mod protected_credential_tests {
             .expect("read stored credential")
     }
 
-    /// Enroll the way v0.21.0 release builds did: user verification forced on MakeCredential.
+    /// Enroll a legacy level-3 credential, as v0.21.0 release builds stored them: user
+    /// verification forced on MakeCredential. soft-fido2 0.17 defaulted to level 3 after UV;
+    /// since 0.18 the default is level 2, so the fixture requests level 3 explicitly.
     fn enroll_with_forced_uv(storage: &Arc<Mutex<LocalStorageAdapter>>, alg: i64) -> Enrolled {
         let prompts = AutoAccept::install();
-        let enrolled = enroll(&mut service_without_pin(storage, true), alg, None);
+        let enrolled = enroll(&mut service_without_pin(storage, true), alg, Some(3));
         assert_eq!(prompts.uv_prompts(), 1, "enrollment performed built-in UV");
         assert_eq!(
             stored(storage, &enrolled.credential_id)
                 .extensions
                 .cred_protect,
             Some(3),
-            "soft-fido2 defaults credProtect to userVerificationRequired after UV"
+            "the fixture stores a legacy level-3 credential"
         );
         enrolled
     }
@@ -3777,6 +3780,44 @@ mod protected_credential_tests {
             Some(1)
         );
         enrolled
+    }
+
+    /// soft-fido2 0.18 stores level 2 after UV when the client asks for no level, so new
+    /// credentials need no rescue: allowList signing with presence only works directly.
+    #[test]
+    fn new_credential_created_with_uv_defaults_to_level_two() {
+        for alg in [-8, -7] {
+            let dir = tempfile::tempdir().expect("create temp directory");
+            let storage = local_storage(&dir);
+            let prompts = AutoAccept::install();
+            let enrolled = enroll(&mut service_without_pin(&storage, true), alg, None);
+            assert_eq!(
+                prompts.uv_prompts(),
+                1,
+                "alg {alg}: enrollment performed UV"
+            );
+            assert_eq!(
+                stored(&storage, &enrolled.credential_id)
+                    .extensions
+                    .cred_protect,
+                Some(2),
+                "alg {alg}: UV without a credProtect request stores level 2"
+            );
+
+            // `always_uv = false`: allowList, `up = true`, no UV, answered by soft-fido2 itself.
+            let mut service = service_without_pin(&storage, false);
+            let prompts = AutoAccept::install();
+            let response = soft_fido2_answer(
+                &mut service,
+                &ssh_sign_request(&enrolled.credential_id, true),
+            );
+            assert_signed(&response, Some(&enrolled.cose_key), UP_FLAG);
+            assert_eq!(
+                (prompts.up_prompts(), prompts.uv_prompts()),
+                (1, 0),
+                "alg {alg}: presence only, no UV prompt"
+            );
+        }
     }
 
     #[test]
