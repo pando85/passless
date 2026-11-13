@@ -450,7 +450,8 @@ Profile `credential_refs` and the wildcard coexist. The pin list constrains oper
 resolve through an exact rule and never applies to one that resolves through `*` (§10.1). A pin
 belongs to one RP, so it is meaningful only at its own RP; an operator who wants an RP pinned lists
 it with an exact rule, which can carry the same actions as the wildcard. `agent-admin profile
-check` and `passless doctor --agents` print what the pins cover ("`credential_refs` (N) constrain
+check` and `passless doctor --agents` print what the pins cover (the agent's own `doctor` request does
+not: it would name pinned RP IDs and say whether the human's store holds each pin; review L3) ("`credential_refs` (N) constrain
 the E exact rule(s); RPs matched by `*` use discovery") and warn about pins that are inert (their
 credential belongs to an RP with no exact rule) or missing from the store.
 

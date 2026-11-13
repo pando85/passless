@@ -516,6 +516,36 @@ impl core::fmt::Debug for ProfileRuntime {
     }
 }
 
+/// Who a profile report is for. The agent's own `doctor` request gets the health of the
+/// deployment, not the operator's view of the credential store (review L3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportAudience {
+    /// `agent-admin profile check`: the operator.
+    Admin,
+    /// `PrincipalRequest::Doctor`: the agent, over its principal socket.
+    Principal,
+}
+
+/// The profile's credential store as its path index shows it, for the pin checks, or `None` when
+/// `audience` does not get them: then the storage lock is not taken and the store is not asked
+/// anything. Under the storage lock alone; no credential is decrypted or unsealed.
+fn pin_store_view(
+    audience: ReportAudience,
+    storage: &Mutex<Box<dyn CredentialStorage>>,
+) -> Option<super::doctor_pins::StoreView> {
+    if audience != ReportAudience::Admin {
+        return None;
+    }
+    let indexed = super::lock_order::lock(storage, super::lock_order::LockLevel::Storage)
+        .indexed_credentials();
+    Some(match indexed {
+        Some(credentials) => super::doctor_pins::StoreView::from_indexed(credentials),
+        None => super::doctor_pins::StoreView::Unknown(
+            "the backend cannot list its credentials without decrypting them".into(),
+        ),
+    })
+}
+
 impl ProfileRuntime {
     /// The profile's place in the section 13 matrix: its mode and the principal relationship.
     pub fn deployment_axes(&self) -> super::deployment::DeploymentAxes {
@@ -2931,7 +2961,7 @@ impl AgentRuntime {
             )
         })?;
 
-        let report = self.build_profile_report(profile_id, profile);
+        let report = self.build_profile_report(profile_id, profile, ReportAudience::Admin);
         Ok(AdminResponse::ProfileCheck(report))
     }
 
@@ -2939,6 +2969,7 @@ impl AgentRuntime {
         &self,
         profile_id: &ProfileId,
         profile: &ProfileRuntime,
+        audience: ReportAudience,
     ) -> passless_core::agent::ProfileDiagnosticReport {
         let enabled = profile.enabled.load(Ordering::Acquire);
 
@@ -3019,18 +3050,8 @@ impl AgentRuntime {
         ));
         // The profile's credential store as its path index shows it, for the pin checks. Read
         // before the configuration lock and under the storage lock alone: no credential is
-        // decrypted or unsealed.
-        let indexed = super::lock_order::lock(
-            &profile.credential_storage,
-            super::lock_order::LockLevel::Storage,
-        )
-        .indexed_credentials();
-        let store_view = match indexed {
-            Some(credentials) => super::doctor_pins::StoreView::from_indexed(credentials),
-            None => super::doctor_pins::StoreView::Unknown(
-                "the backend cannot list its credentials without decrypting them".into(),
-            ),
-        };
+        // decrypted or unsealed. Not read at all for the agent (review L3).
+        let store_view = pin_store_view(audience, &profile.credential_storage);
         {
             let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
             let config = self
@@ -3055,13 +3076,18 @@ impl AgentRuntime {
             ));
             // What the pins cover, inert or missing pins, the wildcard registration count and
             // the configuration advice that names this profile (ADR 0014 amendment 2.1, 2.2).
-            report.checks.extend(super::doctor_pins::profile_checks(
-                &config,
-                profile_id.as_str(),
-                profile_config,
-                grants.as_deref(),
-                &store_view,
-            ));
+            // Operator surfaces only: they name pinned RP IDs and whether the human's store holds
+            // each pin, which is metadata about the human's store that the agent must not read
+            // through its own doctor (review L3).
+            if let Some(store_view) = &store_view {
+                report.checks.extend(super::doctor_pins::profile_checks(
+                    &config,
+                    profile_id.as_str(),
+                    profile_config,
+                    grants.as_deref(),
+                    store_view,
+                ));
+            }
         }
         // Deprecated config vocabulary is accepted with a warning until the release after next (plan R8):
         // a warning never makes the profile unhealthy, so the check passes and carries the text.
@@ -4643,7 +4669,8 @@ impl PrincipalHandler for AgentRuntime {
                 }))
             }
             PrincipalRequest::Doctor => {
-                let report = self.build_profile_report(&profile_id, profile);
+                let report =
+                    self.build_profile_report(&profile_id, profile, ReportAudience::Principal);
                 Ok(PrincipalResponse::Doctor(DoctorResponse {
                     healthy: report.is_healthy(),
                     checks: report.checks,
@@ -4735,6 +4762,66 @@ mod tests {
         fn count_credentials(&self) -> usize {
             self.0
         }
+    }
+
+    /// A storage that counts how often the doctor asks it to list its credentials.
+    struct CountingIndexStorage(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CredentialStorage for CountingIndexStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            panic!("the doctor must not read a credential");
+        }
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            panic!("the doctor must not read a credential");
+        }
+        fn read(&mut self, _id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            panic!("the doctor must not read a credential");
+        }
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _id: &[u8]) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn count_credentials(&self) -> usize {
+            0
+        }
+        fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(vec![("pinned.example".to_string(), vec![1; 32])])
+        }
+    }
+
+    /// Review L3: the agent's own doctor must not list the human's store (the pin checks name
+    /// pinned RP IDs and whether the store holds each pin), and must not even take its lock for
+    /// it. The operator's `profile check` still does.
+    #[test]
+    fn the_principal_doctor_does_not_read_the_credential_store_for_pin_checks() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage: Mutex<Box<dyn CredentialStorage>> =
+            Mutex::new(Box::new(CountingIndexStorage(calls.clone())));
+
+        assert!(pin_store_view(ReportAudience::Principal, &storage).is_none());
+        // Held here for the whole call: a principal report that tried to take the lock would
+        // deadlock on it.
+        let held = storage.lock().unwrap();
+        assert!(
+            pin_store_view(ReportAudience::Principal, &storage).is_none(),
+            "no lock is taken for the agent"
+        );
+        drop(held);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The operator's report does read the index, once.
+        let view = pin_store_view(ReportAudience::Admin, &storage).expect("admin view");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            view,
+            super::super::doctor_pins::StoreView::Known(_)
+        ));
     }
 
     /// Review L4: the status counts read a poisoned storage lock with recovery instead of

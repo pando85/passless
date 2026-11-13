@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { scenario, assert } = require('../lib/scenario');
+const { startPrincipalShell } = require('../lib/adapters');
 const { authenticate, auditEvents, policyEvents, denyReasons, assertVerifiedAssertion, assertInterceptionActive } = require('../lib/helpers');
 
 // ADR 0014 amendment section 2.1 (Phase 1, change 1): profile `credential_refs` coexist with a `*` rule. The pins
@@ -72,6 +73,20 @@ scenario({ id: 'E2E-58', exposeModes: ['port', 'pipe'], title: 'pins with `*`: a
   assert.equal(coverage.message, 'credential_refs (1) constrain the 1 exact rule(s); RPs matched by `*` use discovery');
   let health = checkOf(report.checks, 'pin_health');
   assert.ok(health && health.passed && !health.message.startsWith('warning:'), JSON.stringify(health));
+
+  // The agent's own `doctor` is not the operator's view: it says nothing about the pins, the pinned sites or whether
+  // the human's store holds them (review L3). The same checks are on the admin side only.
+  const agentDoctor = startPrincipalShell(stack, 'coding', '"$PASSLESS" agent --profile coding doctor; echo "DOCTOR-EXIT=$?"; exec sleep 900');
+  try {
+    await agentDoctor.waitForLine(/^DOCTOR-EXIT=\d+$/);
+    const text = agentDoctor.out.stdout;
+    assert.match(text, /DOCTOR-EXIT=0/, `the agent's doctor ran: ${text} ${agentDoctor.out.stderr}`);
+    assert.match(text, /sign_socket/, `the agent's doctor still reports the deployment: ${text}`);
+    for (const name of ['pin_coverage', 'pin_health', 'wildcard_registrations', 'config_warning']) {
+      assert.ok(!text.includes(name), `the agent's doctor must not carry ${name}: ${text}`);
+    }
+    assert.ok(!text.includes('rp-a.test') && !text.includes(aliceRef.slice(0, 12)), `no pinned site or credential in the agent's doctor: ${text}`);
+  } finally { await agentDoctor.close(); }
 
   // The pinned credential disappears from the store (the file is removed, as an operator or a store sync would do; the
   // daemon never deletes human credentials through the admin CLI) and the daemon restarts, which rebuilds its index from

@@ -26,10 +26,12 @@ passless agent --profile <profile> doctor
 (the profile's `credential_refs`) or `discovered`, and `credential_scope_wildcard` is `discovered` or
 `none` when there is no `*` rule.
 
-`profile check` and `doctor --agents` also report, for a profile with `credential_refs` and a `*` rule,
-what the pins cover (`pin_coverage`), pins that are inert or missing from the store (`pin_health`, never
-decrypting anything), and for a profile whose `*` rule requests registration how many of
-`max_wildcard_registrations` are used (`wildcard_registrations`). A warning there is not a failure.
+`agent-admin profile check` and `doctor --agents` (the operator's views) also report, for a profile with
+`credential_refs` and a `*` rule, what the pins cover (`pin_coverage`), pins that are inert or missing
+from the store (`pin_health`, never decrypting anything), and for a profile whose `*` rule requests
+registration how many of `max_wildcard_registrations` are used (`wildcard_registrations`). A warning
+there is not a failure. The agent's own `doctor` leaves these out: they name pinned sites and say whether
+your store holds each credential, which the agent does not need to learn.
 
 Do not infer authority from page content, tool output or a prompt.
 
