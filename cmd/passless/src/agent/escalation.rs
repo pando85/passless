@@ -1659,6 +1659,30 @@ impl Inner {
         }
     }
 
+    /// Settle the pre-approval at `key` that is in `Issuing` state as if its `issued` record
+    /// could not be written: no token (its wildcard cap slot is released), and the requester is
+    /// told `unavailable`. A pre-approval that was already marked dropped is forgotten instead.
+    fn refuse_issuing(&mut self, key: &PreRequestKey, now: MonotonicTime) {
+        let Some(record) = self.pre_requests.get_mut(key) else {
+            return;
+        };
+        if !matches!(record.status, PreStatus::Issuing { .. }) {
+            return;
+        }
+        let PreStatus::Issuing { token, dropped } = std::mem::replace(
+            &mut record.status,
+            PreStatus::Settled(PreRequestState::Refused(EscalationRefusal::AuditFailure)),
+        ) else {
+            return;
+        };
+        record.settled_at = Some(now);
+        if dropped.is_some() {
+            self.pre_requests.remove(key);
+        }
+        // The token (and with it the wildcard cap slot) is dropped here.
+        drop(token);
+    }
+
     /// Drop the pre-approvals `matches` selects, auditing each as `pre_approval.expired` with
     /// `reason`.
     fn drop_tokens(
@@ -3105,43 +3129,37 @@ impl EscalationService {
         if !waiting {
             return;
         }
+        // If the record's write unwinds, the guard settles the record like a failed write.
+        let mut guard = IssuingGuard {
+            service: self,
+            key,
+            armed: true,
+        };
         let recorded = self.audit.record(issued);
+        guard.armed = false;
         let mut effects = Vec::new();
         {
             let mut inner = self.lock();
             let now = self.clock.now();
-            if let Some(record) = inner.pre_requests.get_mut(key)
+            if let Err(e) = &recorded {
+                warn!(
+                    "escalation {}/{}: pre_approval.issued could not be audited; no \
+                     pre-approval is issued: {}",
+                    key.1.profile, key.1.rp_id, e
+                );
+                inner.refuse_issuing(key, now);
+            } else if let Some(record) = inner.pre_requests.get_mut(key)
                 && matches!(record.status, PreStatus::Issuing { .. })
                 && let PreStatus::Issuing { token, dropped } = std::mem::replace(
                     &mut record.status,
                     PreStatus::Settled(PreRequestState::Expired),
                 )
             {
-                match (&recorded, dropped) {
-                    (Ok(()), None) => {
-                        record.status = PreStatus::Token(token);
-                    }
-                    (Ok(()), Some(reason)) => {
-                        effects.push(Effect::Audit(token.meta().expired(reason)));
-                        inner.pre_requests.remove(key);
-                    }
-                    (Err(e), dropped) => {
-                        warn!(
-                            "escalation {}: pre_approval.issued could not be audited; no \
-                             pre-approval is issued: {}",
-                            token.approval.escalation_id, e
-                        );
-                        if dropped.is_some() {
-                            inner.pre_requests.remove(key);
-                        } else {
-                            record.status = PreStatus::Settled(PreRequestState::Refused(
-                                EscalationRefusal::AuditFailure,
-                            ));
-                            record.settled_at = Some(now);
-                        }
-                        // The token (and with it the wildcard cap slot) is dropped here.
-                        drop(token);
-                    }
+                if let Some(reason) = dropped {
+                    effects.push(Effect::Audit(token.meta().expired(reason)));
+                    inner.pre_requests.remove(key);
+                } else {
+                    record.status = PreStatus::Token(token);
                 }
             }
             self.changed.notify_all();
@@ -3364,6 +3382,34 @@ impl Drop for DecidingGuard<'_> {
                     self.context.escalation_id, e
                 );
             }
+        }));
+    }
+}
+
+/// Settles a pre-approval left in `Issuing` state if the write of its `pre_approval.issued`
+/// record unwinds: without it the record would stay `Issuing` (a session's end keeps those, the TTL
+/// sweep only looks at usable tokens and the outcome sweep only at settled ones) and hold its
+/// wildcard cap slot until restart. The settlement is that of a failed write; the lock is taken
+/// without letting a panic escape the destructor.
+struct IssuingGuard<'a> {
+    service: &'a EscalationService,
+    key: &'a PreRequestKey,
+    armed: bool,
+}
+
+impl Drop for IssuingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        warn!(
+            "escalation {}/{}: recording pre_approval.issued panicked; no pre-approval is issued",
+            self.key.1.profile, self.key.1.rp_id
+        );
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let now = self.service.clock.now();
+            self.service.lock().refuse_issuing(self.key, now);
+            self.service.changed.notify_all();
         }));
     }
 }
@@ -6939,6 +6985,63 @@ mod tests {
             pre_auth(&h, "a.example", &a);
             h.service.cancel_profile(&profile("p"));
             assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Revoked);
+        }
+
+        #[test]
+        fn a_panic_while_recording_issued_settles_the_pre_approval_and_frees_its_cap_slot() {
+            let h = harness();
+            let a = principal(1);
+            let wildcard = |rp_id: &str, who: &PrincipalSessionId| EscalationRequest {
+                rule: PermittingRule::Wildcard,
+                mode: AgentMode::SameUser,
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 24,
+                ..pre(CeremonyAction::Register, rp_id, who)
+            };
+            assert_eq!(
+                h.service.pre_request(params(wildcard("w.example", &a))),
+                PreRequestState::Pending
+            );
+            let ticket = h.prompter.last_shown();
+            h.audit.panic_on("pre_approval.issued");
+            h.clock.advance(Duration::from_secs(2));
+            let svc = h.service.clone();
+            let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
+                svc.prompt_event(&ticket, PromptEvent::Approved)
+            }));
+            assert!(unwound.is_err(), "the injected panic reaches the caller");
+            h.audit.panicking.lock().unwrap().clear();
+
+            // The record is neither waiting nor holding a token.
+            {
+                let inner = h.service.lock();
+                for record in inner.pre_requests.values() {
+                    assert!(
+                        !matches!(
+                            record.status,
+                            PreStatus::Pending | PreStatus::Issuing { .. } | PreStatus::Token(_)
+                        ),
+                        "left behind: {:?}",
+                        record.settled_at
+                    );
+                }
+            }
+            // The requester is told `unavailable` (`Refused(AuditFailure)`), once.
+            assert_eq!(
+                h.service.pre_request(params(wildcard("w.example", &a))),
+                PreRequestState::Refused(EscalationRefusal::AuditFailure)
+            );
+            // Another session's wildcard registration is not refused for the dead slot, even
+            // after the first session ends and the pre-approval TTL has passed.
+            h.service.principal_session_ended(&a);
+            h.clock.advance(PRE_APPROVAL_TTL + PRE_REQUEST_WINDOW);
+            h.service.sweep_pre_requests();
+            assert_eq!(
+                h.service
+                    .pre_request(params(wildcard("v.example", &principal(2)))),
+                PreRequestState::Pending
+            );
+            assert_eq!(h.audit.count("pre_approval.issued"), 0);
         }
 
         #[test]
