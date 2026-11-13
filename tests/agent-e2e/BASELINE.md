@@ -1,5 +1,16 @@
 # E2E baseline
 
+## Agent pre-requests (ADR 0014 amendment, Phase 2), 2026-11-13
+
+Branch `feat/agent-pre-requests`. Debug build, `--features agent`.
+
+- Command: `AGENT_E2E_MATRIX=full AGENT_E2E_EXPOSE=all tests/agent-e2e/run.sh E2E-27 E2E-28 E2E-42 E2E-58 E2E-59 E2E-60 E2E-61 E2E-62
+  E2E-63 E2E-64 E2E-65 E2E-66` (chromium, pw-chromium and cft, headed and headless, port and pipe; the ids also select E2E-42/register,
+  E2E-59/deny, E2E-59/exact-later and E2E-61/localhost): exit 0, 168 PASS, 0 FAIL, 0 XFAIL, 0 SKIP. By attach mode: port 96 PASS,
+  pipe 72 PASS (E2E-42, E2E-61 and E2E-65 are port-only). Every scenario passes on each of the 6 variants.
+- `make test-agent-e2e` (CI subset, port, pw-chromium headless): exit 0, PASS=62, 0 FAIL.
+- E2E-63 to E2E-66 are new. See `README.md`, "Agent pre-requests".
+
 ## Pins with `*` and registration at unlisted sites (ADR 0014 amendment, Phase 1), 2026-11-13
 
 Branch `feat/agent-new-sites` on top of the core commits `7a5f76e`, `d1d00bb` and `c494328`. Debug build, `--features agent`.
