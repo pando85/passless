@@ -1967,4 +1967,156 @@ rule = "exact"
             "2000-02-29T00:00:00Z"
         );
     }
+
+    /// An `authenticate` pre-request's grant: no origin, `source = "pre_request"`.
+    fn pre_request_grant(rp_id: &str) -> GrantedRule {
+        GrantedRule::from_escalation(
+            rp_id,
+            GrantKind::Escalation,
+            "esc-pre",
+            None,
+            PermittingRule::Wildcard,
+            None,
+            RequestSource::PreRequest,
+        )
+    }
+
+    #[test]
+    fn a_version_1_store_loads_as_version_2_with_ceremony_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), VALID, 0o600);
+        let store = open(tmp.path());
+        let rules = store.profile(&profile()).unwrap().rules().to_vec();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].source, RequestSource::Ceremony);
+        assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn the_writer_keeps_version_1_until_a_pre_request_grant_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let store = open(tmp.path());
+        let file = store.path_for(&profile());
+        store
+            .add(&policy, &profile(), escalation("example.com"), 64)
+            .unwrap();
+        let v1 = fs::read_to_string(&file).unwrap();
+        assert!(v1.starts_with("version = 1\n"), "{v1}");
+        assert!(!v1.contains("source"), "{v1}");
+        let v1_digest = store.grants_digest(&profile());
+
+        store
+            .add(&policy, &profile(), pre_request_grant("other.example"), 64)
+            .unwrap();
+        let v2 = fs::read_to_string(&file).unwrap();
+        assert!(v2.starts_with("version = 2\n"), "{v2}");
+        assert!(v2.contains("source = \"pre_request\""), "{v2}");
+        // The pre-request entry has no origin line; the ceremony entry keeps its own and writes
+        // no source (the default).
+        assert_eq!(v2.matches("origin = ").count(), 1, "{v2}");
+        assert_eq!(v2.matches("source = ").count(), 1, "{v2}");
+
+        // Version 2 round trip.
+        let reopened = open(tmp.path());
+        let rules = reopened.profile(&profile()).unwrap().rules().to_vec();
+        let pre = rules.iter().find(|r| r.rp_id == "other.example").unwrap();
+        assert_eq!(pre.source, RequestSource::PreRequest);
+        assert_eq!(pre.origin, None);
+        assert!(reopened.is_granted(&profile(), "other.example", &RuleIdentity::Wildcard));
+        assert_eq!(
+            reopened.grants_digest(&profile()),
+            store.grants_digest(&profile())
+        );
+        assert_ne!(store.grants_digest(&profile()), v1_digest);
+
+        // Revoking the only pre-request grant writes version 1 again (a downgrade works).
+        store
+            .revoke(
+                &policy,
+                &profile(),
+                "other.example",
+                GrantedAction::Authenticate,
+            )
+            .unwrap();
+        let again = fs::read_to_string(&file).unwrap();
+        assert!(again.starts_with("version = 1\n"), "{again}");
+        assert_eq!(store.grants_digest(&profile()), v1_digest);
+    }
+
+    #[test]
+    fn the_lowest_version_follows_the_entries() {
+        let ceremony = escalation("example.com");
+        assert_eq!(store_version_for(&[]), 1);
+        assert_eq!(store_version_for(std::slice::from_ref(&ceremony)), 1);
+        // A pre-request with an origin (a registration it led to) still needs version 2.
+        let with_origin = GrantedRule::from_escalation(
+            "example.com",
+            GrantKind::Registration,
+            "esc-3",
+            Some("https://example.com"),
+            PermittingRule::Exact,
+            Some(CredentialRef::with_default_domain(b"c")),
+            RequestSource::PreRequest,
+        );
+        assert_eq!(store_version_for(&[ceremony.clone(), with_origin]), 2);
+        assert_eq!(
+            store_version_for(&[ceremony, pre_request_grant("other.example")]),
+            2
+        );
+    }
+
+    #[test]
+    fn a_version_1_file_with_a_version_2_field_disables_the_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!("{VALID}source = \"pre_request\"\n"),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "version 1 entry");
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &VALID.replace("origin = \"https://example.com\"\n", ""),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "version 1 entry");
+    }
+
+    #[test]
+    fn only_an_authenticate_pre_request_may_lack_an_origin() {
+        let base = VALID
+            .replace("version = 1", "version = 2")
+            .replace("origin = \"https://example.com\"\n", "");
+        // An origin-less ceremony grant.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &base, 0o600);
+        assert_disabled(tmp.path(), "no origin");
+        // An origin-less registration grant, even from a pre-request.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!(
+                "{}source = \"pre_request\"\ncredential_ref = \"{}\"\n",
+                base.replace("kind = \"escalation\"", "kind = \"registration\""),
+                CredentialRef::with_default_domain(b"c").to_hex()
+            ),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "no origin");
+        // An authenticate pre-request without an origin loads.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!("{base}source = \"pre_request\"\n"),
+            0o600,
+        );
+        let store = open(tmp.path());
+        assert!(store.is_granted(&profile(), "example.com", &exact("example.com")));
+        // An unknown source value disables the profile.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &format!("{base}source = \"agent\"\n"), 0o600);
+        assert_disabled(tmp.path(), "does not parse");
+    }
 }
