@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.27.0](https://github.com/pando85/passless/tree/v0.27.0) - 2026-11-13
+
+### Added
+
+- Let agents ask for access in advance with request-access and an opt-in MCP tool (#600) ([806ec80](https://github.com/pando85/passless/commit/806ec806e2ce43a0b6fa704b06558edcbb49a17c))
+
 ## [v0.26.0](https://github.com/pando85/passless/tree/v0.26.0) - 2026-11-13
 
 ### Added
