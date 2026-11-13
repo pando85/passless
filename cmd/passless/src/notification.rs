@@ -15,12 +15,23 @@ const INTERACTION_MODE_ENV: &str = "PASSLESS_INTERACTION_MODE";
 pub enum NotificationResult {
     /// User approved the operation
     Accepted,
-    /// User denied the operation
+    /// User explicitly refused the operation (clicked Deny) or answered with an action the
+    /// prompt never offered
     Denied,
+    /// The notification was closed without an answer: the user dismissed it, or it timed out.
+    /// The operation is still refused, but nobody refused it, so it must not be counted as a
+    /// failed verification attempt.
+    Dismissed,
 }
 
 /// Result of a yes/no question via notification
-pub type YesNoResult = NotificationResult;
+///
+/// Closing the notification answers no: these questions have no retry budget to protect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YesNoResult {
+    Accepted,
+    Denied,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptKind {
@@ -198,8 +209,32 @@ fn show_confirmation_notification(
     show_prompt(summary, message, timeout_seconds, prompt_kind)
 }
 
+/// Name `notify-rust` gives the action reported when a notification is closed without an answer
+/// (dismissed by the user or timed out).
+const CLOSED_ACTION: &str = "__closed";
+
+/// Classify the action a notification reported. Anything but the affirmative action refuses;
+/// only an explicit `deny` (or an action the prompt never offered) is a denial, a close is not.
+fn answer_from_action(
+    action: &str,
+    affirmative_action: &str,
+    action_mode: NotificationActionMode,
+) -> NotificationResult {
+    if action_is_accepted(action, affirmative_action, action_mode) {
+        NotificationResult::Accepted
+    } else if action == CLOSED_ACTION {
+        NotificationResult::Dismissed
+    } else {
+        if action != "deny" {
+            debug!("Unknown action '{}' - treating as denied", action);
+        }
+        NotificationResult::Denied
+    }
+}
+
 /// Show `message` under `summary` with Accept and Deny actions and wait for the answer.
-/// Closing the notification or letting it time out denies.
+/// Clicking Deny denies. Closing the notification or letting it time out is `Dismissed`:
+/// the operation is refused, but nobody refused it.
 fn show_prompt(
     summary: &str,
     mut message: String,
@@ -211,7 +246,7 @@ fn show_prompt(
     if action_mode == NotificationActionMode::DunstDefault {
         message.push_str(
             "\n\nDunst: confirm by invoking this notification's action \
-             (middle-click by default). Closing the notification denies the request.",
+             (middle-click by default). Closing the notification refuses the request.",
         );
     }
 
@@ -251,18 +286,15 @@ fn show_prompt(
         .lock()
         .expect("Failed to lock action result")
         .clone()
-        .unwrap_or_else(|| "__closed".to_string());
+        .unwrap_or_else(|| CLOSED_ACTION.to_string());
 
-    if action_is_accepted(&action, "approve", action_mode) {
-        info!("Notification accepted");
-        Ok(NotificationResult::Accepted)
-    } else {
-        if action != "deny" && action != "__closed" {
-            debug!("Unknown action '{}' - treating as denied", action);
-        }
-        info!("Notification denied or closed");
-        Ok(NotificationResult::Denied)
+    let answer = answer_from_action(&action, "approve", action_mode);
+    match answer {
+        NotificationResult::Accepted => info!("Notification accepted"),
+        NotificationResult::Denied => info!("Notification denied"),
+        NotificationResult::Dismissed => info!("Notification closed or timed out"),
     }
+    Ok(answer)
 }
 
 /// Ask the human to confirm lowering the protection of stored credentials.
@@ -340,7 +372,7 @@ pub fn show_verification_notification(
 ///
 /// # Returns
 ///
-/// Result indicating whether the user answered yes (Accepted) or no (Denied)
+/// Result indicating whether the user answered yes (Accepted) or no or closed it (Denied)
 pub fn show_yes_no_notification(title: &str, question: &str) -> Result<YesNoResult, String> {
     info!("Showing yes/no notification: {}", title);
 
@@ -380,13 +412,13 @@ pub fn show_yes_no_notification(title: &str, question: &str) -> Result<YesNoResu
         .lock()
         .expect("Failed to lock action result")
         .clone()
-        .unwrap_or_else(|| "__closed".to_string());
+        .unwrap_or_else(|| CLOSED_ACTION.to_string());
 
     if action_is_accepted(&action, "yes", action_mode) {
         info!("User answered yes");
         Ok(YesNoResult::Accepted)
     } else {
-        if action != "no" && action != "__closed" {
+        if action != "no" && action != CLOSED_ACTION {
             debug!("Unknown action '{}' - treating as no", action);
         }
         info!("User answered no or closed notification");
@@ -451,6 +483,36 @@ mod tests {
         assert_eq!(NotificationResult::Accepted, NotificationResult::Accepted);
         assert_eq!(NotificationResult::Denied, NotificationResult::Denied);
         assert_ne!(NotificationResult::Accepted, NotificationResult::Denied);
+        assert_ne!(NotificationResult::Denied, NotificationResult::Dismissed);
+    }
+
+    #[test]
+    fn test_only_an_explicit_deny_is_a_denial() {
+        let mode = NotificationActionMode::Explicit;
+        let answer = |action: &str| answer_from_action(action, "approve", mode);
+
+        assert_eq!(answer("approve"), NotificationResult::Accepted);
+        assert_eq!(answer("deny"), NotificationResult::Denied);
+        // Dismissed by the user or timed out: neither accepted nor denied.
+        assert_eq!(answer("__closed"), NotificationResult::Dismissed);
+        // An action the prompt never offered stays a denial, so it fails closed and counts.
+        assert_eq!(answer("whatever"), NotificationResult::Denied);
+        assert_eq!(answer(""), NotificationResult::Denied);
+        // "default" is only an answer on daemons that offer nothing else.
+        assert_eq!(answer("default"), NotificationResult::Denied);
+    }
+
+    #[test]
+    fn test_dunst_default_action_accepts_and_close_is_dismissed() {
+        let mode = NotificationActionMode::DunstDefault;
+        assert_eq!(
+            answer_from_action("default", "approve", mode),
+            NotificationResult::Accepted
+        );
+        assert_eq!(
+            answer_from_action("__closed", "approve", mode),
+            NotificationResult::Dismissed
+        );
     }
 
     #[test]

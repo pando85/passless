@@ -217,6 +217,16 @@ enum UvRetryTransition {
     Recovered,
 }
 
+/// Logged when a request is answered CTAP2_ERR_UV_BLOCKED.
+const UV_BLOCKED_HINT: &str = "CTAP request answered UV_BLOCKED (0x3c): built-in user \
+    verification retries are exhausted. Run `passless client pin uv-reset` to restore them \
+    (it asks for the PIN when one is set)";
+
+/// Whether `response` is a bare CTAP2_ERR_UV_BLOCKED status answer.
+fn is_uv_blocked_response(response: &[u8]) -> bool {
+    response == [StatusCode::UvBlocked as u8]
+}
+
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
 ///
 /// This wrapper intercepts PIN state load/save operations to enforce the configured
@@ -491,7 +501,9 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         );
         match answer {
             Ok(NotificationResult::Accepted) => Ok(UpResult::Accepted),
-            Ok(NotificationResult::Denied) => Ok(UpResult::Denied),
+            // User presence has no retry budget: a closed or timed-out prompt refuses the
+            // operation exactly like a denial.
+            Ok(NotificationResult::Denied | NotificationResult::Dismissed) => Ok(UpResult::Denied),
             Err(e) => {
                 error!("Failed to show notification: {}", e);
                 Err(soft_fido2::Error::Other)
@@ -586,6 +598,16 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             Ok(NotificationResult::Denied) => {
                 warn!("User verification via notification: denied");
                 Ok(UvResult::Denied)
+            }
+            // Nobody refused: the prompt was dismissed or timed out. soft-fido2 consumes a UV
+            // retry on `Denied` only, and answers CTAP2_ERR_USER_ACTION_TIMEOUT here. The
+            // operation still fails closed.
+            Ok(NotificationResult::Dismissed) => {
+                warn!(
+                    "User verification via notification: closed or timed out \
+                     (no UV retry consumed)"
+                );
+                Ok(UvResult::Timeout)
             }
             Err(e) => {
                 error!("Failed to show notification: {}", e);
@@ -1594,7 +1616,7 @@ impl<
                 info!("Lowering credential protection confirmed by the user");
                 Ok(())
             }
-            Ok(NotificationResult::Denied) => {
+            Ok(NotificationResult::Denied | NotificationResult::Dismissed) => {
                 warn!("Refused to lower credential protection: denied, closed or timed out");
                 Err(StatusCode::OperationDenied)
             }
@@ -1610,6 +1632,16 @@ impl<
 
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
+        let result = self.handle_request(request, response_buffer);
+        // soft-fido2 reports a CTAP error as a one-byte status response, not as an `Err`, so
+        // inspect what is actually answered, whichever handler answered it.
+        if result.is_ok() && is_uv_blocked_response(response_buffer) {
+            error!("{UV_BLOCKED_HINT}");
+        }
+        result
+    }
+
+    fn handle_request(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         self.refresh_built_in_uv_state()?;
 
         if request.first() == Some(&CMD_PASSLESS_BACKUP) {
@@ -1703,16 +1735,6 @@ impl<
         } else {
             self.authenticator.handle(request, response_buffer)
         };
-        if let Err(SoftFido2Error::CtapError(code)) = &result
-            && *code == StatusCode::UvBlocked as u8
-        {
-            warn!(
-                "CTAP request returned UV_BLOCKED (0x{:02x}); \
-                 built-in user verification retries are exhausted. \
-                 Run `passless client pin uv-reset` to restore",
-                code
-            );
-        }
         result?;
         Ok(())
     }
@@ -3244,10 +3266,10 @@ mod tests {
                 Ok(NotificationResult::Denied),
                 Some(StatusCode::OperationDenied as u8),
             ),
-            // The desktop prompt reports a closed or timed-out notification as Denied.
+            // A closed or timed-out notification refuses just like a denial.
             (
                 "closed or timed out",
-                Ok(NotificationResult::Denied),
+                Ok(NotificationResult::Dismissed),
                 Some(StatusCode::OperationDenied as u8),
             ),
             (
@@ -3473,6 +3495,513 @@ mod tests {
         let response = send_set_cred_protect(&mut service, &ids, 1, authorized_v1(&token, &ids, 1));
         assert_eq!(response.first(), Some(&0x00), "{response:02x?}");
         assert_eq!(stored_level(&service, &credential.id), Some(1));
+    }
+
+    /// What a closed or timed-out prompt, an explicit denial and a policy denial cost: only
+    /// somebody refusing may spend one of the built-in UV retries.
+    mod uv_budget {
+        use super::*;
+
+        use crate::human_prompts::HumanPrompts;
+
+        use ciborium::Value as Cbor;
+
+        const MAX_RETRIES: u8 = 3;
+        const CLIENT_DATA_HASH: [u8; 32] = [0x5a; 32];
+
+        /// Answers every prompt with `answer` and counts the verification prompts.
+        struct Answering {
+            answer: NotificationResult,
+            verifications: Arc<Mutex<usize>>,
+        }
+
+        impl HumanPrompts for Answering {
+            fn user_presence(
+                &mut self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: u32,
+            ) -> core::result::Result<NotificationResult, String> {
+                Ok(self.answer)
+            }
+
+            fn user_verification(
+                &mut self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: u32,
+            ) -> core::result::Result<NotificationResult, String> {
+                *self.verifications.lock().unwrap() += 1;
+                Ok(self.answer)
+            }
+
+            fn confirm_credential_protection_lowering(
+                &mut self,
+                _: &str,
+                _: &str,
+                _: u32,
+            ) -> core::result::Result<NotificationResult, String> {
+                Ok(self.answer)
+            }
+
+            fn interaction_is_automatic(&self) -> core::result::Result<bool, String> {
+                Ok(false)
+            }
+        }
+
+        struct Harness {
+            service: AuthenticatorService<LocalStorageAdapter, TestPinStorage>,
+            verifications: Arc<Mutex<usize>>,
+            _dir: tempfile::TempDir,
+        }
+
+        impl Harness {
+            fn new(with_pin: bool, always_uv: bool, enforcement: PinEnforcement) -> Self {
+                let (service, dir) = cred_protect_service_with(
+                    &[],
+                    with_pin,
+                    SecurityConfig {
+                        always_uv,
+                        ..Default::default()
+                    },
+                    PinConfig {
+                        enforcement,
+                        max_uv_retries: MAX_RETRIES,
+                        ..Default::default()
+                    },
+                );
+                Self {
+                    service,
+                    verifications: Arc::new(Mutex::new(0)),
+                    _dir: dir,
+                }
+            }
+
+            fn answer(&self, answer: NotificationResult) {
+                self.service.set_prompts(Answering {
+                    answer,
+                    verifications: self.verifications.clone(),
+                });
+            }
+
+            fn prompts_shown(&self) -> usize {
+                *self.verifications.lock().unwrap()
+            }
+
+            fn uv_retries(&self) -> u8 {
+                self.service
+                    .authenticator
+                    .uv_retries()
+                    .expect("read UV retries")
+            }
+
+            fn send(&mut self, request: &[u8]) -> Vec<u8> {
+                let mut response = Vec::new();
+                self.service
+                    .handle(request, &mut response)
+                    .expect("handle CTAP request");
+                response
+            }
+
+            /// getPinUvAuthTokenUsingUvWithPermissions: the built-in UV prompt.
+            fn uv_token(&mut self) -> core::result::Result<[u8; 32], u8> {
+                platform::token(&mut self.service, 2, platform::Way::BuiltInUv, 0x04, None)
+            }
+        }
+
+        fn text(value: &str) -> Cbor {
+            Cbor::Text(value.to_string())
+        }
+
+        fn int(value: i64) -> Cbor {
+            Cbor::Integer(value.into())
+        }
+
+        fn command(code: u8, params: Vec<(Cbor, Cbor)>) -> Vec<u8> {
+            let mut request = vec![code];
+            ciborium::into_writer(&Cbor::Map(params), &mut request).expect("encode request");
+            request
+        }
+
+        /// MakeCredential asking for built-in user verification (`"uv": true`), no pinUvAuthParam.
+        fn make_credential_with_uv(rp_id: &str) -> Vec<u8> {
+            command(
+                0x01,
+                vec![
+                    (int(1), Cbor::Bytes(CLIENT_DATA_HASH.to_vec())),
+                    (int(2), Cbor::Map(vec![(text("id"), text(rp_id))])),
+                    (
+                        int(3),
+                        Cbor::Map(vec![
+                            (text("id"), Cbor::Bytes(vec![0x42; 16])),
+                            (text("name"), text("user")),
+                        ]),
+                    ),
+                    (
+                        int(4),
+                        Cbor::Array(vec![Cbor::Map(vec![
+                            (text("alg"), int(-7)),
+                            (text("type"), text("public-key")),
+                        ])]),
+                    ),
+                    (int(7), Cbor::Map(vec![(text("uv"), Cbor::Bool(true))])),
+                ],
+            )
+        }
+
+        /// GetAssertion for `credential_id` asking for user verification, no pinUvAuthParam.
+        fn get_assertion_with_uv(rp_id: &str, credential_id: &[u8]) -> Vec<u8> {
+            command(
+                0x02,
+                vec![
+                    (int(1), text(rp_id)),
+                    (int(2), Cbor::Bytes(CLIENT_DATA_HASH.to_vec())),
+                    (
+                        int(3),
+                        Cbor::Array(vec![Cbor::Map(vec![
+                            (text("id"), Cbor::Bytes(credential_id.to_vec())),
+                            (text("type"), text("public-key")),
+                        ])]),
+                    ),
+                    (
+                        int(5),
+                        Cbor::Map(vec![
+                            (text("up"), Cbor::Bool(true)),
+                            (text("uv"), Cbor::Bool(true)),
+                        ]),
+                    ),
+                ],
+            )
+        }
+
+        fn enrolled_credential_id(response: &[u8]) -> Vec<u8> {
+            assert_eq!(response.first(), Some(&0x00), "status {response:02x?}");
+            let attestation: Cbor = ciborium::from_reader(&response[1..]).expect("attestation");
+            let auth_data = match &attestation {
+                Cbor::Map(entries) => entries
+                    .iter()
+                    .find_map(|(k, v)| match (k, v) {
+                        (Cbor::Integer(i), Cbor::Bytes(bytes)) if i128::from(*i) == 2 => {
+                            Some(bytes.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("authData"),
+                other => panic!("expected a map, got {other:?}"),
+            };
+            let id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
+            auth_data[55..55 + id_len].to_vec()
+        }
+
+        const USER_ACTION_TIMEOUT: u8 = StatusCode::UserActionTimeout as u8;
+
+        #[test]
+        fn an_explicit_deny_consumes_a_retry() {
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Denied);
+
+            assert_eq!(harness.uv_retries(), MAX_RETRIES);
+            assert_eq!(
+                harness.uv_token(),
+                Err(StatusCode::OperationDenied as u8),
+                "an explicit deny still fails closed"
+            );
+            assert_eq!(harness.uv_retries(), MAX_RETRIES - 1);
+
+            let response = harness.send(&make_credential_with_uv("denied.example"));
+            assert_eq!(response, vec![StatusCode::OperationDenied as u8]);
+            assert_eq!(harness.uv_retries(), MAX_RETRIES - 2);
+
+            // The last retry blocks built-in UV: the denial that spends it answers UV_BLOCKED.
+            let response = harness.send(&make_credential_with_uv("denied.example"));
+            assert_eq!(response, vec![StatusCode::UvBlocked as u8]);
+            assert_eq!(harness.uv_retries(), 0);
+        }
+
+        #[test]
+        fn a_closed_or_timed_out_prompt_costs_nothing_and_fails_closed() {
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Dismissed);
+
+            // getPinUvAuthTokenUsingUvWithPermissions
+            assert_eq!(harness.uv_token(), Err(USER_ACTION_TIMEOUT));
+            // MakeCredential with `uv`
+            let response = harness.send(&make_credential_with_uv("closed.example"));
+            assert_eq!(response, vec![USER_ACTION_TIMEOUT]);
+
+            assert_eq!(harness.prompts_shown(), 2);
+            assert_eq!(harness.uv_retries(), MAX_RETRIES, "nobody refused");
+            assert_eq!(
+                lock_shared_storage(&harness.service.storage).count_credentials(),
+                0,
+                "nothing is registered without verification"
+            );
+        }
+
+        #[test]
+        fn a_closed_prompt_costs_nothing_for_get_assertion_either() {
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Accepted);
+            let response = harness.send(&make_credential_with_uv("assert.example"));
+            let credential_id = enrolled_credential_id(&response);
+            // An accepted verification refills the counter.
+            let full = harness.uv_retries();
+
+            harness.answer(NotificationResult::Dismissed);
+            let response = harness.send(&get_assertion_with_uv("assert.example", &credential_id));
+            assert_eq!(response, vec![USER_ACTION_TIMEOUT]);
+            assert_eq!(harness.uv_retries(), full);
+
+            harness.answer(NotificationResult::Denied);
+            let response = harness.send(&get_assertion_with_uv("assert.example", &credential_id));
+            assert_eq!(response, vec![StatusCode::OperationDenied as u8]);
+            assert_eq!(harness.uv_retries(), full - 1);
+        }
+
+        #[test]
+        fn closing_every_prompt_never_blocks_built_in_uv() {
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Dismissed);
+            for attempt in 0..u32::from(MAX_RETRIES) * 4 {
+                let result = harness.uv_token();
+                assert_eq!(result, Err(USER_ACTION_TIMEOUT), "attempt {attempt}");
+                assert_eq!(harness.uv_retries(), MAX_RETRIES, "attempt {attempt}");
+            }
+
+            // UV is still available for the next prompt that is accepted.
+            harness.answer(NotificationResult::Accepted);
+            assert!(harness.uv_token().is_ok(), "UV was never blocked");
+            assert_ne!(harness.uv_retries(), 0);
+        }
+
+        #[test]
+        fn closing_prompts_does_not_make_an_earlier_denial_worse() {
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Denied);
+            assert_eq!(harness.uv_token(), Err(StatusCode::OperationDenied as u8));
+            harness.answer(NotificationResult::Dismissed);
+            for _ in 0..10 {
+                assert_eq!(harness.uv_token(), Err(USER_ACTION_TIMEOUT));
+            }
+            assert_eq!(harness.uv_retries(), MAX_RETRIES - 1);
+        }
+
+        #[test]
+        fn a_closed_user_presence_prompt_still_refuses() {
+            // `always_uv = false`, no UV requested: only user presence is asked.
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Accepted);
+            let enroll = command(
+                0x01,
+                vec![
+                    (int(1), Cbor::Bytes(CLIENT_DATA_HASH.to_vec())),
+                    (int(2), Cbor::Map(vec![(text("id"), text("up.example"))])),
+                    (
+                        int(3),
+                        Cbor::Map(vec![(text("id"), Cbor::Bytes(vec![7; 16]))]),
+                    ),
+                    (
+                        int(4),
+                        Cbor::Array(vec![Cbor::Map(vec![
+                            (text("alg"), int(-7)),
+                            (text("type"), text("public-key")),
+                        ])]),
+                    ),
+                ],
+            );
+            let credential_id = enrolled_credential_id(&harness.send(&enroll));
+
+            let sign = command(
+                0x02,
+                vec![
+                    (int(1), text("up.example")),
+                    (int(2), Cbor::Bytes(CLIENT_DATA_HASH.to_vec())),
+                    (
+                        int(3),
+                        Cbor::Array(vec![Cbor::Map(vec![
+                            (text("id"), Cbor::Bytes(credential_id)),
+                            (text("type"), text("public-key")),
+                        ])]),
+                    ),
+                    (int(5), Cbor::Map(vec![(text("up"), Cbor::Bool(true))])),
+                ],
+            );
+            for answer in [NotificationResult::Dismissed, NotificationResult::Denied] {
+                harness.answer(answer);
+                assert_eq!(
+                    harness.send(&sign),
+                    vec![StatusCode::OperationDenied as u8],
+                    "{answer:?}: presence is refused"
+                );
+                assert_eq!(harness.uv_retries(), MAX_RETRIES, "{answer:?}");
+            }
+        }
+
+        #[test]
+        fn the_blocked_hint_fires_whenever_a_request_answers_uv_blocked() {
+            let mut harness = Harness::new(false, false, PinEnforcement::Optional);
+            harness.answer(NotificationResult::Denied);
+            for _ in 0..MAX_RETRIES {
+                let _ = harness.uv_token();
+            }
+            assert_eq!(harness.uv_retries(), 0);
+
+            // getPinUvAuthTokenUsingUv answers UV_BLOCKED before it asks anything.
+            let before = harness.prompts_shown();
+            captured_log::clear();
+            assert_eq!(harness.uv_token(), Err(StatusCode::UvBlocked as u8));
+            assert_eq!(harness.prompts_shown(), before);
+            let logged = captured_log::errors();
+            assert_eq!(logged.len(), 1, "{logged:?}");
+            assert!(
+                logged[0].contains("passless client pin uv-reset"),
+                "{logged:?}"
+            );
+            assert!(logged[0].contains("UV_BLOCKED"), "{logged:?}");
+
+            // Any other request answered UV_BLOCKED logs it too, and others do not.
+            captured_log::clear();
+            let _ = harness.send(&[0x04]);
+            assert!(captured_log::errors().is_empty());
+        }
+
+        /// With a PIN set (and the PIN hint current) built-in UV is not configured, so GetInfo
+        /// advertises `uv: false` and soft-fido2 refuses UV requests before asking the callback:
+        /// the policy denials in `request_uv` are never reached and no retry is touched.
+        #[test]
+        fn with_a_current_pin_hint_policy_denials_are_never_asked_for() {
+            for (always_uv, enforcement) in [
+                (false, PinEnforcement::Required),
+                (true, PinEnforcement::Optional),
+            ] {
+                let mut harness = Harness::new(true, always_uv, enforcement);
+                harness.answer(NotificationResult::Accepted);
+
+                let info = harness.send(&[0x04]);
+                assert_eq!(get_info_uv(&info), Some(false));
+                for _ in 0..MAX_RETRIES * 2 {
+                    assert_eq!(
+                        harness.send(&make_credential_with_uv("pin.example")),
+                        vec![StatusCode::InvalidOption as u8],
+                        "always_uv={always_uv}, {enforcement:?}"
+                    );
+                    assert_eq!(harness.uv_token(), Err(StatusCode::NotAllowed as u8));
+                }
+                assert_eq!(harness.prompts_shown(), 0);
+                assert_eq!(harness.uv_retries(), MAX_RETRIES);
+            }
+        }
+
+        /// A PIN that the cached hint does not know about yet (a synchronized password store)
+        /// leaves built-in UV configured, so `request_uv` is reached and refuses by policy.
+        /// soft-fido2 0.18 counts that `Denied` as a failed attempt: each refusal spends a retry
+        /// and the one that spends the last answers UV_BLOCKED instead of the PUAT_REQUIRED the
+        /// platform needs for its PIN fallback.
+        ///
+        /// Needs `UvResult::Unavailable` from soft-fido2 (pando85/soft-fido2#179) to stop; when
+        /// passless answers it, this test flips to "no retry consumed, always PUAT_REQUIRED".
+        #[test]
+        fn policy_denials_still_consume_retries_when_the_pin_hint_is_stale() {
+            for (always_uv, enforcement) in [
+                (false, PinEnforcement::Required),
+                (true, PinEnforcement::Optional),
+            ] {
+                let dir = tempfile::tempdir().expect("create temp directory");
+                let cred_dir = dir.path().join("credentials");
+                std::fs::create_dir_all(&cred_dir).expect("create credential directory");
+                let storage = LocalStorageAdapter::new(cred_dir).expect("create storage");
+                let pin_storage = Arc::new(Mutex::new(StalePinConfigStorage {
+                    state: Mutex::new(PinState {
+                        uv_retries: MAX_RETRIES,
+                        ..pin_state_with_pin()
+                    }),
+                    cached_pin_configured: false,
+                }));
+                let mut service = AuthenticatorService::with_pin_storage(
+                    storage,
+                    Some(pin_storage),
+                    SecurityConfig {
+                        always_uv,
+                        ..Default::default()
+                    },
+                    PinConfig {
+                        enforcement,
+                        max_uv_retries: MAX_RETRIES,
+                        ..Default::default()
+                    },
+                )
+                .expect("create authenticator service");
+                let verifications = Arc::new(Mutex::new(0));
+                service.set_prompts(Answering {
+                    answer: NotificationResult::Accepted,
+                    verifications: verifications.clone(),
+                });
+
+                let mut answers = Vec::new();
+                for _ in 0..MAX_RETRIES {
+                    let mut response = Vec::new();
+                    service
+                        .handle(&make_credential_with_uv("pin.example"), &mut response)
+                        .expect("handle CTAP request");
+                    answers.push(response);
+                }
+                let mut expected =
+                    vec![vec![StatusCode::PuatRequired as u8]; MAX_RETRIES as usize - 1];
+                expected.push(vec![StatusCode::UvBlocked as u8]);
+                assert_eq!(answers, expected, "always_uv={always_uv}, {enforcement:?}");
+                assert_eq!(service.authenticator.uv_retries().unwrap(), 0);
+                assert_eq!(*verifications.lock().unwrap(), 0, "nobody was asked");
+            }
+        }
+
+        #[test]
+        fn recognizes_only_a_bare_uv_blocked_status() {
+            assert!(is_uv_blocked_response(&[0x3c]));
+            assert!(!is_uv_blocked_response(&[0x00]));
+            assert!(!is_uv_blocked_response(&[0x3c, 0x00]));
+            assert!(!is_uv_blocked_response(&[]));
+            assert!(UV_BLOCKED_HINT.contains("passless client pin uv-reset"));
+        }
+
+        /// Collects what this thread logs at error level. The test harness runs each test on its
+        /// own thread, so the buffer is thread-local.
+        mod captured_log {
+            use std::cell::RefCell;
+
+            struct Capture;
+
+            thread_local! {
+                static ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+            }
+
+            impl log::Log for Capture {
+                fn enabled(&self, _: &log::Metadata) -> bool {
+                    true
+                }
+
+                fn log(&self, record: &log::Record) {
+                    if record.level() == log::Level::Error {
+                        ERRORS.with(|errors| errors.borrow_mut().push(record.args().to_string()));
+                    }
+                }
+
+                fn flush(&self) {}
+            }
+
+            static CAPTURE: Capture = Capture;
+
+            pub fn clear() {
+                let _ = log::set_logger(&CAPTURE);
+                log::set_max_level(log::LevelFilter::Trace);
+                ERRORS.with(|errors| errors.borrow_mut().clear());
+            }
+
+            pub fn errors() -> Vec<String> {
+                ERRORS.with(|errors| errors.borrow().clone())
+            }
+        }
     }
 }
 
@@ -3870,6 +4399,70 @@ mod protected_credential_tests {
             assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 1));
             assert_eq!(stored(&storage, &enrolled.credential_id).sign_count, before);
         }
+    }
+
+    /// The desktop prompt the way a user who ignores it, or a timeout, answers it.
+    struct Closing;
+
+    impl crate::human_prompts::HumanPrompts for Closing {
+        fn user_presence(
+            &mut self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: u32,
+        ) -> core::result::Result<NotificationResult, String> {
+            Ok(NotificationResult::Dismissed)
+        }
+
+        fn user_verification(
+            &mut self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: u32,
+        ) -> core::result::Result<NotificationResult, String> {
+            Ok(NotificationResult::Dismissed)
+        }
+
+        fn confirm_credential_protection_lowering(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: u32,
+        ) -> core::result::Result<NotificationResult, String> {
+            Ok(NotificationResult::Dismissed)
+        }
+
+        fn interaction_is_automatic(&self) -> core::result::Result<bool, String> {
+            Ok(false)
+        }
+    }
+
+    /// The rescue of a protected credential asks for built-in UV on the client's behalf. Closing
+    /// that prompt refuses the request (CTAP2_ERR_USER_ACTION_TIMEOUT) and spends no retry.
+    #[test]
+    fn closed_uv_prompt_of_the_rescue_fails_closed_without_spending_a_retry() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let enrolled = enroll_with_forced_uv(&storage, -8);
+        let before = stored(&storage, &enrolled.credential_id).sign_count;
+
+        let mut service = service_without_pin(&storage, false);
+        service.set_prompts(Closing);
+        let retries = service.authenticator.uv_retries().expect("UV retries");
+        for _ in 0..20 {
+            let response = respond(
+                &mut service,
+                &ssh_sign_request(&enrolled.credential_id, true),
+            );
+            assert_eq!(response, vec![StatusCode::UserActionTimeout as u8]);
+        }
+        assert_eq!(
+            service.authenticator.uv_retries().expect("UV retries"),
+            retries
+        );
+        assert_eq!(stored(&storage, &enrolled.credential_id).sign_count, before);
     }
 
     #[test]
