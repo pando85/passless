@@ -561,18 +561,21 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
+        // A policy refusal is not somebody refusing: `Unavailable` fails the request like
+        // `Denied` but spends no UV retry, so a stale PIN hint cannot drain the retries or turn the
+        // PUAT_REQUIRED a platform needs for its PIN fallback into UV_BLOCKED.
         if pin_set {
             match self.pin_config.enforcement {
                 PinEnforcement::Required => {
                     info!("PIN is set and enforcement=required, denying built-in UV to force PIN");
-                    return Ok(UvResult::Denied);
+                    return Ok(UvResult::Unavailable);
                 }
                 PinEnforcement::Optional => {
                     if self.security_config.always_uv {
                         info!(
                             "PIN is set, always_uv=true, enforcement=optional, denying built-in UV"
                         );
-                        return Ok(UvResult::Denied);
+                        return Ok(UvResult::Unavailable);
                     }
                     info!(
                         "PIN is set, always_uv=false, enforcement=optional, using notification fallback"
@@ -3954,14 +3957,13 @@ mod tests {
 
         /// A PIN that the cached hint does not know about yet (a synchronized password store)
         /// leaves built-in UV configured, so `request_uv` is reached and refuses by policy.
-        /// soft-fido2 0.18 counts that `Denied` as a failed attempt: each refusal spends a retry
-        /// and the one that spends the last answers UV_BLOCKED instead of the PUAT_REQUIRED the
-        /// platform needs for its PIN fallback.
-        ///
-        /// Needs `UvResult::Unavailable` from soft-fido2 (pando85/soft-fido2#179) to stop; when
-        /// passless answers it, this test flips to "no retry consumed, always PUAT_REQUIRED".
+        /// That refusal answers `UvResult::Unavailable` (soft-fido2 0.19, pando85/soft-fido2#179),
+        /// which fails the request like a denial but spends no retry: every request keeps
+        /// answering the PUAT_REQUIRED the platform needs for its PIN fallback, the counter stays
+        /// where it was and UV never becomes blocked. getPinUvAuthTokenUsingUv answers
+        /// OperationDenied, again without a decrement.
         #[test]
-        fn policy_denials_still_consume_retries_when_the_pin_hint_is_stale() {
+        fn policy_denials_consume_no_retries_when_the_pin_hint_is_stale() {
             for (always_uv, enforcement) in [
                 (false, PinEnforcement::Required),
                 (true, PinEnforcement::Optional),
@@ -3986,6 +3988,7 @@ mod tests {
                     },
                     PinConfig {
                         enforcement,
+                        max_retries: MAX_RETRIES,
                         max_uv_retries: MAX_RETRIES,
                         ..Default::default()
                     },
@@ -3996,20 +3999,41 @@ mod tests {
                     answer: NotificationResult::Accepted,
                     verifications: verifications.clone(),
                 });
+                let context = format!("always_uv={always_uv}, {enforcement:?}");
 
+                // Well past the retry budget: every answer is PUAT_REQUIRED, never UV_BLOCKED.
                 let mut answers = Vec::new();
-                for _ in 0..MAX_RETRIES {
+                for _ in 0..MAX_RETRIES * 2 {
                     let mut response = Vec::new();
                     service
                         .handle(&make_credential_with_uv("pin.example"), &mut response)
                         .expect("handle CTAP request");
                     answers.push(response);
                 }
-                let mut expected =
-                    vec![vec![StatusCode::PuatRequired as u8]; MAX_RETRIES as usize - 1];
-                expected.push(vec![StatusCode::UvBlocked as u8]);
-                assert_eq!(answers, expected, "always_uv={always_uv}, {enforcement:?}");
-                assert_eq!(service.authenticator.uv_retries().unwrap(), 0);
+                assert_eq!(
+                    answers,
+                    vec![vec![StatusCode::PuatRequired as u8]; MAX_RETRIES as usize * 2],
+                    "{context}"
+                );
+                assert_eq!(
+                    service.authenticator.uv_retries().unwrap(),
+                    MAX_RETRIES,
+                    "{context}"
+                );
+
+                // The token path answers OperationDenied each time, with no decrement either.
+                for _ in 0..MAX_RETRIES * 2 {
+                    assert_eq!(
+                        platform::token(&mut service, 2, platform::Way::BuiltInUv, 0x04, None),
+                        Err(StatusCode::OperationDenied as u8),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        service.authenticator.uv_retries().unwrap(),
+                        MAX_RETRIES,
+                        "{context}"
+                    );
+                }
                 assert_eq!(*verifications.lock().unwrap(), 0, "nobody was asked");
             }
         }
