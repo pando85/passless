@@ -425,18 +425,27 @@ fn npx_command(npx: &Path, package: &str, args: &[String]) -> Vec<PathBuf> {
 /// The MCP clients' server name, and the arguments `passless` is started with. The name is the one
 /// the browser MCP servers' own documentation uses and `agent mcp install` writes, so the tools
 /// stay `mcp__playwright__*` (Claude Code) whichever way the entry got there.
-fn entry_parts(profile: &str, adapter: McpAdapterKind) -> (&'static str, Vec<String>) {
+fn entry_parts(
+    profile: &str,
+    adapter: McpAdapterKind,
+    with_access_tool: bool,
+) -> (&'static str, Vec<String>) {
     let (name, adapter_name) = match adapter {
         McpAdapterKind::Playwright => ("playwright", "playwright"),
         McpAdapterKind::ChromeDevtools => ("chrome-devtools", "chrome-devtools"),
     };
-    (
-        name,
-        ["agent", "mcp", adapter_name, "--profile", profile]
-            .map(String::from)
-            .to_vec(),
-    )
+    let mut args = ["agent", "mcp", adapter_name, "--profile", profile]
+        .map(String::from)
+        .to_vec();
+    // Only the Playwright adapter has the tool (ADR 0014 amendment section 6).
+    if with_access_tool && adapter == McpAdapterKind::Playwright {
+        args.push(WITH_ACCESS_TOOL_FLAG.to_string());
+    }
+    (name, args)
 }
+
+/// The `agent mcp playwright` flag that exposes the `passless_request_access` tool.
+pub(super) const WITH_ACCESS_TOOL_FLAG: &str = "--with-access-tool";
 
 /// The configuration a client reads, with one passless MCP server entry (formats checked against
 /// each client's documentation, P10b):
@@ -452,9 +461,10 @@ pub fn render_client_config(
     profile: &str,
     adapter: McpAdapterKind,
     command: &str,
+    with_access_tool: bool,
 ) -> serde_json::Value {
     use serde_json::json;
-    let (name, args) = entry_parts(profile, adapter);
+    let (name, args) = entry_parts(profile, adapter, with_access_tool);
     let stdio = json!({ "type": "stdio", "command": command, "args": args });
     match target {
         McpConfigTarget::ClaudeCode | McpConfigTarget::Cursor => {
@@ -508,6 +518,7 @@ fn print_config(
     profile: Option<&str>,
     target: McpConfigTarget,
     adapter: McpAdapterKind,
+    with_access_tool: bool,
 ) -> Result<()> {
     // The entry names its profile explicitly, so it keeps working when more are added later.
     let profile = &resolve_profile(profile)?;
@@ -517,13 +528,13 @@ fn print_config(
         eprintln!("warning: {warning}");
     }
     let command = mcp_entry_command(std::env::current_exe());
-    let config = render_client_config(target, profile, adapter, &command);
+    let config = render_client_config(target, profile, adapter, &command, with_access_tool);
     println!(
         "{}",
         serde_json::to_string_pretty(&config).map_err(|e| Error::Other(e.to_string()))?
     );
     if target == McpConfigTarget::ClaudeCode {
-        let (name, _) = entry_parts(profile, adapter);
+        let (name, _) = entry_parts(profile, adapter, with_access_tool);
         let entry = &config["mcpServers"][name];
         eprintln!(
             "# or, without editing a file (every project of this Claude Code account):\n\
@@ -543,21 +554,30 @@ pub fn dispatch_mcp(
     output: OutputFormat,
     print: Option<McpConfigTarget>,
     server: McpAdapterKind,
+    with_access_tool: bool,
     adapter: Option<&McpAdapter>,
 ) -> Result<()> {
     if let Some(target) = print {
-        return print_config(profile, target, server);
+        return print_config(profile, target, server, with_access_tool);
     }
     // `agent mcp playwright --profile P --print-config <client>`: the adapter names the entry.
     match adapter {
         Some(McpAdapter::Playwright {
             print_config: Some(target),
+            with_access_tool,
             ..
-        }) => return print_config(profile, *target, McpAdapterKind::Playwright),
+        }) => {
+            return print_config(
+                profile,
+                *target,
+                McpAdapterKind::Playwright,
+                *with_access_tool,
+            );
+        }
         Some(McpAdapter::ChromeDevtools {
             print_config: Some(target),
             ..
-        }) => return print_config(profile, *target, McpAdapterKind::ChromeDevtools),
+        }) => return print_config(profile, *target, McpAdapterKind::ChromeDevtools, false),
         _ => {}
     }
     if let Some(McpAdapter::Install {
@@ -566,6 +586,7 @@ pub fn dispatch_mcp(
         yes,
         skill,
         passless_path,
+        with_access_tool,
         ..
     }) = adapter
     {
@@ -577,6 +598,7 @@ pub fn dispatch_mcp(
                 yes: *yes,
                 skill: *skill,
                 passless_path: passless_path.as_deref(),
+                with_access_tool: *with_access_tool,
             },
         );
     }
@@ -588,24 +610,39 @@ pub fn dispatch_mcp(
         ));
     };
     let profile = &resolve_profile(profile)?;
-    let (kind, package, npx, url, extra) = match adapter {
+    let (kind, package, npx, url, extra, with_access_tool) = match adapter {
         McpAdapter::Playwright {
             package,
             npx,
             url,
             extra,
+            with_access_tool,
             ..
-        } => (McpAdapterKind::Playwright, package, npx, url, extra),
+        } => (
+            McpAdapterKind::Playwright,
+            package,
+            npx,
+            url,
+            extra,
+            *with_access_tool,
+        ),
         McpAdapter::ChromeDevtools {
             package,
             npx,
             url,
             extra,
             ..
-        } => (McpAdapterKind::ChromeDevtools, package, npx, url, extra),
+        } => (
+            McpAdapterKind::ChromeDevtools,
+            package,
+            npx,
+            url,
+            extra,
+            false,
+        ),
         McpAdapter::Install { .. } => unreachable!("handled above"),
     };
-    let adapter_name = entry_parts(profile, kind).1[2].clone();
+    let adapter_name = entry_parts(profile, kind, false).1[2].clone();
     if !in_principal_session(profile)? {
         // Resolve npx here: the principal session runs with the daemon's environment, whose PATH
         // need not have it.
@@ -615,8 +652,12 @@ pub fn dispatch_mcp(
             // own (re-established after a daemon restart) answers the discovery requests.
             let package = package.as_deref().unwrap_or(PLAYWRIGHT_PACKAGE);
             let command = npx_command(&npx, package, extra);
-            if let Some(()) = super::mcp_session::run_playwright(profile, url.as_deref(), &command)?
-            {
+            if let Some(()) = super::mcp_session::run_playwright(
+                profile,
+                url.as_deref(),
+                &command,
+                with_access_tool,
+            )? {
                 return Ok(());
             }
         }
@@ -635,6 +676,9 @@ pub fn dispatch_mcp(
         if let Some(url) = url {
             args.extend(["--url".to_string(), url.clone()]);
         }
+        if with_access_tool {
+            args.push(WITH_ACCESS_TOOL_FLAG.to_string());
+        }
         if !extra.is_empty() {
             args.push("--".to_string());
             args.extend(extra.iter().cloned());
@@ -646,7 +690,12 @@ pub fn dispatch_mcp(
         McpAdapterKind::Playwright => {
             let package = package.as_deref().unwrap_or(PLAYWRIGHT_PACKAGE);
             let command = npx_command(&npx, package, extra);
-            super::playwright_mcp::run_as_principal(profile, url.as_deref(), &command)
+            super::playwright_mcp::run_as_principal(
+                profile,
+                url.as_deref(),
+                &command,
+                with_access_tool,
+            )
         }
         McpAdapterKind::ChromeDevtools => {
             run_chrome_devtools(profile, url.as_deref(), &npx, package.as_deref(), extra)
@@ -696,6 +745,7 @@ fn run_chrome_devtools(
             misses = if endpoint_alive(&addr) { 0 } else { misses + 1 };
             misses < 2
         },
+        None,
     )
 }
 
@@ -1017,6 +1067,7 @@ mod tests {
             "coding",
             Playwright,
             "passless",
+            false,
         );
         let entry = &claude["mcpServers"]["playwright"];
         assert_eq!(entry["type"], "stdio");
@@ -1024,13 +1075,23 @@ mod tests {
         assert_eq!(entry["args"], serde_json::json!(args));
 
         // Cursor `.cursor/mcp.json`: the same shape.
-        let cursor =
-            render_client_config(McpConfigTarget::Cursor, "coding", Playwright, "passless");
+        let cursor = render_client_config(
+            McpConfigTarget::Cursor,
+            "coding",
+            Playwright,
+            "passless",
+            false,
+        );
         assert_eq!(cursor, claude);
 
         // VS Code `.vscode/mcp.json`: `servers`, not `mcpServers`.
-        let vscode =
-            render_client_config(McpConfigTarget::Vscode, "coding", Playwright, "passless");
+        let vscode = render_client_config(
+            McpConfigTarget::Vscode,
+            "coding",
+            Playwright,
+            "passless",
+            false,
+        );
         assert!(vscode.get("mcpServers").is_none());
         assert_eq!(vscode["servers"]["playwright"]["type"], "stdio");
         assert_eq!(
@@ -1039,8 +1100,13 @@ mod tests {
         );
 
         // opencode `opencode.json`: `mcp.servers.<name>` with a local command array.
-        let opencode =
-            render_client_config(McpConfigTarget::Opencode, "coding", Playwright, "passless");
+        let opencode = render_client_config(
+            McpConfigTarget::Opencode,
+            "coding",
+            Playwright,
+            "passless",
+            false,
+        );
         let entry = &opencode["mcp"]["servers"]["playwright"];
         assert_eq!(entry["type"], "local");
         assert_eq!(
@@ -1061,6 +1127,7 @@ mod tests {
             "coding",
             ChromeDevtools,
             "passless",
+            false,
         );
         assert_eq!(
             devtools["mcpServers"]["chrome-devtools"]["args"][2],
@@ -1095,10 +1162,46 @@ mod tests {
     }
 
     #[test]
-    fn the_entries_are_named_like_install_names_them() {
-        assert_eq!(entry_parts("p", McpAdapterKind::Playwright).0, "playwright");
+    fn the_access_tool_flag_is_printed_only_when_asked_and_only_for_playwright() {
+        use McpAdapterKind::{ChromeDevtools, Playwright};
+        let args = |adapter, flag| entry_parts("coding", adapter, flag).1;
         assert_eq!(
-            entry_parts("p", McpAdapterKind::ChromeDevtools).0,
+            args(Playwright, true),
+            [
+                "agent",
+                "mcp",
+                "playwright",
+                "--profile",
+                "coding",
+                "--with-access-tool"
+            ]
+        );
+        assert_eq!(
+            args(Playwright, false),
+            ["agent", "mcp", "playwright", "--profile", "coding"]
+        );
+        assert!(!args(ChromeDevtools, true).contains(&"--with-access-tool".to_string()));
+        for target in [
+            McpConfigTarget::ClaudeCode,
+            McpConfigTarget::Cursor,
+            McpConfigTarget::Vscode,
+            McpConfigTarget::Opencode,
+        ] {
+            let on = render_client_config(target, "coding", Playwright, "passless", true);
+            let off = render_client_config(target, "coding", Playwright, "passless", false);
+            assert!(on.to_string().contains("--with-access-tool"), "{on}");
+            assert!(!off.to_string().contains("--with-access-tool"), "{off}");
+        }
+    }
+
+    #[test]
+    fn the_entries_are_named_like_install_names_them() {
+        assert_eq!(
+            entry_parts("p", McpAdapterKind::Playwright, false).0,
+            "playwright"
+        );
+        assert_eq!(
+            entry_parts("p", McpAdapterKind::ChromeDevtools, false).0,
             "chrome-devtools"
         );
     }
@@ -1117,11 +1220,21 @@ mod tests {
         // A symlink resolves to the file; the entry carries it in every client's format.
         let command = mcp_entry_command(Ok(link));
         assert_eq!(command, canonical);
-        let claude =
-            render_client_config(McpConfigTarget::ClaudeCode, "coding", Playwright, &command);
+        let claude = render_client_config(
+            McpConfigTarget::ClaudeCode,
+            "coding",
+            Playwright,
+            &command,
+            false,
+        );
         assert_eq!(claude["mcpServers"]["playwright"]["command"], canonical);
-        let opencode =
-            render_client_config(McpConfigTarget::Opencode, "coding", Playwright, &command);
+        let opencode = render_client_config(
+            McpConfigTarget::Opencode,
+            "coding",
+            Playwright,
+            &command,
+            false,
+        );
         assert_eq!(
             opencode["mcp"]["servers"]["playwright"]["command"][0],
             canonical

@@ -578,9 +578,9 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
         .map_err(|e| Error::Other(e.to_string()))?;
     match resp {
         passless_core::agent::AdminResponse::GrantedRuleList(list) => match output {
-            OutputFormat::Json => admin_output_json(&list),
+            OutputFormat::Json => admin_output_json(&display_granted_rules(list)),
             OutputFormat::Plain => {
-                print!("{}", format_granted_rules(&list));
+                print!("{}", format_granted_rules(&display_granted_rules(list)));
                 Ok(())
             }
         },
@@ -601,16 +601,37 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
     }
 }
 
+/// The text of an empty `origin` (an `authenticate` pre-request has no page) in both outputs.
+const NO_ORIGIN: &str = "-";
+
+/// The form both `grants list` outputs show (ADR 0014 amendment section 7): every grant carries
+/// its `source` (`ceremony` when the daemon did not say, as an older one does not) and an empty
+/// `origin` reads `-`.
+fn display_granted_rules(mut list: GrantedRuleList) -> GrantedRuleList {
+    for rule in list.profiles.iter_mut().flat_map(|p| p.rules.iter_mut()) {
+        if rule.source.is_none() {
+            rule.source = Some("ceremony".to_string());
+        }
+        if rule.origin.is_empty() {
+            rule.origin = NO_ORIGIN.to_string();
+        }
+    }
+    list
+}
+
 /// The plain `agent-admin grants list` text: per profile a summary line, then a table with a header
 /// whose `RULE` column says which configured rule permitted each grant (`exact`, or `*` for a grant
-/// under the wildcard rule, ADR 0014 amendment section 2.2) and `KIND` whether it came from an
-/// approved sign-in (`escalation`) or a registration (`registration`, with its credential).
+/// under the wildcard rule, ADR 0014 amendment section 2.2), `KIND` whether it came from an
+/// approved sign-in (`escalation`) or a registration (`registration`, with its credential) and
+/// `SOURCE` who raised the escalation (`ceremony`, or `pre_request` for one the agent asked for
+/// in advance, which has no origin).
 fn format_granted_rules(list: &GrantedRuleList) -> String {
-    const HEADER: [&str; 8] = [
+    const HEADER: [&str; 9] = [
         "RP_ID",
         "ACTION",
         "KIND",
         "RULE",
+        "SOURCE",
         "GRANTED_AT",
         "REQUEST",
         "ORIGIN",
@@ -632,7 +653,7 @@ fn format_granted_rules(list: &GrantedRuleList) -> String {
         if profile.rules.is_empty() {
             continue;
         }
-        let rows: Vec<[String; 8]> = profile
+        let rows: Vec<[String; 9]> = profile
             .rules
             .iter()
             .map(|rule| {
@@ -641,9 +662,14 @@ fn format_granted_rules(list: &GrantedRuleList) -> String {
                     rule.action.clone(),
                     rule.kind.clone(),
                     rule.rule.clone(),
+                    rule.source.clone().unwrap_or_else(|| "ceremony".into()),
                     rule.granted_at.clone(),
                     rule.request_id.clone(),
-                    rule.origin.clone(),
+                    if rule.origin.is_empty() {
+                        NO_ORIGIN.to_string()
+                    } else {
+                        rule.origin.clone()
+                    },
                     rule.credential_ref.clone().unwrap_or_else(|| "-".into()),
                 ]
             })
@@ -1247,6 +1273,7 @@ mod tests {
                 "ACTION",
                 "KIND",
                 "RULE",
+                "SOURCE",
                 "GRANTED_AT",
                 "REQUEST",
                 "ORIGIN",
@@ -1255,20 +1282,84 @@ mod tests {
         );
         let exact: Vec<&str> = lines[2].split_whitespace().collect();
         assert_eq!(
-            exact[..4],
-            ["github.com", "authenticate", "escalation", "exact"]
+            exact[..5],
+            [
+                "github.com",
+                "authenticate",
+                "escalation",
+                "exact",
+                "ceremony"
+            ]
         );
-        assert_eq!(exact[7], "-");
+        assert_eq!(exact[8], "-");
         let wildcard: Vec<&str> = lines[3].split_whitespace().collect();
         assert_eq!(
-            wildcard[..4],
-            ["new.example.org", "authenticate", "registration", "*"]
+            wildcard[..5],
+            [
+                "new.example.org",
+                "authenticate",
+                "registration",
+                "*",
+                "ceremony"
+            ]
         );
-        assert_eq!(wildcard[7], "ab12");
+        assert_eq!(wildcard[8], "ab12");
         // The columns line up: every row starts its RULE cell where the header does.
         let column = lines[1].find("RULE").unwrap();
         assert_eq!(&lines[2][column..column + 5], "exact");
         assert_eq!(&lines[3][column..column + 1], "*");
+    }
+
+    /// A pre-request grant has no origin (it prints `-`) and says where it came from, in the
+    /// plain table and in the JSON; a grant from an older daemon, with no `source`, is a
+    /// ceremony's.
+    #[test]
+    fn grants_list_shows_the_source_and_a_dash_for_an_empty_origin() {
+        let mut pre = info("docs.example.net", "escalation", "*", None);
+        pre.origin = String::new();
+        pre.source = Some("pre_request".into());
+        let mut old = info("github.com", "escalation", "exact", None);
+        old.source = None;
+        let list = display_granted_rules(GrantedRuleList {
+            profiles: vec![ProfileGrantedRules {
+                profile_id: "coding".into(),
+                enabled: true,
+                disabled_reason: None,
+                digest: "d1".into(),
+                rules: vec![pre, old],
+            }],
+        });
+        let json = serde_json::to_value(&list).unwrap();
+        let rules = &json["profiles"][0]["rules"];
+        assert_eq!(rules[0]["source"], "pre_request");
+        assert_eq!(rules[0]["origin"], "-");
+        assert_eq!(rules[1]["source"], "ceremony");
+        assert_eq!(rules[1]["origin"], "https://github.com");
+
+        let text = format_granted_rules(&list);
+        let lines: Vec<&str> = text.lines().collect();
+        let row: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(row[0], "docs.example.net");
+        assert_eq!(row[4], "pre_request");
+        assert_eq!(row[7], "-", "the ORIGIN cell: {}", lines[2]);
+        let column = lines[1].find("SOURCE").unwrap();
+        assert_eq!(&lines[2][column..column + 11], "pre_request");
+        assert_eq!(&lines[3][column..column + 8], "ceremony");
+        // The formatter alone shows the dash too, for a list that was not normalised.
+        let mut raw = info("docs.example.net", "escalation", "*", None);
+        raw.origin = String::new();
+        raw.source = None;
+        let text = format_granted_rules(&GrantedRuleList {
+            profiles: vec![ProfileGrantedRules {
+                profile_id: "p".into(),
+                enabled: true,
+                disabled_reason: None,
+                digest: "d".into(),
+                rules: vec![raw],
+            }],
+        });
+        let row: Vec<&str> = text.lines().nth(2).unwrap().split_whitespace().collect();
+        assert_eq!((row[4], row[7]), ("ceremony", "-"));
     }
 
     #[test]

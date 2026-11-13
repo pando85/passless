@@ -334,6 +334,21 @@ impl AuditEvent {
         self.payload.kind_name()
     }
 
+    /// The names of the fields of this record that hold agent-supplied text: `agent_note`, the
+    /// note of a pre-request (schema 5), when the record has one. The export labels them so that
+    /// a reader sees which words are the agent's, not the daemon's (ADR 0014 amendment section
+    /// 2.3); the record itself, and so the hash chain, is unchanged.
+    pub fn agent_supplied_fields(&self) -> Vec<&'static str> {
+        const FIELDS: [&str; 1] = ["agent_note"];
+        let Ok(value) = serde_json::to_value(self) else {
+            return Vec::new();
+        };
+        FIELDS
+            .into_iter()
+            .filter(|field| value.get(field).is_some_and(|v| !v.is_null()))
+            .collect()
+    }
+
     /// The request ID of an operation reservation (`policy.allow`), if this is one.
     pub fn reservation_request_id(&self) -> Option<&str> {
         match &self.payload {
@@ -4057,6 +4072,18 @@ mod tests {
             assert_eq!(json["source"], "pre_request");
             assert_eq!(json["principal_session_id_hash"], hash.as_str());
         }
+        // The export labels the note as agent-supplied, on that record only.
+        assert_eq!(
+            pre_request.requested().agent_supplied_fields(),
+            ["agent_note"]
+        );
+        assert!(pre_request.approved(1).agent_supplied_fields().is_empty());
+        assert!(
+            escalation_context(&pid)
+                .requested()
+                .agent_supplied_fields()
+                .is_empty()
+        );
         // A ceremony's records say so, with null for what does not apply.
         let ceremony = serde_json::to_value(escalation_context(&pid).requested()).unwrap();
         assert_eq!(ceremony["source"], "ceremony");

@@ -31,6 +31,9 @@ pub struct InstallRequest<'a> {
     pub skill: bool,
     /// `--passless-path`.
     pub passless_path: Option<&'a Path>,
+    /// `--with-access-tool`: the Playwright entries it writes run `agent mcp playwright
+    /// --with-access-tool`.
+    pub with_access_tool: bool,
 }
 
 /// The `passless` an install writes into the entries, and what to tell the user about it.
@@ -588,7 +591,14 @@ fn install_plan(
 ) -> Result<()> {
     let fail = |e: mcp_clients::PlanError| Error::Other(format!("{}: {e}", file.display()));
     let plan = match text {
-        Some(text) => mcp_clients::plan(request.client, text, passless, profile).map_err(fail)?,
+        Some(text) => mcp_clients::plan(
+            request.client,
+            text,
+            passless,
+            profile,
+            request.with_access_tool,
+        )
+        .map_err(fail)?,
         None => Plan {
             entries: Vec::new(),
             jsonc: false,
@@ -601,7 +611,16 @@ fn install_plan(
         None
     } else {
         let base = plan.new_text.as_deref().or(text);
-        Some(mcp_clients::plan_add(request.client, base, passless, profile).map_err(fail)?)
+        Some(
+            mcp_clients::plan_add(
+                request.client,
+                base,
+                passless,
+                profile,
+                request.with_access_tool,
+            )
+            .map_err(fail)?,
+        )
     };
     print!("{}", report(file, request.client, scope, &plan));
     if let Some(add) = &add {
