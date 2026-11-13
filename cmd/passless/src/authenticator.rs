@@ -22,6 +22,7 @@ use soft_fido2::{
     CtapCommand, Error as SoftFido2Error, PinState, Result, SoftwareCredentialKeyProvider,
     StatusCode, UpResult, UvResult,
 };
+use soft_fido2_ctap::CredProtect;
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -833,6 +834,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             .algorithms(vec![-7])
             .max_pin_retries(pin_config.max_retries)
             .auto_lock_timeout(pin_config.auto_lock_timeout)
+            .default_cred_protect_with_uv(CredProtect::UserVerificationRequired)
             .build();
 
         let callbacks = PasslessCallbacks::with_prompts(
@@ -965,6 +967,7 @@ impl<
             .algorithms(vec![-7])
             .max_pin_retries(pin_config.max_retries)
             .auto_lock_timeout(pin_config.auto_lock_timeout)
+            .default_cred_protect_with_uv(CredProtect::UserVerificationRequired)
             .build();
 
         let callbacks = PasslessCallbacks::with_prompts(
