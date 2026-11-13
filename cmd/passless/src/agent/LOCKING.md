@@ -63,7 +63,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 
 | Rank | Lock | Declared at | Notes |
 |---|---|---|---|
-| 5 T | `managed_sessions[profile]` slot | `runtime.rs` (`AgentRuntime.managed_sessions`) | Held by `handle_principal` for one whole principal request, except `RequestAccess`, which copies the requester's session ID and deadline and releases it before anything else (it may wait for the human, rule 3). A parked `RequestAccess` takes it alone, with nothing held, to check that its session is still alive. It is the outermost runtime lock. |
+| 5 T | `managed_sessions[profile]` slot | `runtime.rs` (`AgentRuntime.managed_sessions`) | Held by `handle_principal` for one whole principal request, except `RequestAccess`, which copies the requester's session ID and deadline and releases it before anything else (it may wait for the human, rule 3). A parked `RequestAccess`, and the check after a pre-request was admitted (the session may have ended since the slot was released), take it alone, with nothing held, to check that its session is still alive. It is the outermost runtime lock. |
 | 10 T | `ProfileRuntime::lifecycle_lock` | `runtime.rs` (`ProfileRuntime`) | Makes browser launch and delegation single-flight per profile. |
 | 20 T | Backend operation lock | `backend.rs` (`CredentialBackendHandle.operation_lock`); the human one in `main.rs` (`ServiceHandler.operation_lock`) | See rule 4. Admin credential handlers take it before storage. |
 | 25 | Human `ServiceHandler.service` | `main.rs` | Human CTAP path only: operation lock, then service, then storage. |
@@ -209,8 +209,12 @@ condvar holding nothing else, wakes at least every 250 ms, and checks its sessio
 escalation mutex released by taking the `managed_sessions` slot (5) alone. Deadlines and token
 lifetimes are enforced by `sweep_pre_requests` (the runtime loop, about every 50 ms, and every
 pre-request call): escalation mutex, then prompt withdrawals and audit records after it is released.
-A token is consumed by `take_pre_approval` from the registration ceremony before its replay key,
-with no lock held: the escalation mutex, released, then the audit gate. The bearer's owner is read
+After the request is admitted, `pre_request_while` checks the session with no lock held and, if it
+ended meanwhile, runs `principal_session_ended` (escalation mutex, then the audit gate). A token
+is looked for by `has_pre_approval` (escalation mutex alone) before the replay key and consumed by
+`take_pre_approval` once the key is fresh, with no lock held: the escalation mutex, released, then
+the audit gate. `pre_approval.issued` is written by an effect after the mutex is released, and
+the token becomes usable only after it. The bearer's owner is read
 through `AgentSession::owning_principal_session` (policy grants, 70, alone); the pre-key-use
 re-check reads it again under the session and epoch gates (66, 69), which rank below it. A principal
 session's end (`cleanup_browser_for_session`, before its lifecycle lock) and a lease revocation take
