@@ -319,12 +319,18 @@ fn open_authenticator(selector: Option<&str>) -> Result<Transport> {
 /// 1. UV token (built-in user verification)
 /// 2. PIN token (if PIN is set on the authenticator)
 ///
-/// Returns an error if neither method is available/supported.
+/// Returns an error if neither method is available/supported. A refused verification (denied,
+/// closed or timed out prompt) ends here: the PIN is not offered after it, and the command never
+/// goes on without a token (the authenticator would answer PUAT_REQUIRED, 0x36). The exception is
+/// a denial that spends the last UV retry: the authenticator then answers UV_BLOCKED, which is
+/// not a refusal and does fall back to the PIN when one is set. `nothing` ends the message
+/// ("nothing was deleted").
 fn authenticate_for_credential_management(
     transport: &mut Transport,
     output: OutputFormat,
+    nothing: &str,
 ) -> Result<soft_fido2::request::PinUvAuth> {
-    authenticate_for_credential_management_cached(transport, output, &mut None)
+    authenticate_for_credential_management_cached(transport, output, &mut None, nothing)
 }
 
 /// A PIN typed by the user, kept in memory for the duration of one command so that a command
@@ -336,12 +342,129 @@ fn authenticate_for_credential_management_cached(
     transport: &mut Transport,
     output: OutputFormat,
     pin_cache: &mut PinCache,
+    nothing: &str,
+) -> Result<soft_fido2::request::PinUvAuth> {
+    acquire_credential_management_token(
+        transport,
+        output,
+        pin_cache,
+        &mut || read_pin_from_terminal(output),
+        nothing,
+    )
+}
+
+/// Ask for the PIN on the terminal.
+fn read_pin_from_terminal(output: OutputFormat) -> Result<Zeroizing<String>> {
+    if output == OutputFormat::Plain {
+        println!("Enter PIN: ");
+    }
+
+    let pin = Zeroizing::new(
+        read_password()
+            .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?,
+    );
+
+    if pin.is_empty() {
+        return Err(passless_core::Error::Other(
+            "PIN is required for credential management on this authenticator".to_string(),
+        ));
+    }
+
+    if output == OutputFormat::Plain {
+        println!();
+    }
+    Ok(pin)
+}
+
+/// What the credential-management token needs from the authenticator. A seam so the choice
+/// between built-in UV and the PIN, and the messages for a refusal, can be tested without a device.
+trait CredMgmtAuthenticator {
+    /// A `cm` token through built-in user verification.
+    fn uv_token(&mut self) -> soft_fido2::Result<soft_fido2::request::PinUvAuth>;
+    /// The authenticator's info (options `credMgmt` and `clientPin`).
+    fn info(&mut self) -> Result<AuthenticatorInfo>;
+    /// A `cm` token through the PIN.
+    fn pin_token(&mut self, pin: &str) -> soft_fido2::Result<soft_fido2::request::PinUvAuth>;
+}
+
+impl CredMgmtAuthenticator for Transport {
+    fn uv_token(&mut self) -> soft_fido2::Result<soft_fido2::request::PinUvAuth> {
+        Client::get_uv_token_for_credential_management(self, PinProtocol::V2)
+    }
+
+    fn info(&mut self) -> Result<AuthenticatorInfo> {
+        let info_response = Client::authenticator_get_info(self).map_err(|e| {
+            passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
+        })?;
+
+        let info_value: soft_fido2_ctap::cbor::Value =
+            soft_fido2_ctap::cbor::decode(&info_response).map_err(|e| {
+                passless_core::Error::Other(format!("Failed to decode info response: {:?}", e))
+            })?;
+
+        parse_authenticator_info(&info_value)
+    }
+
+    fn pin_token(&mut self, pin: &str) -> soft_fido2::Result<soft_fido2::request::PinUvAuth> {
+        Client::get_pin_token_for_credential_management(self, pin, PinProtocol::V2)
+    }
+}
+
+/// How a verification that the authenticator or the user refused is described.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UvRefusal {
+    /// The prompt was denied or closed (OPERATION_DENIED).
+    Denied,
+    /// The prompt was closed or timed out (USER_ACTION_TIMEOUT or ACTION_TIMEOUT; a deliberately
+    /// closed prompt also answers USER_ACTION_TIMEOUT).
+    TimedOut,
+}
+
+/// Whether `error` says that the user did not verify: a denied or closed prompt, or a timeout.
+fn uv_refusal(error: &soft_fido2::Error) -> Option<UvRefusal> {
+    use soft_fido2::StatusCode;
+
+    let soft_fido2::Error::CtapError(code) = error else {
+        return None;
+    };
+    if *code == StatusCode::OperationDenied as u8 {
+        Some(UvRefusal::Denied)
+    } else if *code == StatusCode::UserActionTimeout as u8
+        || *code == StatusCode::ActionTimeout as u8
+    {
+        Some(UvRefusal::TimedOut)
+    } else {
+        None
+    }
+}
+
+/// The message of a refused verification; `nothing` says what did not happen.
+fn format_uv_refusal(refusal: UvRefusal, nothing: &str) -> String {
+    match refusal {
+        UvRefusal::Denied => format!(
+            "User verification was denied or the prompt was closed; {}.",
+            nothing
+        ),
+        UvRefusal::TimedOut => format!(
+            "User verification was closed or timed out before it was answered; {}.",
+            nothing
+        ),
+    }
+}
+
+/// Get a credential-management token: built-in UV first, then the PIN.
+fn acquire_credential_management_token<D: CredMgmtAuthenticator>(
+    device: &mut D,
+    output: OutputFormat,
+    pin_cache: &mut PinCache,
+    read_pin: &mut dyn FnMut() -> Result<Zeroizing<String>>,
+    nothing: &str,
 ) -> Result<soft_fido2::request::PinUvAuth> {
     if output == OutputFormat::Plain {
         println!("Attempting user verification...");
     }
 
-    match Client::get_uv_token_for_credential_management(transport, PinProtocol::V2) {
+    match device.uv_token() {
         Ok(token) => {
             if output == OutputFormat::Plain {
                 println!("User verification successful\n");
@@ -349,6 +472,11 @@ fn authenticate_for_credential_management_cached(
             Ok(token)
         }
         Err(uv_error) => {
+            if let Some(refusal) = uv_refusal(&uv_error) {
+                return Err(passless_core::Error::Other(format_uv_refusal(
+                    refusal, nothing,
+                )));
+            }
             if output == OutputFormat::Plain {
                 if is_uv_blocked_error(&uv_error) {
                     println!("  {}", format_uv_blocked_message(&uv_error));
@@ -357,28 +485,43 @@ fn authenticate_for_credential_management_cached(
                 }
             }
 
-            fallback_to_pin_auth(transport, output, uv_error, pin_cache)
+            fallback_to_pin_auth(device, output, uv_error, pin_cache, read_pin)
         }
     }
 }
 
-/// Try to authenticate for credential management, returning None on failure
-///
-/// This is used by operations that may proceed without authentication
-/// (e.g., with passless authenticator that allows internal operations).
-fn authenticate_for_credential_management_opt(
-    transport: &mut Transport,
-    output: OutputFormat,
-) -> Option<soft_fido2::request::PinUvAuth> {
-    match authenticate_for_credential_management(transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
+/// Describe a failed credential-management request. A refused verification, a blocked UV and a
+/// token the authenticator did not accept get a sentence of their own instead of `CtapError(n)`.
+fn credential_management_failure(
+    what: &str,
+    error: &soft_fido2::Error,
+    nothing: &str,
+) -> passless_core::Error {
+    use soft_fido2::StatusCode;
+
+    if let Some(refusal) = uv_refusal(error) {
+        return passless_core::Error::Other(format_uv_refusal(refusal, nothing));
+    }
+    if is_uv_blocked_error(error) {
+        return passless_core::Error::Other(format_uv_blocked_message(error));
+    }
+    if let soft_fido2::Error::CtapError(code) = error {
+        let code = *code;
+        if code == StatusCode::PuatRequired as u8
+            || code == StatusCode::PinAuthInvalid as u8
+            || code == StatusCode::UnauthorizedPermission as u8
+        {
+            return passless_core::Error::Other(format!(
+                "{what}: the authenticator did not accept the PIN or user verification token \
+                 (it is missing, expired or lacks the permission); {nothing}. Run the command \
+                 again."
+            ));
+        }
+        if code == StatusCode::NoCredentials as u8 {
+            return passless_core::Error::Other(format!("{what}: credential not found"));
         }
     }
+    passless_core::Error::Other(format!("{what}: {:?}", error))
 }
 
 /// Check if a soft_fido2 error represents a UV-blocked condition
@@ -400,26 +543,18 @@ fn format_uv_blocked_message(error: &soft_fido2::Error) -> String {
 }
 
 /// Fallback to PIN authentication when UV fails
-fn fallback_to_pin_auth(
-    transport: &mut Transport,
+fn fallback_to_pin_auth<D: CredMgmtAuthenticator>(
+    device: &mut D,
     output: OutputFormat,
     uv_error: soft_fido2::Error,
     pin_cache: &mut PinCache,
+    read_pin: &mut dyn FnMut() -> Result<Zeroizing<String>>,
 ) -> Result<soft_fido2::request::PinUvAuth> {
     if output == OutputFormat::Plain {
         println!("  Checking if PIN authentication is available...");
     }
 
-    let info_response = Client::authenticator_get_info(transport).map_err(|e| {
-        passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
-    })?;
-
-    let info_value: soft_fido2_ctap::cbor::Value = soft_fido2_ctap::cbor::decode(&info_response)
-        .map_err(|e| {
-            passless_core::Error::Other(format!("Failed to decode info response: {:?}", e))
-        })?;
-
-    let info = parse_authenticator_info(&info_value)?;
+    let info = device.info()?;
 
     let has_cred_mgmt = info
         .options
@@ -449,39 +584,17 @@ fn fallback_to_pin_auth(
 
             let pin = match pin_cache.clone() {
                 Some(pin) => pin,
-                None => {
-                    if output == OutputFormat::Plain {
-                        println!("Enter PIN: ");
-                    }
-
-                    let pin = Zeroizing::new(read_password().map_err(|e| {
-                        passless_core::Error::Other(format!("Failed to read PIN: {:?}", e))
-                    })?);
-
-                    if pin.is_empty() {
-                        return Err(passless_core::Error::Other(
-                            "PIN is required for credential management on this authenticator"
-                                .to_string(),
-                        ));
-                    }
-
-                    if output == OutputFormat::Plain {
-                        println!();
-                    }
-                    pin
-                }
+                None => read_pin()?,
             };
 
-            let token =
-                Client::get_pin_token_for_credential_management(transport, &pin, PinProtocol::V2)
-                    .map_err(|e| {
-                    // A rejected PIN must not be offered again.
-                    *pin_cache = None;
-                    passless_core::Error::Other(format!(
-                        "PIN authentication failed: {:?}. UV was also unavailable: {:?}",
-                        e, uv_error
-                    ))
-                })?;
+            let token = device.pin_token(&pin).map_err(|e| {
+                // A rejected PIN must not be offered again.
+                *pin_cache = None;
+                passless_core::Error::Other(format!(
+                    "PIN authentication failed: {:?}. UV was also unavailable: {:?}",
+                    e, uv_error
+                ))
+            })?;
             *pin_cache = Some(pin);
             Ok(token)
         }
@@ -699,7 +812,11 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
         }
     }
 
-    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
+    let pin_uv_auth = Some(authenticate_for_credential_management(
+        &mut transport,
+        output,
+        "no credentials were listed",
+    )?);
 
     // Get metadata (optional, only for plain output)
     if output == OutputFormat::Plain {
@@ -733,7 +850,11 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
 
     let request = CredentialManagementRequest::new(pin_uv_auth.clone());
     let rps = Client::enumerate_rps(&mut transport, request).map_err(|e| {
-        passless_core::Error::Other(format!("Failed to enumerate relying parties: {:?}", e))
+        credential_management_failure(
+            "Failed to enumerate relying parties",
+            &e,
+            "no credentials were listed",
+        )
     })?;
 
     if rps.is_empty() {
@@ -934,16 +1055,24 @@ pub fn show(output: OutputFormat, device: Option<&str>, credential_id_hex: &str)
 
     let mut transport = open_authenticator(device)?;
 
-    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
-
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
         .map_err(|e| passless_core::Error::Other(format!("Invalid credential ID hex: {:?}", e)))?;
 
+    let pin_uv_auth = Some(authenticate_for_credential_management(
+        &mut transport,
+        output,
+        "no credential was shown",
+    )?);
+
     // Enumerate RPs to find the credential
     let request = CredentialManagementRequest::new(pin_uv_auth.clone());
     let rps = Client::enumerate_rps(&mut transport, request).map_err(|e| {
-        passless_core::Error::Other(format!("Failed to enumerate relying parties: {:?}", e))
+        credential_management_failure(
+            "Failed to enumerate relying parties",
+            &e,
+            "no credential was shown",
+        )
     })?;
 
     let mut found_credential = None;
@@ -1086,11 +1215,15 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
 
     let mut transport = open_authenticator(device)?;
 
-    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
-
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
         .map_err(|e| passless_core::Error::Other(format!("Invalid credential ID hex: {:?}", e)))?;
+
+    let pin_uv_auth = Some(authenticate_for_credential_management(
+        &mut transport,
+        output,
+        "nothing was deleted",
+    )?);
 
     if output == OutputFormat::Plain {
         println!("Deleting credential...");
@@ -1098,7 +1231,7 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
 
     let request = DeleteCredentialRequest::new(pin_uv_auth, credential_id);
     Client::delete_credential(&mut transport, request).map_err(|e| {
-        passless_core::Error::Other(format!("Failed to delete credential: {:?}", e))
+        credential_management_failure("Failed to delete credential", &e, "nothing was deleted")
     })?;
 
     match output {
@@ -1142,11 +1275,15 @@ pub fn rename(
 
     let mut transport = open_authenticator(device)?;
 
-    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
-
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
         .map_err(|e| passless_core::Error::Other(format!("Invalid credential ID hex: {:?}", e)))?;
+
+    let pin_uv_auth = Some(authenticate_for_credential_management(
+        &mut transport,
+        output,
+        "nothing was renamed",
+    )?);
 
     // First, we need to get the current credential to retrieve the user.id
     // We'll enumerate credentials and find the matching one
@@ -1180,8 +1317,9 @@ pub fn rename(
 
     // Enumerate all RPs to find the credential
     let mgmt_request = CredentialManagementRequest::new(pin_uv_auth.clone());
-    let rps = Client::enumerate_rps(&mut transport, mgmt_request)
-        .map_err(|e| passless_core::Error::Other(format!("Failed to enumerate RPs: {:?}", e)))?;
+    let rps = Client::enumerate_rps(&mut transport, mgmt_request).map_err(|e| {
+        credential_management_failure("Failed to enumerate RPs", &e, "nothing was renamed")
+    })?;
 
     let mut found_credential = None;
 
@@ -1226,7 +1364,11 @@ pub fn rename(
     // Send the update request
     let update_request = UpdateUserRequest::new(pin_uv_auth, credential_id, updated_user.clone());
     Client::update_user_information(&mut transport, update_request).map_err(|e| {
-        passless_core::Error::Other(format!("Failed to update user information: {:?}", e))
+        credential_management_failure(
+            "Failed to update user information",
+            &e,
+            "nothing was renamed",
+        )
     })?;
 
     match output {
@@ -1281,7 +1423,11 @@ fn vendor_pin_uv_auth(
     output: OutputFormat,
     auth_data: &[u8],
 ) -> Result<(u8, Vec<u8>)> {
-    let token = authenticate_for_credential_management(transport, output)?;
+    let token = authenticate_for_credential_management(
+        transport,
+        output,
+        "the operation was not performed",
+    )?;
     vendor_auth_from_token(transport, &token, auth_data)
 }
 
@@ -1701,6 +1847,7 @@ impl TransportBackend {
             &mut self.transport,
             self.output,
             &mut self.pin_cache,
+            "nothing was changed",
         )
     }
 }
@@ -3001,5 +3148,218 @@ mod tests {
         };
         assert!(text(StatusCode::OperationDenied).contains("denied, closed or timed out"));
         assert!(text(StatusCode::NotAllowed).contains("PASSLESS_INTERACTION_MODE=automatic"));
+    }
+    /// A device that answers the token requests of `acquire_credential_management_token`.
+    struct FakeAuthenticator {
+        uv: std::result::Result<(), soft_fido2::Error>,
+        client_pin: Option<bool>,
+        pin_accepted: bool,
+        calls: Vec<&'static str>,
+    }
+
+    const UV_TOKEN: u8 = 1;
+    const PIN_TOKEN: u8 = 2;
+
+    impl FakeAuthenticator {
+        fn new(uv: std::result::Result<(), soft_fido2::Error>, client_pin: Option<bool>) -> Self {
+            Self {
+                uv,
+                client_pin,
+                pin_accepted: true,
+                calls: Vec::new(),
+            }
+        }
+
+        fn token(marker: u8) -> soft_fido2::request::PinUvAuth {
+            soft_fido2::request::PinUvAuth::new(
+                vec![marker],
+                soft_fido2::request::PinUvAuthProtocol::V2,
+            )
+        }
+    }
+
+    impl CredMgmtAuthenticator for FakeAuthenticator {
+        fn uv_token(&mut self) -> soft_fido2::Result<soft_fido2::request::PinUvAuth> {
+            self.calls.push("uv");
+            self.uv.clone().map(|()| Self::token(UV_TOKEN))
+        }
+
+        fn info(&mut self) -> Result<AuthenticatorInfo> {
+            self.calls.push("info");
+            let mut options = HashMap::from([("credMgmt".to_string(), true)]);
+            if let Some(set) = self.client_pin {
+                options.insert("clientPin".to_string(), set);
+            }
+            Ok(AuthenticatorInfo {
+                options: Some(options),
+                ..AuthenticatorInfo::default()
+            })
+        }
+
+        fn pin_token(&mut self, pin: &str) -> soft_fido2::Result<soft_fido2::request::PinUvAuth> {
+            self.calls.push("pin");
+            if self.pin_accepted && pin == "1234" {
+                Ok(Self::token(PIN_TOKEN))
+            } else {
+                Err(soft_fido2::Error::CtapError(
+                    soft_fido2::StatusCode::PinInvalid as u8,
+                ))
+            }
+        }
+    }
+
+    fn ctap(status: soft_fido2::StatusCode) -> soft_fido2::Error {
+        soft_fido2::Error::CtapError(status as u8)
+    }
+
+    /// Run the acquisition; the PIN prompt answers "1234" and counts its calls.
+    fn acquire(
+        device: &mut FakeAuthenticator,
+        pin_cache: &mut PinCache,
+    ) -> (Result<soft_fido2::request::PinUvAuth>, usize) {
+        let mut asked = 0;
+        let result = acquire_credential_management_token(
+            device,
+            OutputFormat::Json,
+            pin_cache,
+            &mut || {
+                asked += 1;
+                Ok(Zeroizing::new("1234".to_string()))
+            },
+            "nothing was deleted",
+        );
+        (result, asked)
+    }
+
+    #[test]
+    fn without_a_pin_the_token_comes_from_built_in_user_verification() {
+        let mut device = FakeAuthenticator::new(Ok(()), Some(false));
+        let (result, asked) = acquire(&mut device, &mut None);
+        assert_eq!(result.unwrap().param(), [UV_TOKEN]);
+        assert_eq!(asked, 0);
+        assert_eq!(device.calls, ["uv"], "no PIN lookup, no second request");
+    }
+
+    #[test]
+    fn with_a_pin_the_pin_is_used_when_built_in_user_verification_is_unavailable() {
+        let mut device = FakeAuthenticator::new(
+            Err(ctap(soft_fido2::StatusCode::UnsupportedOption)),
+            Some(true),
+        );
+        let mut cache = None;
+        let (result, asked) = acquire(&mut device, &mut cache);
+        assert_eq!(result.unwrap().param(), [PIN_TOKEN]);
+        assert_eq!(asked, 1);
+        assert_eq!(device.calls, ["uv", "info", "pin"]);
+        // A second token of the same command reuses the typed PIN.
+        let (result, asked) = acquire(&mut device, &mut cache);
+        assert_eq!(result.unwrap().param(), [PIN_TOKEN]);
+        assert_eq!(asked, 0);
+    }
+
+    #[test]
+    fn a_denied_or_closed_prompt_ends_the_command_with_a_clear_message() {
+        // The observed case: the notification was closed (OPERATION_DENIED). Neither a PIN nor
+        // "no authentication" may follow, which is what ended in 0x36 PUAT_REQUIRED.
+        for client_pin in [None, Some(false), Some(true)] {
+            let mut device = FakeAuthenticator::new(
+                Err(ctap(soft_fido2::StatusCode::OperationDenied)),
+                client_pin,
+            );
+            let (result, asked) = acquire(&mut device, &mut None);
+            let text = result.unwrap_err().to_string();
+            assert_eq!(
+                text,
+                "User verification was denied or the prompt was closed; nothing was deleted."
+            );
+            assert_eq!(asked, 0, "the PIN is not asked after a denial");
+            assert_eq!(device.calls, ["uv"]);
+        }
+    }
+
+    #[test]
+    fn a_timed_out_prompt_ends_the_command_with_a_clear_message() {
+        for status in [
+            soft_fido2::StatusCode::UserActionTimeout,
+            soft_fido2::StatusCode::ActionTimeout,
+        ] {
+            let mut device = FakeAuthenticator::new(Err(ctap(status)), Some(true));
+            let (result, asked) = acquire(&mut device, &mut None);
+            let text = result.unwrap_err().to_string();
+            assert!(text.contains("timed out"), "{text}");
+            assert!(text.ends_with("nothing was deleted."), "{text}");
+            assert!(!text.contains("CtapError"), "{text}");
+            assert_eq!(asked, 0);
+        }
+    }
+
+    #[test]
+    fn blocked_user_verification_points_to_uv_reset_or_falls_back_to_the_pin() {
+        let blocked = || ctap(soft_fido2::StatusCode::UvBlocked);
+        let mut device = FakeAuthenticator::new(Err(blocked()), Some(false));
+        let (result, asked) = acquire(&mut device, &mut None);
+        let text = result.unwrap_err().to_string();
+        assert!(text.contains("passless client pin uv-reset"), "{text}");
+        assert_eq!(asked, 0);
+
+        // With a PIN set the PIN still works, as before.
+        let mut device = FakeAuthenticator::new(Err(blocked()), Some(true));
+        let (result, asked) = acquire(&mut device, &mut None);
+        assert_eq!(result.unwrap().param(), [PIN_TOKEN]);
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_rejected_pin_is_reported_and_forgotten() {
+        let mut device = FakeAuthenticator::new(
+            Err(ctap(soft_fido2::StatusCode::UnsupportedOption)),
+            Some(true),
+        );
+        device.pin_accepted = false;
+        let mut cache = None;
+        let (result, _) = acquire(&mut device, &mut cache);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("PIN authentication failed")
+        );
+        assert!(cache.is_none(), "a rejected PIN is not offered again");
+    }
+
+    #[test]
+    fn failed_credential_management_requests_never_print_a_bare_ctap_error() {
+        use soft_fido2::StatusCode;
+
+        let text = |status| {
+            credential_management_failure(
+                "Failed to delete credential",
+                &ctap(status),
+                "nothing was deleted",
+            )
+            .to_string()
+        };
+        assert_eq!(
+            text(StatusCode::OperationDenied),
+            "User verification was denied or the prompt was closed; nothing was deleted."
+        );
+        assert!(text(StatusCode::UvBlocked).contains("passless client pin uv-reset"));
+        let puat = text(StatusCode::PuatRequired);
+        assert!(puat.starts_with("Failed to delete credential: "), "{puat}");
+        assert!(puat.contains("did not accept"), "{puat}");
+        assert!(puat.contains("nothing was deleted"), "{puat}");
+        assert!(text(StatusCode::NoCredentials).contains("credential not found"));
+        // (A blocked UV keeps its long-standing message, which shows the status next to the hint.)
+        for status in [
+            StatusCode::OperationDenied,
+            StatusCode::PuatRequired,
+            StatusCode::PinAuthInvalid,
+            StatusCode::NoCredentials,
+            StatusCode::UserActionTimeout,
+        ] {
+            assert!(!text(status).contains("CtapError"), "{status:?}");
+        }
+        // Anything else keeps the technical detail.
+        assert!(text(StatusCode::InvalidParameter).contains("CtapError"));
     }
 }
