@@ -640,7 +640,9 @@ and never reveals whether the human holds a credential.
   (`not_requestable` otherwise); then the ceremony-time pre-checks in their usual order (cooldown, the
   wildcard registration limits, grant cap and store, notification bus, queue, waiter caps), with the
   pre-request occupying a waiter slot of its session, and per principal session one pending
-  pre-request and at most six per 10 minutes (`rate_limited`). Refusals are audited as `policy.deny`
+  pre-request and at most six per 10 minutes, and per profile, across its principal sessions (the
+  out-of-session CLI starts a fresh one per call), at most three pending and twelve per 10 minutes
+  (`rate_limited`). Refusals are audited as `policy.deny`
   (`not_requestable`, `pre_request_rate_limited`, `pre_request_not_enabled`) and coalesced like any.
 - **`authenticate`.** Creates or joins the escalation for the key; ceremonies that arrive meanwhile join
   it as usual. Approval persists the grant a ceremony-time approval would, with `source = "pre_request"`
@@ -880,7 +882,9 @@ The normative model is a bearer session, not a per-operation state machine.
   extension path is the session bearer itself; there is no separate registration grant (§10.3).
   A registration escalation binds to the waiting ceremony's session; a pre-approval token (§8.1) binds
   to the principal session that owns the browser and dies with it: with the session, its lease, the
-  revocation epoch, or a grant revocation for its RP.
+  revocation epoch, or a grant revocation for its RP. Under `browser_scope = "profile"` any session
+  attached to the shared browser acts as its owner and can use the owner's token; only
+  `browser_scope = "session"` keeps one agent's token from another's browser.
 - **In flight.** An operation whose session or generation is no longer valid fails before key
   use. An additive grant (§8.4) does not count as a change.
 
@@ -1315,7 +1319,7 @@ reservation (§12).
 | Port-mode CDP reached by another local user | Loopback only; pipe mode for untrusted peers | Accepted in port mode |
 | Agent copies browser session material | CDP pipe mediation; short leases | Lease expiry is not RP-side revocation |
 | Agent suppresses audit | Audit outside principal; durable pre-write gate | Host root can rewrite local audit |
-| A prompt-injected agent asks in advance, or writes persuasion into its request (§8.1) | A pre-request raises only a prompt a page could raise, for a key the live rules resolve to `request`, behind `pre_request_actions`; one pending and six per 10 minutes per session, the shared cooldown and caps; the prompt text is daemon-derived and never shows the agent's note, which is audit-only and labelled agent-supplied; a `register` approval is one-use, in memory and bound to one principal session | A same-UID agent can still approve its own prompt (§8.2); an agent can cost the human up to six prompts per session per 10 minutes, and the pre-request's site name is the agent's choice |
+| A prompt-injected agent asks in advance, or writes persuasion into its request (§8.1) | A pre-request raises only a prompt a page could raise, for a key the live rules resolve to `request`, behind `pre_request_actions`; one pending and six per 10 minutes per session, three pending and twelve per 10 minutes per profile across sessions, the shared cooldown and caps; the prompt text is daemon-derived and never shows the agent's note, which is audit-only and labelled agent-supplied; a `register` approval is one-use, in memory and bound to one principal session | A same-UID agent can still approve its own prompt (§8.2); an agent can cost the human up to six prompts per session and twelve per profile per 10 minutes, and the pre-request's site name is the agent's choice; under `browser_scope = "profile"` any session attached to the shared browser acts as its owner and can use the owner's pre-approval |
 
 ## 16. Consequences
 

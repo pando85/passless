@@ -279,9 +279,15 @@ session ends, its browser lease is revoked, the policy reloads with a change, or
 `grants clear` reaches the site. The audit records each token as `pre_approval.issued`, `consumed` or
 `expired` with the reason.
 
-**Limits.** One pending pre-request and six per 10 minutes per principal session, and the same
-cooldown, caps, queue and daily limits as a page-raised prompt. A pre-request occupies a waiting slot
-of its session.
+**Limits.** One pending pre-request and six per 10 minutes per principal session, and at most three
+pending and twelve per 10 minutes per profile across all its sessions (a shell agent calling
+`passless agent request-access` outside a session starts a new session each time, so only the
+profile's bounds apply to it), and the same cooldown, caps, queue and daily limits as a page-raised
+prompt. A pre-request occupies a waiting slot of its session.
+
+**Shared browser.** With `browser_scope = "profile"`, every session attached to the shared browser
+acts as the session that launched it, so any of them can use that session's pre-approval. Only
+`browser_scope = "session"` keeps one agent's approval from another agent's browser.
 
 **Same-UID caveat.** An agent that shares your Unix user can approve its own prompt (see above).
 Asking in advance is a usability and audit feature, not a security boundary, in that deployment.

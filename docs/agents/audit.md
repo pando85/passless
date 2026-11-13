@@ -87,14 +87,19 @@ either a record or part of a count. `suppressed` is null on every other record.
   browser; never the session ID) and `agent_note`. `origin` is null for a pre-request, which has no page.
   `agent_note` is the `--note` of `passless agent request-access` or the `note` of the MCP tool,
   sanitized (one line, no markup or control characters) and cut to 200 bytes. It is on the pre-request's
-  `escalation.requested` record only (null on every other record) and is never shown in a prompt. It is
+  `escalation.requested` record only (null on every other record); a pre-request that joins an
+  escalation another request already raised gets its own `escalation.requested` record, with the
+  same `escalation_id`, its own `principal_session_id_hash` and its note. The note is never shown in a prompt. It is
   agent-supplied text and is stored as it was sent, so a secret an agent puts there is in the log.
 - Pre-approvals (schema 5): `pre_approval.issued` (with `ttl_secs`) when a `register` pre-request is
   approved before a ceremony claims it, `pre_approval.consumed` (with the `request_id` of the
   registration that used it) and `pre_approval.expired` with a `reason`: `ttl`, `session_end` (the
   principal session ended; a token capped by the session's own end is usually recorded this way),
   `lease_revoked`, `policy_reload` or `grant_revoked`. Each carries `escalation_id`, `profile_id`,
-  `rp_id`, `rule` and `principal_session_id_hash`; a token is issued once and ends exactly once.
+  `rp_id`, `rule` and `principal_session_id_hash`; a token is issued once and ends exactly once. It
+  is usable only after `issued` is written: if that record cannot be written, no token exists and the
+  agent is told `unavailable`. A registration that only replays an earlier one (same challenge) does not
+  spend a token.
 - Granted rules: `granted_rule.add` and `granted_rule.revoke`.
 - Browser sessions: `grant.request` and `grant.approve` (profile, principal, RP scope, TTL), and
   browser lease creation, expiry, revocation, exit and cleanup.
