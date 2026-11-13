@@ -182,7 +182,9 @@ form is future work (§15).
    granted rules with `kind = "registration"` and `rule = "*"`. At the cap a wildcard registration is
    refused without a prompt (`policy.deny`, `wildcard_registration_cap`). Revoking such a grant frees
    a slot (the credential stays until `agent-admin credential delete`). These entries also count
-   against `max_granted_rules`.
+   against `max_granted_rules`. Pending escalations and approved ceremonies whose grant is not
+   written yet hold a slot too (an RAII reservation from approval until the grant write returns or
+   the ceremony ends, review L2); otherwise a second registration would be prompted in the gap.
 5. **Daily prompt limit.** `wildcard_registration_prompts_per_day` (profile key, default 3): wildcard
    registration prompts per profile in any rolling 24 hours, counted when a prompt is shown. Beyond
    it the request is refused without a prompt (`wildcard_registration_rate`). Exact-rule registration

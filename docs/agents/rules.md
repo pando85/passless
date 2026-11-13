@@ -181,8 +181,8 @@ What bounds it:
   already had at that site. The grant belongs to the `*` rule: it does not create an exact rule, and it
   becomes inert if the `*` rule's `authenticate` is set to `deny`, or if you later add an exact rule for
   that site (which then asks again; `doctor` lists the grant as inert).
-- **A hard cap.** At `max_wildcard_registrations` stored wildcard registration grants, a new request is
-  refused without a prompt (audit reason `wildcard_registration_cap`). `agent-admin grants revoke`
+- **A hard cap.** At `max_wildcard_registrations` wildcard registration grants (stored, or approved
+  and still being written), a new request is refused without a prompt (audit reason `wildcard_registration_cap`). `agent-admin grants revoke`
   frees a slot.
 - **A daily limit.** After `wildcard_registration_prompts_per_day` such prompts in a rolling 24 hours,
   further requests are refused without a prompt (`wildcard_registration_rate`). The count is in memory

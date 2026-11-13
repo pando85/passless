@@ -458,7 +458,9 @@ credential belongs to an RP with no exact rule) or missing from the store.
 registration at exactly the RP of the creating ceremony (§8.3); afterwards the agent signs in there
 without asking, with the passkey it created only (§10.1). It is bounded by a hard cap
 (`max_wildcard_registrations`, default 4, range 1 to 32: wildcard registration grants a profile
-holds, counted from the granted-rules store; at the cap a request is refused without a prompt),
+holds, counted from the granted-rules store plus the registrations in flight, that is pending
+escalations and approved ceremonies whose grant is not written yet; at the cap a request is
+refused without a prompt),
 a daily prompt limit (`wildcard_registration_prompts_per_day`, default 3, range 1 to 24, rolling 24
 hours, in memory) and a profile-wide cooldown (`agents.escalation_cooldown`, started by a deny, a
 timeout or the third withdrawal within 10 minutes). **In shared-UID deployments this is a
@@ -711,7 +713,10 @@ before the escalation is raised, and goes to the human only.
 Wildcard registrations have their own pre-checks, in this order, each a refusal without a prompt:
 the profile-wide cooldown (`wildcard_registration_cooldown`), the hard cap
 (`wildcard_registration_cap`) and the daily prompt limit (`wildcard_registration_rate`); the cap
-is re-checked atomically with the grant write. Exact-rule registrations are unaffected.
+is re-checked atomically with the grant write. An approval holds its cap slot from the moment it
+is given until the grant write returns or the ceremony ends without one (the slot is released
+whichever way the ceremony ends), so no second registration is prompted in the gap while the
+credential is being written. Exact-rule registrations are unaffected.
 
 ### 8.4 Granted-rules store
 

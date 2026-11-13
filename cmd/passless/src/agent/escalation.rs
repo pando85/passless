@@ -57,7 +57,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -299,6 +299,42 @@ pub struct RegistrationApproval {
     /// The RP's revocation generation when the escalation was raised: the grant is persisted
     /// only if no `grants revoke` or `grants clear` happened since (review M-c).
     revoke_token: Option<RevokeToken>,
+    /// For a registration through `*`: the cap slot held from the approval until the grant write
+    /// returns (review L2). Released when the approval is dropped, whatever the ceremony does.
+    reservation: Option<WildcardReservation>,
+}
+
+/// A wildcard registration cap slot held between an approval and the write of its grant (review
+/// L2). The approval turns its escalation terminal at once, but the grant is written only after
+/// the credential exists (with `pass`: after GPG, a commit and a push); without this slot the
+/// registration would count as neither live nor stored in between, and a second wildcard
+/// registration would be admitted and prompted at the cap. Dropping it releases the slot, so a
+/// failed, aborted or panicking ceremony cannot leak one.
+///
+/// The release bumps `epoch` before it lowers the count. A check that read the stored grants
+/// before the release and the count after it sees the epoch moved and adds the releases to the
+/// stored count (an over-estimate: safe), so no interleaving lets a grant that was just written
+/// go uncounted.
+#[derive(Debug)]
+struct WildcardReservation {
+    held: Arc<AtomicUsize>,
+    epoch: Arc<AtomicU64>,
+    released: AtomicBool,
+}
+
+impl WildcardReservation {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            self.held.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for WildcardReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl RegistrationApproval {
@@ -647,9 +683,28 @@ struct Inner {
     /// per profile (item 5). Bounded by the profile's `wildcard_registration_prompts_per_day`
     /// (at most 24): a prompt is only shown after the admission check against it.
     wildcard_prompts: HashMap<ProfileId, VecDeque<MonotonicTime>>,
+    /// Cap slots held by approved wildcard registrations whose grant is not written yet, per
+    /// profile (review L2). One entry per configured profile at most.
+    wildcard_reserved: HashMap<ProfileId, Arc<AtomicUsize>>,
+    /// Counts reservation releases (see [`WildcardReservation`]).
+    reservation_epoch: Arc<AtomicU64>,
     next_serial: u64,
     next_waiter: u64,
     next_ticket: u64,
+}
+
+/// The profile's stored wildcard registration grants as read by a check, with the reservation
+/// epoch read before them (see [`WildcardReservation`]).
+#[derive(Clone, Copy, Debug)]
+struct StoredWildcards {
+    count: usize,
+    epoch: u64,
+}
+
+#[cfg(test)]
+impl StoredWildcards {
+    /// Nothing stored, read before any reservation was released.
+    const NONE: Self = Self { count: 0, epoch: 0 };
 }
 
 /// Deferred side effects, run after the mutex is released.
@@ -741,8 +796,35 @@ impl Inner {
         count
     }
 
-    /// The profile's live wildcard registration escalations: `(all, not yet shown)`.
+    /// Take a cap slot for an approved wildcard registration of `profile` (review L2).
+    fn reserve_wildcard(&mut self, profile: &ProfileId) -> WildcardReservation {
+        let held = self.wildcard_reserved.entry(profile.clone()).or_default();
+        held.fetch_add(1, Ordering::SeqCst);
+        WildcardReservation {
+            held: Arc::clone(held),
+            epoch: Arc::clone(&self.reservation_epoch),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn reserved_wildcards(&self, profile: &ProfileId) -> usize {
+        self.wildcard_reserved
+            .get(profile)
+            .map_or(0, |held| held.load(Ordering::SeqCst))
+    }
+
+    /// The profile's wildcard registrations that hold a cap slot but are not stored: the live
+    /// escalations plus the approved ones whose grant is pending. Returns `(all, not yet shown)`.
     fn live_wildcard_registrations(&self, profile: &ProfileId) -> (usize, usize) {
+        let (live, unshown) = self.live_wildcard_escalations(profile);
+        (
+            live.saturating_add(self.reserved_wildcards(profile)),
+            unshown,
+        )
+    }
+
+    /// The profile's live wildcard registration escalations: `(all, not yet shown)`.
+    fn live_wildcard_escalations(&self, profile: &ProfileId) -> (usize, usize) {
         self.entries
             .values()
             .filter(|entry| {
@@ -764,14 +846,25 @@ impl Inner {
     fn check_wildcard_registration(
         &mut self,
         request: &EscalationRequest,
-        persisted: usize,
+        stored: StoredWildcards,
         now: MonotonicTime,
     ) -> Result<(), EscalationRefusal> {
         if !request.is_wildcard_registration() {
             return Ok(());
         }
         let (live, unshown) = self.live_wildcard_registrations(&request.profile);
-        // A pending escalation may still end in a grant, so it holds a slot of the cap.
+        // Read after the count above: a reservation released since `stored` was read may have
+        // written its grant after that read, so each such release counts as one more stored
+        // grant (over-counting is safe; review L2).
+        let released = self
+            .reservation_epoch
+            .load(Ordering::SeqCst)
+            .saturating_sub(stored.epoch);
+        let persisted = stored
+            .count
+            .saturating_add(usize::try_from(released).unwrap_or(usize::MAX));
+        // A pending escalation, or an approved registration whose grant is not written yet, may
+        // still end in a grant, so each holds a slot of the cap.
         if persisted.saturating_add(live) >= request.max_wildcard_registrations {
             return Err(EscalationRefusal::WildcardRegistrationCap);
         }
@@ -900,18 +993,18 @@ impl Inner {
     }
 
     /// Admission of `request` under the mutex: `Some(serial)` to join, `None` to create.
-    /// `wildcard_persisted` is the profile's stored wildcard registration grants.
+    /// `stored` is the profile's stored wildcard registration grants.
     fn admit(
         &mut self,
         request: &EscalationRequest,
         key: &EscalationKey,
         now: MonotonicTime,
-        wildcard_persisted: usize,
+        stored: StoredWildcards,
     ) -> Result<Option<u64>, EscalationRefusal> {
         if self.in_cooldown(key, now) {
             return Err(EscalationRefusal::Cooldown);
         }
-        self.check_wildcard_registration(request, wildcard_persisted, now)?;
+        self.check_wildcard_registration(request, stored, now)?;
         if let Some(&serial) = self.by_key.get(key) {
             let joinable = self
                 .entries
@@ -1131,7 +1224,12 @@ impl EscalationService {
     /// registration limits first (amendment section 2.3 order), then the grant store and prompt
     /// availability. Returns the profile's stored wildcard registration grants, which admission
     /// checks again under the mutex.
-    fn check_resources(&self, request: &EscalationRequest) -> Result<usize, EscalationRefusal> {
+    fn check_resources(
+        &self,
+        request: &EscalationRequest,
+    ) -> Result<StoredWildcards, EscalationRefusal> {
+        // Before the store is read (see `WildcardReservation`).
+        let epoch = self.lock().reservation_epoch.load(Ordering::SeqCst);
         let capacity = self.grants.capacity(&request.profile);
         let wildcard_persisted = match capacity {
             GrantCapacity::Available {
@@ -1140,6 +1238,10 @@ impl EscalationService {
             } => wildcard_registrations,
             GrantCapacity::Unavailable => 0,
         };
+        let stored = StoredWildcards {
+            count: wildcard_persisted,
+            epoch,
+        };
         if request.is_wildcard_registration() {
             // An unreadable store cannot be counted: refuse rather than assume zero.
             if capacity == GrantCapacity::Unavailable {
@@ -1147,7 +1249,7 @@ impl EscalationService {
             }
             let now = self.clock.now();
             self.lock()
-                .check_wildcard_registration(request, wildcard_persisted, now)?;
+                .check_wildcard_registration(request, stored, now)?;
         }
         match capacity {
             GrantCapacity::Unavailable => return Err(EscalationRefusal::GrantsUnavailable),
@@ -1163,7 +1265,7 @@ impl EscalationService {
             );
             return Err(EscalationRefusal::Unavailable);
         }
-        Ok(wildcard_persisted)
+        Ok(stored)
     }
 
     /// Whether `request` would be admitted now: cooldown, the wildcard registration limits,
@@ -1174,9 +1276,9 @@ impl EscalationService {
         if self.lock().in_cooldown(&key, self.clock.now()) {
             return Err(EscalationRefusal::Cooldown);
         }
-        let wildcard_persisted = self.check_resources(request)?;
+        let stored = self.check_resources(request)?;
         self.lock()
-            .admit(request, &key, self.clock.now(), wildcard_persisted)
+            .admit(request, &key, self.clock.now(), stored)
             .map(|_| ())
     }
 
@@ -1191,7 +1293,7 @@ impl EscalationService {
         if self.lock().in_cooldown(&key, self.clock.now()) {
             return Err(EscalationRefusal::Cooldown);
         }
-        let wildcard_persisted = self.check_resources(&request)?;
+        let stored = self.check_resources(&request)?;
         // Before the entry exists, with no lock held (the grant writer, LOCKING.md rank 64): a
         // revocation from here on makes this escalation's approval persist nothing.
         let revoke_token = self.grants.revoke_token(&request.profile, &request.rp_id);
@@ -1199,7 +1301,7 @@ impl EscalationService {
         let now = self.clock.now();
         let (waiter, announcement) = {
             let mut inner = self.lock();
-            match inner.admit(&request, &key, now, wildcard_persisted)? {
+            match inner.admit(&request, &key, now, stored)? {
                 Some(serial) => {
                     let id = inner.add_waiter(serial, request.session);
                     let escalation_id = inner.entries[&serial].id.clone();
@@ -1535,6 +1637,12 @@ impl EscalationService {
                 "escalation {}: registration approved for {}/{}",
                 escalation_id, request.profile, request.rp_id
             );
+            // The entry turns terminal when this outcome is published, but its grant is written
+            // only after the credential exists: hold the cap slot meanwhile (review L2). Taken
+            // while the entry is still `Deciding`, so the slot is never uncounted.
+            let reservation = request
+                .is_wildcard_registration()
+                .then(|| self.lock().reserve_wildcard(&request.profile));
             return Settled {
                 outcome: EntryOutcome::Registration(Some(RegistrationApproval {
                     escalation_id: escalation_id.clone(),
@@ -1544,6 +1652,7 @@ impl EscalationService {
                     rule: request.rule,
                     session: request.session,
                     revoke_token,
+                    reservation,
                 })),
                 audit: None,
                 grant_written: false,
@@ -1796,7 +1905,9 @@ impl EscalationService {
     /// A registration through the `*` rule is persisted only while the profile holds fewer than
     /// `max_wildcard_registrations` wildcard registration grants (checked atomically with the
     /// write); at the cap the credential stays without a grant, so the agent cannot sign in with
-    /// it unattended.
+    /// it unattended. The approval's cap slot (review L2) is held until this returns, whatever the
+    /// outcome, and the cap is also checked before `granted_rule.add` is audited, so that record
+    /// never describes a grant the cap refuses.
     pub fn record_registration_grant(
         &self,
         approval: &RegistrationApproval,
@@ -1804,6 +1915,18 @@ impl EscalationService {
         max_granted_rules: usize,
         max_wildcard_registrations: usize,
     ) -> Result<(), GrantStoreError> {
+        // The slot is released when this function returns, on every path (the store holds the
+        // grant by then, or never will).
+        struct ReleaseSlot<'a>(&'a RegistrationApproval);
+        impl Drop for ReleaseSlot<'_> {
+            fn drop(&mut self) {
+                if let Some(reservation) = &self.0.reservation {
+                    reservation.release();
+                }
+            }
+        }
+        let _slot = ReleaseSlot(approval);
+
         let context = EscalationAuditContext {
             escalation_id: approval.escalation_id.as_str().to_string(),
             profile_id: approval.profile.clone(),
@@ -1820,6 +1943,33 @@ impl EscalationService {
                 );
             }
         };
+        // A cap that no longer admits this grant (a reload lowered it, or grants were stored
+        // meanwhile) is refused before `granted_rule.add` is audited: that record exists only for
+        // grants the store is about to take. The store re-checks atomically with the write.
+        let refused = match self.grants.capacity(&approval.profile) {
+            GrantCapacity::Available { used, .. } if used >= max_granted_rules => {
+                Some(GrantStoreError::CapReached(max_granted_rules))
+            }
+            GrantCapacity::Available {
+                wildcard_registrations,
+                ..
+            } if approval.rule == PermittingRule::Wildcard
+                && wildcard_registrations >= max_wildcard_registrations =>
+            {
+                Some(GrantStoreError::WildcardCapReached(
+                    max_wildcard_registrations,
+                ))
+            }
+            _ => None,
+        };
+        if let Some(error) = refused {
+            warn!(
+                "escalation {}: the registration grant is refused before it is audited: {}",
+                approval.escalation_id, error
+            );
+            audit_denial(EscalationDenyCause::GrantWriteFailed);
+            return Err(error);
+        }
         let added = GrantedRuleAddBuilder::new(
             approval.profile.clone(),
             &approval.rp_id,
@@ -3758,7 +3908,7 @@ mod tests {
         // A new key is refused, not admitted at the expense of an old cooldown.
         let fresh = request("p", "fresh.example", 1);
         assert_eq!(
-            inner.admit(&fresh, &fresh.key(), now, 0),
+            inner.admit(&fresh, &fresh.key(), now, StoredWildcards::NONE),
             Err(EscalationRefusal::TrackingFull)
         );
         assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
@@ -3766,7 +3916,7 @@ mod tests {
         assert!(inner.in_cooldown(&key(0), now));
         let oldest = request("p", "0.example", 1);
         assert_eq!(
-            inner.admit(&oldest, &oldest.key(), now, 0),
+            inner.admit(&oldest, &oldest.key(), now, StoredWildcards::NONE),
             Err(EscalationRefusal::Cooldown)
         );
         // A refresh of a present key evicts nothing either.
@@ -3777,7 +3927,7 @@ mod tests {
         // Once cooldowns expire the table has room again.
         let after = at(1_000 + 3_600_000 + MAX_TRACKED_KEYS as u64 + 1);
         assert!(matches!(
-            inner.admit(&fresh, &fresh.key(), after, 0),
+            inner.admit(&fresh, &fresh.key(), after, StoredWildcards::NONE),
             Ok(None)
         ));
     }
@@ -3795,7 +3945,7 @@ mod tests {
         inner.by_key.insert(key(MAX_TRACKED_KEYS), 1);
         let next = request("p", "next.example", 1);
         assert_eq!(
-            inner.admit(&next, &next.key(), at(2_000), 0),
+            inner.admit(&next, &next.key(), at(2_000), StoredWildcards::NONE),
             Err(EscalationRefusal::TrackingFull)
         );
     }
@@ -3820,13 +3970,13 @@ mod tests {
         let now = at(2_000);
         let more = request("hostile", "more.example", 1);
         assert_eq!(
-            inner.admit(&more, &more.key(), now, 0),
+            inner.admit(&more, &more.key(), now, StoredWildcards::NONE),
             Err(EscalationRefusal::TrackingFull)
         );
         // Live escalations count toward the quota as well.
         let other = request("other", "a.example", 2);
         assert!(matches!(
-            inner.admit(&other, &other.key(), now, 0),
+            inner.admit(&other, &other.key(), now, StoredWildcards::NONE),
             Ok(None)
         ));
         assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS_PER_PROFILE);
@@ -3834,7 +3984,7 @@ mod tests {
         // The quota frees up when the cooldowns run out.
         let later = at(1_000 + 3_600_000 + 1);
         assert!(matches!(
-            inner.admit(&more, &more.key(), later, 0),
+            inner.admit(&more, &more.key(), later, StoredWildcards::NONE),
             Ok(None)
         ));
     }
@@ -3849,12 +3999,12 @@ mod tests {
         }
         let hostile = request("hostile", "new.example", 1);
         assert_eq!(
-            inner.admit(&hostile, &hostile.key(), at(1), 0),
+            inner.admit(&hostile, &hostile.key(), at(1), StoredWildcards::NONE),
             Err(EscalationRefusal::TrackingFull)
         );
         let other = request("other", "new.example", 2);
         assert!(matches!(
-            inner.admit(&other, &other.key(), at(1), 0),
+            inner.admit(&other, &other.key(), at(1), StoredWildcards::NONE),
             Ok(None)
         ));
     }
@@ -3874,7 +4024,7 @@ mod tests {
         assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
         let fresh = request("fresh", "a.example", 1);
         assert_eq!(
-            inner.admit(&fresh, &fresh.key(), at(2_000), 0),
+            inner.admit(&fresh, &fresh.key(), at(2_000), StoredWildcards::NONE),
             Err(EscalationRefusal::TrackingFull)
         );
     }
@@ -4093,6 +4243,200 @@ mod tests {
         assert_eq!(wildcard_registration_count(&rules), 3);
     }
 
+    /// Approve a wildcard registration of `rp_id` (cap 2, one grant already stored), leaving the
+    /// credential unwritten: the approval is returned with no grant recorded yet.
+    fn approved_wildcard_registration(h: &Harness, rp_id: &str) -> RegistrationApproval {
+        let waiter = h
+            .service
+            .join_or_create(capped_wildcard_register(rp_id, 1))
+            .unwrap();
+        let parked = park(waiter);
+        h.clock.advance(Duration::from_secs(5));
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        let EscalationOutcome::RegistrationApproved(approval) = parked.join().unwrap() else {
+            panic!("expected a registration approval");
+        };
+        approval
+    }
+
+    fn capped_wildcard_register(rp_id: &str, session: usize) -> EscalationRequest {
+        EscalationRequest {
+            max_wildcard_registrations: 2,
+            wildcard_registration_prompts_per_day: 24,
+            ..wildcard_register("p", rp_id, session)
+        }
+    }
+
+    /// Review L2: between the approval and the grant write the registration counts as neither
+    /// live nor stored. A second wildcard registration used to be admitted and prompted at the
+    /// cap; the approval now holds a slot until its grant write returns.
+    #[test]
+    fn an_approved_wildcard_registration_holds_its_cap_slot_until_the_grant_is_written() {
+        let h = harness();
+        h.grants
+            .rules
+            .lock()
+            .unwrap()
+            .push(wildcard_grant("stored.example"));
+        let approval = approved_wildcard_registration(&h, "a.example");
+        // The credential is being written; no grant exists yet. The cap (2) is full.
+        let shown = h.prompter.shown().len();
+        let second = capped_wildcard_register("b.example", 2);
+        assert_eq!(
+            h.service.precheck(&second).unwrap_err(),
+            EscalationRefusal::WildcardRegistrationCap
+        );
+        assert_eq!(
+            h.service.join_or_create(second.clone()).unwrap_err(),
+            EscalationRefusal::WildcardRegistrationCap
+        );
+        assert_eq!(h.prompter.shown().len(), shown, "refused without a prompt");
+        assert_eq!(
+            h.service
+                .join_or_create(second.clone())
+                .unwrap_err()
+                .deny_reason(),
+            PolicyDenyReason::WildcardRegistrationCap
+        );
+
+        // The grant is written: the slot is now a stored grant, the cap stays full.
+        h.service
+            .record_registration_grant(&approval, CredentialRef::with_default_domain(b"c"), 64, 2)
+            .unwrap();
+        assert_eq!(h.audit.count("granted_rule.add"), 1);
+        assert_eq!(
+            h.service.precheck(&second).unwrap_err(),
+            EscalationRefusal::WildcardRegistrationCap
+        );
+        assert_eq!(
+            wildcard_registration_count(&h.grants.rules.lock().unwrap()),
+            2
+        );
+    }
+
+    /// A ceremony that fails or aborts after the approval releases the slot, whichever way it
+    /// ends: dropped without a write, a refused write, or a failed store.
+    #[test]
+    fn a_failed_or_aborted_wildcard_registration_releases_its_cap_slot() {
+        let h = harness();
+        h.grants
+            .rules
+            .lock()
+            .unwrap()
+            .push(wildcard_grant("stored.example"));
+        let second = capped_wildcard_register("b.example", 2);
+
+        // Aborted: the ceremony returns without recording a grant.
+        let approval = approved_wildcard_registration(&h, "a.example");
+        assert!(h.service.precheck(&second).is_err());
+        drop(approval);
+        assert!(
+            h.service.precheck(&second).is_ok(),
+            "the slot is free again"
+        );
+
+        // The store fails: the slot is released and nothing is stored.
+        let approval = approved_wildcard_registration(&h, "c.example");
+        assert!(h.service.precheck(&second).is_err());
+        h.grants.fail_writes.store(true, Ordering::SeqCst);
+        assert!(
+            h.service
+                .record_registration_grant(
+                    &approval,
+                    CredentialRef::with_default_domain(b"c"),
+                    64,
+                    2
+                )
+                .is_err()
+        );
+        h.grants.fail_writes.store(false, Ordering::SeqCst);
+        assert!(h.service.precheck(&second).is_ok());
+        assert_eq!(
+            wildcard_registration_count(&h.grants.rules.lock().unwrap()),
+            1
+        );
+
+        // A panic in the ceremony after the approval unwinds the approval and frees the slot.
+        let approval = approved_wildcard_registration(&h, "d.example");
+        assert!(h.service.precheck(&second).is_err());
+        let unwound = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _held = approval;
+            panic!("ceremony failed after the approval");
+        }));
+        assert!(unwound.is_err());
+        assert!(h.service.precheck(&second).is_ok());
+    }
+
+    /// `granted_rule.add` is audited only for a grant the store takes: a cap that refuses the
+    /// grant is caught before the record is written (review L2).
+    #[test]
+    fn a_grant_the_cap_refuses_is_never_audited_as_added() {
+        let h = harness();
+        h.grants
+            .rules
+            .lock()
+            .unwrap()
+            .push(wildcard_grant("stored.example"));
+        let approval = approved_wildcard_registration(&h, "a.example");
+        // The operator lowered the cap while the ceremony was in flight.
+        assert_eq!(
+            h.service
+                .record_registration_grant(
+                    &approval,
+                    CredentialRef::with_default_domain(b"c"),
+                    64,
+                    1
+                )
+                .unwrap_err(),
+            GrantStoreError::WildcardCapReached(1)
+        );
+        assert_eq!(h.audit.count("granted_rule.add"), 0);
+        assert_eq!(
+            h.audit.last("escalation.denied")["cause"],
+            "grant_write_failed"
+        );
+        assert_eq!(
+            wildcard_registration_count(&h.grants.rules.lock().unwrap()),
+            1,
+            "no grant was stored"
+        );
+        assert!(
+            h.service
+                .precheck(&capped_wildcard_register("b.example", 2))
+                .is_ok()
+        );
+    }
+
+    /// A check that read the stored grants before a reservation was released and the reservation
+    /// count after it must not undercount the grant written in between.
+    #[test]
+    fn a_stale_stored_count_is_corrected_by_the_release_epoch() {
+        let h = harness();
+        h.grants
+            .rules
+            .lock()
+            .unwrap()
+            .push(wildcard_grant("stored.example"));
+        let approval = approved_wildcard_registration(&h, "a.example");
+        // A checker reads the epoch and the stored count (1) ...
+        let epoch = h.service.lock().reservation_epoch.load(Ordering::SeqCst);
+        // ... then the grant is written and the slot released ...
+        h.service
+            .record_registration_grant(&approval, CredentialRef::with_default_domain(b"c"), 64, 2)
+            .unwrap();
+        // ... before the checker reads the live count: the stale 1 would admit a third grant.
+        let mut inner = h.service.lock();
+        assert_eq!(
+            inner.check_wildcard_registration(
+                &capped_wildcard_register("b.example", 2),
+                StoredWildcards { count: 1, epoch },
+                at(1_000)
+            ),
+            Err(EscalationRefusal::WildcardRegistrationCap)
+        );
+    }
+
     #[test]
     fn wildcard_registration_prompts_are_limited_per_rolling_day() {
         let h = harness();
@@ -4301,11 +4645,11 @@ mod tests {
             .or_default()
             .push_back(now);
         assert_eq!(
-            inner.check_wildcard_registration(&req, 1, now),
+            inner.check_wildcard_registration(&req, StoredWildcards { count: 1, epoch: 0 }, now),
             Err(EscalationRefusal::WildcardRegistrationCap)
         );
         assert_eq!(
-            inner.check_wildcard_registration(&req, 0, now),
+            inner.check_wildcard_registration(&req, StoredWildcards { count: 0, epoch: 0 }, now),
             Err(EscalationRefusal::WildcardRegistrationRate)
         );
         let roomy = EscalationRequest {
@@ -4313,12 +4657,19 @@ mod tests {
             ..req.clone()
         };
         assert_eq!(
-            inner.check_wildcard_registration(&roomy, 0, now),
+            inner.check_wildcard_registration(&roomy, StoredWildcards { count: 0, epoch: 0 }, now),
             Err(EscalationRefusal::WildcardRegistrationCooldown)
         );
         // Not a wildcard registration: never refused by these checks.
         assert_eq!(
-            inner.check_wildcard_registration(&register("p", "a.example", 1), 99, now),
+            inner.check_wildcard_registration(
+                &register("p", "a.example", 1),
+                StoredWildcards {
+                    count: 99,
+                    epoch: 0
+                },
+                now
+            ),
             Ok(())
         );
     }
