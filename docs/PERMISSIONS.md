@@ -448,17 +448,21 @@ Look for these log messages:
 | `UV retry limit is almost exhausted: 1 attempt remaining` | One UV attempt left |
 | `UV retries exhausted; built-in user verification is blocked` | UV is blocked (0 retries) |
 | `Built-in UV is blocked; falling back to notification-based verification` | Notification fallback active |
+| `CTAP request answered UV_BLOCKED (0x3c)` | A client was refused because UV is blocked (logged at error level) |
+
+Only an explicit **Deny** click on the verification notification uses up a UV retry. Ignoring,
+dismissing or timing out the notification does not: the request is refused with
+`CTAP2_ERR_USER_ACTION_TIMEOUT` and the retries stay as they were.
 
 **Fix:**
 
-Reset UV retries with an authenticated command:
+Restore UV retries to the configured maximum (`pin.max_uv_retries` in config, default 8):
 
 ```bash
 passless client pin uv-reset
 ```
 
-This requires PIN authentication and restores UV retries to the configured maximum
-(`pin.max_uv_retries` in config, default 8).
+It asks for the PIN when one is set. Without a PIN it works directly.
 
 **How `pin.enforcement` affects UV fallback:**
 
