@@ -725,7 +725,9 @@ fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -
                 .request(req)
                 .map_err(|e| Error::Other(e.to_string()))?;
             match resp {
-                passless_core::agent::AdminResponse::DelegationInfo(info) => match output {
+                // The daemon answers with the `Grant*` variants; the `Delegation*` ones are the old names.
+                passless_core::agent::AdminResponse::GrantInfo(info)
+                | passless_core::agent::AdminResponse::DelegationInfo(info) => match output {
                     OutputFormat::Json => admin_output_json(&info),
                     OutputFormat::Plain => {
                         println!("grant_id: {}", info.grant_id);
@@ -748,7 +750,8 @@ fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -
                 .request(req)
                 .map_err(|e| Error::Other(e.to_string()))?;
             match resp {
-                passless_core::agent::AdminResponse::DelegationList(list) => match output {
+                passless_core::agent::AdminResponse::GrantList(list)
+                | passless_core::agent::AdminResponse::DelegationList(list) => match output {
                     OutputFormat::Json => admin_output_json(&list),
                     OutputFormat::Plain => {
                         println!("total: {}", list.total);
@@ -777,7 +780,8 @@ fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -
                 .request(req)
                 .map_err(|e| Error::Other(e.to_string()))?;
             match resp {
-                passless_core::agent::AdminResponse::DelegationRevoked => {
+                passless_core::agent::AdminResponse::GrantRevoked
+                | passless_core::agent::AdminResponse::DelegationRevoked => {
                     #[derive(Serialize)]
                     struct RevokedOut {
                         grant_id: String,
