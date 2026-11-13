@@ -411,6 +411,15 @@ pub(crate) fn sanitize_line(input: &str, max_bytes: usize) -> String {
     out.trim().to_string()
 }
 
+/// An agent's note as the audit keeps it (ADR 0014 amendment section 2.3): the prompt's line
+/// rules (one line; no control, Bidi, zero-width or markup characters), cut at a character
+/// boundary to [`passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES`]; `None` when nothing is
+/// left. It is never shown in a prompt.
+pub(crate) fn sanitize_agent_note(note: Option<&str>) -> Option<String> {
+    let note = sanitize_line(note?, passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES);
+    (!note.is_empty()).then_some(note)
+}
+
 /// The RP ID in ASCII (punycode) form.
 pub fn ascii_rp_id(rp_id: &str) -> Result<String, String> {
     match url::Host::parse(rp_id.trim()) {

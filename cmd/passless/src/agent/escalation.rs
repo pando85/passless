@@ -5850,4 +5850,812 @@ mod tests {
             }
         }
     }
+
+    /// ADR 0014 amendment section 2.3: pre-requests, adoption and pre-approval tokens.
+    mod pre_requests {
+        use super::*;
+
+        use std::sync::Barrier;
+
+        use crate::agent::escalation_prompt::{render_prompt, sanitize_agent_note};
+
+        fn principal(n: u8) -> PrincipalSessionId {
+            format!("{n:02x}").repeat(32).parse().unwrap()
+        }
+
+        fn pre(action: CeremonyAction, rp_id: &str, who: &PrincipalSessionId) -> EscalationRequest {
+            EscalationRequest {
+                action,
+                origin: None,
+                session: WaiterSession::of_principal(who),
+                source: RequestSource::PreRequest,
+                principal: Some(who.clone()),
+                agent_note: Some("agent says hi".to_string()),
+                ..request("p", rp_id, 0)
+            }
+        }
+
+        fn params(request: EscalationRequest) -> PreRequestParams {
+            PreRequestParams {
+                request,
+                pending_for: PRE_REQUEST_PENDING_LIMIT,
+                session_remaining: Duration::from_secs(3600),
+            }
+        }
+
+        fn pre_auth(h: &Harness, rp_id: &str, who: &PrincipalSessionId) -> PreRequestState {
+            h.service
+                .pre_request(params(pre(CeremonyAction::Authenticate, rp_id, who)))
+        }
+
+        fn pre_reg(h: &Harness, rp_id: &str, who: &PrincipalSessionId) -> PreRequestState {
+            h.service
+                .pre_request(params(pre(CeremonyAction::Register, rp_id, who)))
+        }
+
+        /// A registration ceremony whose bearer is owned by `who`.
+        fn ceremony_register(
+            rp_id: &str,
+            session: usize,
+            who: &PrincipalSessionId,
+        ) -> EscalationRequest {
+            EscalationRequest {
+                principal: Some(who.clone()),
+                ..register("p", rp_id, session)
+            }
+        }
+
+        fn key(action: CeremonyAction, rp_id: &str) -> EscalationKey {
+            EscalationKey {
+                profile: profile("p"),
+                rp_id: rp_id.to_string(),
+                action,
+            }
+        }
+
+        fn consumer<'a>(rp_id: &'a str, who: &'a PrincipalSessionId) -> PreApprovalConsumer<'a> {
+            PreApprovalConsumer {
+                profile: PROFILE_P.get_or_init(|| profile("p")),
+                rp_id,
+                principal: who,
+                rule: PermittingRule::Exact,
+                session: WaiterSession::from_raw(77),
+                origin: "https://www.r.example",
+                request_id: "req-consumer",
+            }
+        }
+
+        static PROFILE_P: std::sync::OnceLock<ProfileId> = std::sync::OnceLock::new();
+
+        fn approve_last(h: &Harness) {
+            h.clock.advance(Duration::from_secs(2));
+            h.service
+                .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        }
+
+        /// Raise a `register` pre-request and approve it: a token waits.
+        fn issue_token(h: &Harness, rp_id: &str, who: &PrincipalSessionId) {
+            assert_eq!(pre_reg(h, rp_id, who), PreRequestState::Pending);
+            approve_last(h);
+            assert!(matches!(
+                h.service
+                    .pre_request(params(pre(CeremonyAction::Register, rp_id, who))),
+                PreRequestState::PreApproved { .. }
+            ));
+        }
+
+        #[test]
+        fn an_authenticate_pre_request_prompts_once_and_persists_a_pre_request_grant() {
+            let h = harness();
+            let a = principal(1);
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Pending);
+            // Idempotent: the repeat reports the same pending request; no second prompt.
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Pending);
+            assert_eq!(h.prompter.shown().len(), 1);
+            assert_eq!(h.audit.count("escalation.requested"), 1);
+            let fields = h.prompter.shown.lock().unwrap()[0].1.clone();
+            assert_eq!(fields.origin, None);
+            assert!(fields.requested_in_advance);
+            let requested = h.audit.last("escalation.requested");
+            assert_eq!(requested["source"], "pre_request");
+            assert!(requested["origin"].is_null());
+            assert_eq!(requested["agent_note"], "agent says hi");
+            assert_eq!(
+                requested["principal_session_id_hash"],
+                crate::agent::audit_events::principal_session_id_hash(&a)
+            );
+
+            approve_last(&h);
+            let rules = h.grants.rules.lock().unwrap().clone();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].source, RequestSource::PreRequest);
+            assert_eq!(rules[0].origin, None);
+            assert_eq!(rules[0].kind, GrantKind::Escalation);
+            // The note is on `requested` only.
+            assert!(h.audit.last("escalation.approved")["agent_note"].is_null());
+            assert_eq!(h.audit.last("escalation.approved")["source"], "pre_request");
+            // Reported once, then forgotten.
+            assert_eq!(
+                h.service.wait_pre_request(
+                    &a,
+                    &key(CeremonyAction::Authenticate, "a.example"),
+                    far(),
+                    &|| true
+                ),
+                PreRequestState::Approved
+            );
+            assert!(h.service.lock().pre_requests.is_empty());
+            assert!(
+                h.service.lock().entries.is_empty(),
+                "the entry is collected"
+            );
+        }
+
+        #[test]
+        fn ceremonies_join_an_authenticate_pre_request_and_a_pre_request_joins_a_ceremony() {
+            let h = harness();
+            let a = principal(1);
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Pending);
+            let ceremony = h
+                .service
+                .join_or_create(request("p", "a.example", 1))
+                .unwrap();
+            assert!(ceremony.joined());
+            let parked = park(ceremony);
+            approve_last(&h);
+            match parked.join().unwrap() {
+                EscalationOutcome::Approved { source, .. } => {
+                    assert_eq!(source, RequestSource::PreRequest)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(h.prompter.shown().len(), 1);
+
+            // The other way round: a ceremony's escalation, joined by a pre-request.
+            let ceremony = h
+                .service
+                .join_or_create(request("p", "b.example", 1))
+                .unwrap();
+            let b = principal(2);
+            assert_eq!(pre_auth(&h, "b.example", &b), PreRequestState::Pending);
+            assert_eq!(h.audit.count("escalation.requested"), 2);
+            let parked = park(ceremony);
+            approve_last(&h);
+            assert!(matches!(
+                parked.join().unwrap(),
+                EscalationOutcome::Approved {
+                    source: RequestSource::Ceremony,
+                    ..
+                }
+            ));
+            assert_eq!(
+                h.service
+                    .pre_request(params(pre(CeremonyAction::Authenticate, "b.example", &b))),
+                PreRequestState::Approved
+            );
+            let rules = h.grants.rules.lock().unwrap().clone();
+            let b_rule = rules.iter().find(|r| r.rp_id == "b.example").unwrap();
+            assert_eq!(b_rule.source, RequestSource::Ceremony);
+            assert_eq!(b_rule.origin.as_deref(), Some("https://b.example"));
+        }
+
+        #[test]
+        fn a_denied_pre_request_puts_the_key_in_the_shared_cooldown() {
+            let h = harness();
+            let a = principal(1);
+            pre_auth(&h, "a.example", &a);
+            h.service.prompt_event(
+                &h.prompter.last_shown(),
+                PromptEvent::Denied(EscalationDenyCause::User),
+            );
+            assert_eq!(
+                pre_auth(&h, "a.example", &a),
+                PreRequestState::Denied { reason: None }
+            );
+            // The ceremony sees the cooldown the pre-request's deny started ...
+            assert_eq!(
+                h.service.precheck(&request("p", "a.example", 1)),
+                Err(EscalationRefusal::Cooldown)
+            );
+            // ... and so does a new pre-request.
+            assert_eq!(
+                pre_auth(&h, "a.example", &a),
+                PreRequestState::Refused(EscalationRefusal::Cooldown)
+            );
+            // The other direction: a ceremony's deny cools down pre-requests.
+            let ceremony = h
+                .service
+                .join_or_create(request("p", "b.example", 1))
+                .unwrap();
+            let parked = park(ceremony);
+            h.service.prompt_event(
+                &h.prompter.last_shown(),
+                PromptEvent::Denied(EscalationDenyCause::User),
+            );
+            parked.join().unwrap();
+            assert_eq!(
+                pre_auth(&h, "b.example", &a),
+                PreRequestState::Refused(EscalationRefusal::Cooldown)
+            );
+            assert_eq!(h.prompter.shown().len(), 2);
+        }
+
+        #[test]
+        fn a_pending_pre_request_expires_at_its_deadline_into_the_cooldown() {
+            let h = harness();
+            let a = principal(1);
+            let mut short = params(pre(CeremonyAction::Authenticate, "a.example", &a));
+            short.pending_for = Duration::from_secs(30);
+            assert_eq!(h.service.pre_request(short), PreRequestState::Pending);
+            h.clock.advance(Duration::from_secs(29));
+            h.service.sweep_pre_requests();
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Pending);
+            h.clock.advance(Duration::from_secs(1));
+            h.service.sweep_pre_requests();
+            assert_eq!(h.prompter.withdrawn().len(), 1);
+            assert_eq!(h.audit.last("escalation.expired")["reason"], "timeout");
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Expired);
+            assert_eq!(
+                pre_auth(&h, "a.example", &a),
+                PreRequestState::Refused(EscalationRefusal::Cooldown)
+            );
+            assert!(
+                h.service
+                    .in_cooldown(&key(CeremonyAction::Authenticate, "a.example"))
+            );
+        }
+
+        #[test]
+        fn the_pending_lifetime_is_capped_at_ten_minutes() {
+            let h = harness();
+            let a = principal(1);
+            let mut long = params(pre(CeremonyAction::Authenticate, "a.example", &a));
+            long.pending_for = Duration::from_secs(3600);
+            h.service.pre_request(long);
+            h.clock.advance(PRE_REQUEST_PENDING_LIMIT);
+            h.service.sweep_pre_requests();
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Expired);
+        }
+
+        #[test]
+        fn a_pre_request_that_expires_leaves_waiting_ceremonies_their_escalation() {
+            let h = harness();
+            let a = principal(1);
+            let mut short = params(pre(CeremonyAction::Authenticate, "a.example", &a));
+            short.pending_for = Duration::from_secs(5);
+            h.service.pre_request(short);
+            let ceremony = h
+                .service
+                .join_or_create(request("p", "a.example", 1))
+                .unwrap();
+            h.clock.advance(Duration::from_secs(6));
+            h.service.sweep_pre_requests();
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Expired);
+            assert!(h.prompter.withdrawn().is_empty());
+            let parked = park(ceremony);
+            approve_last(&h);
+            assert!(matches!(
+                parked.join().unwrap(),
+                EscalationOutcome::Approved { .. }
+            ));
+        }
+
+        #[test]
+        fn the_requesters_wait_ends_at_the_decision_or_its_own_bound() {
+            let h = harness();
+            let a = principal(1);
+            pre_auth(&h, "a.example", &a);
+            let k = key(CeremonyAction::Authenticate, "a.example");
+            // Its own bound: still pending, and the request stays.
+            let start = Instant::now();
+            assert_eq!(
+                h.service.wait_pre_request(
+                    &a,
+                    &k,
+                    Instant::now() + Duration::from_millis(300),
+                    &|| true
+                ),
+                PreRequestState::Pending
+            );
+            assert!(start.elapsed() >= Duration::from_millis(300));
+            assert_eq!(h.prompter.withdrawn().len(), 0);
+            // A decision wakes it.
+            let service = Arc::clone(&h.service);
+            let waiting = {
+                let a = a.clone();
+                let k = k.clone();
+                thread::spawn(move || service.wait_pre_request(&a, &k, far(), &|| true))
+            };
+            thread::sleep(Duration::from_millis(50));
+            approve_last(&h);
+            assert_eq!(waiting.join().unwrap(), PreRequestState::Approved);
+            // A requester whose session went away stops waiting.
+            pre_auth(&h, "b.example", &a);
+            assert_eq!(
+                h.service.wait_pre_request(
+                    &a,
+                    &key(CeremonyAction::Authenticate, "b.example"),
+                    far(),
+                    &|| false
+                ),
+                PreRequestState::Expired
+            );
+        }
+
+        #[test]
+        fn per_session_limits_one_pending_and_six_per_window() {
+            let h = harness();
+            let a = principal(1);
+            assert_eq!(pre_auth(&h, "a1.example", &a), PreRequestState::Pending);
+            // One pending per principal session.
+            assert_eq!(
+                pre_auth(&h, "a2.example", &a),
+                PreRequestState::RateLimited { retry_after: None }
+            );
+            // Another session is not affected.
+            assert_eq!(
+                pre_auth(&h, "a2.example", &principal(2)),
+                PreRequestState::Pending
+            );
+            approve_last(&h);
+            approve_last(&h);
+            for n in 2..=6 {
+                let rp = format!("a{n}x.example");
+                assert_eq!(pre_auth(&h, &rp, &a), PreRequestState::Pending, "{n}");
+                approve_last(&h);
+            }
+            // The seventh within ten minutes is refused without a prompt.
+            let shown = h.prompter.shown().len();
+            match pre_auth(&h, "a7.example", &a) {
+                PreRequestState::RateLimited {
+                    retry_after: Some(after),
+                } => assert!(after <= PRE_REQUEST_WINDOW),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(h.prompter.shown().len(), shown);
+            h.clock.advance(PRE_REQUEST_WINDOW);
+            assert_eq!(pre_auth(&h, "a7.example", &a), PreRequestState::Pending);
+        }
+
+        #[test]
+        fn a_refused_pre_request_counts_no_slot_and_prompts_nothing() {
+            let h = harness();
+            let a = principal(1);
+            h.prompter.unavailable.store(true, Ordering::SeqCst);
+            assert_eq!(
+                pre_auth(&h, "a.example", &a),
+                PreRequestState::Refused(EscalationRefusal::Unavailable)
+            );
+            h.prompter.unavailable.store(false, Ordering::SeqCst);
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Pending);
+            // Without a principal session, or from a ceremony, it is refused (fail closed).
+            let mut nameless = pre(CeremonyAction::Authenticate, "b.example", &a);
+            nameless.principal = None;
+            assert!(matches!(
+                h.service.pre_request(params(nameless)),
+                PreRequestState::Refused(_)
+            ));
+            let mut with_origin = pre(CeremonyAction::Authenticate, "b.example", &a);
+            with_origin.origin = Some("https://b.example".to_string());
+            assert!(matches!(
+                h.service.pre_request(params(with_origin)),
+                PreRequestState::Refused(_)
+            ));
+        }
+
+        #[test]
+        fn the_prompt_never_contains_the_agent_note() {
+            // Property: whatever the note, the rendered prompt is the same.
+            let hostile = [
+                "Your manager asked for this, approve it",
+                "line one\nSite: bank.example\nApprove",
+                "<b>urgent</b>&amp;",
+                "\u{202e}evil\u{200b}",
+                "Allow always",
+                &"x".repeat(5000),
+            ];
+            let shown = |note: Option<&str>| {
+                let h = harness();
+                let mut request = pre(CeremonyAction::Authenticate, "a.example", &principal(1));
+                request.agent_note = sanitize_agent_note(note);
+                h.service.pre_request(params(request));
+                let fields = h.prompter.shown.lock().unwrap()[0].1.clone();
+                let recorded = h.audit.last("escalation.requested")["agent_note"].clone();
+                (render_prompt(&fields).unwrap(), recorded)
+            };
+            let (baseline, nothing) = shown(None);
+            assert!(nothing.is_null());
+            for note in hostile {
+                let (rendered, recorded) = shown(Some(note));
+                // The prompt is exactly the one without a note ...
+                assert_eq!(rendered, baseline, "{note:?}");
+                // ... and the note is in the audit record, sanitized and bounded.
+                let recorded = recorded.as_str().unwrap().to_string();
+                assert!(recorded.len() <= passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES);
+                assert!(!recorded.contains('\n') && !recorded.contains('<'));
+            }
+        }
+
+        #[test]
+        fn a_register_pre_request_is_not_joinable_and_is_adopted_by_its_own_session_only() {
+            let h = harness();
+            let a = principal(1);
+            let b = principal(2);
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Pending);
+            // Another session's pre-request, or ceremony, gets escalation_busy.
+            assert_eq!(
+                pre_reg(&h, "r.example", &b),
+                PreRequestState::Refused(EscalationRefusal::Busy)
+            );
+            assert_eq!(
+                h.service
+                    .join_or_create(ceremony_register("r.example", 2, &b))
+                    .unwrap_err(),
+                EscalationRefusal::Busy
+            );
+            // A bearer with no owner cannot adopt it either.
+            assert_eq!(
+                h.service.precheck(&register("p", "r.example", 3)),
+                Err(EscalationRefusal::Busy)
+            );
+            // The first registration ceremony of the same principal session adopts it.
+            let ceremony = h
+                .service
+                .join_or_create(ceremony_register("r.example", 1, &a))
+                .unwrap();
+            assert!(ceremony.joined());
+            assert_eq!(h.prompter.shown().len(), 1, "adoption raises no prompt");
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Adopted);
+            // A second one of the same session is busy: it was adopted.
+            assert_eq!(
+                h.service
+                    .join_or_create(ceremony_register("r.example", 4, &a))
+                    .unwrap_err(),
+                EscalationRefusal::Busy
+            );
+            let parked = park(ceremony);
+            approve_last(&h);
+            match parked.join().unwrap() {
+                EscalationOutcome::RegistrationApproved(approval) => {
+                    assert_eq!(approval.session(), WaiterSession::from_raw(1));
+                    assert_eq!(approval.origin(), Some("https://r.example"));
+                    assert_eq!(approval.source(), RequestSource::PreRequest);
+                    assert_eq!(approval.principal(), Some(&a));
+                    h.service
+                        .record_registration_grant(
+                            &approval,
+                            CredentialRef::with_default_domain(b"cred"),
+                            64,
+                            4,
+                        )
+                        .unwrap();
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            // The adopting ceremony had the outcome: no token is issued.
+            assert_eq!(h.audit.count("pre_approval.issued"), 0);
+            assert!(h.service.lock().pre_requests.is_empty());
+            let rule = h.grants.rules.lock().unwrap()[0].clone();
+            assert_eq!(rule.source, RequestSource::PreRequest);
+            assert_eq!(rule.origin.as_deref(), Some("https://r.example"));
+        }
+
+        #[test]
+        fn an_unadopted_register_approval_becomes_a_one_use_token() {
+            let h = harness();
+            let a = principal(1);
+            issue_token(&h, "r.example", &a);
+            let issued = h.audit.last("pre_approval.issued");
+            assert_eq!(issued["ttl_secs"], 600);
+            assert_eq!(issued["rp_id"], "r.example");
+            // Idempotent: the repeat reports the token, no new prompt.
+            match pre_reg(&h, "r.example", &a) {
+                PreRequestState::PreApproved { expires_in } => {
+                    assert!(expires_in <= PRE_APPROVAL_TTL)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(h.prompter.shown().len(), 1);
+            // Another principal session cannot consume it.
+            let b = principal(2);
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &b))
+                    .is_none()
+            );
+            // Nor at another RP.
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("s.example", &a))
+                    .is_none()
+            );
+            // Its own session consumes it once.
+            let approval = h
+                .service
+                .take_pre_approval(consumer("r.example", &a))
+                .expect("the token");
+            assert_eq!(approval.session(), WaiterSession::from_raw(77));
+            assert_eq!(approval.origin(), Some("https://www.r.example"));
+            assert_eq!(approval.source(), RequestSource::PreRequest);
+            assert_eq!(approval.principal(), Some(&a));
+            assert_eq!(
+                h.audit.last("pre_approval.consumed")["request_id"],
+                "req-consumer"
+            );
+            // Replay: nothing left.
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_none()
+            );
+            assert_eq!(h.audit.count("pre_approval.consumed"), 1);
+            h.service
+                .record_registration_grant(
+                    &approval,
+                    CredentialRef::with_default_domain(b"c"),
+                    64,
+                    4,
+                )
+                .unwrap();
+            let rule = h.grants.rules.lock().unwrap()[0].clone();
+            assert_eq!(rule.kind, GrantKind::Registration);
+            assert_eq!(rule.source, RequestSource::PreRequest);
+            assert_eq!(rule.origin.as_deref(), Some("https://www.r.example"));
+        }
+
+        #[test]
+        fn two_ceremonies_racing_for_one_token_get_it_once() {
+            for _ in 0..20 {
+                let h = harness();
+                let a = principal(1);
+                issue_token(&h, "r.example", &a);
+                let barrier = Arc::new(Barrier::new(2));
+                let racers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let service = Arc::clone(&h.service);
+                        let barrier = Arc::clone(&barrier);
+                        let a = a.clone();
+                        thread::spawn(move || {
+                            barrier.wait();
+                            service
+                                .take_pre_approval(consumer("r.example", &a))
+                                .is_some()
+                        })
+                    })
+                    .collect();
+                let won: usize = racers
+                    .into_iter()
+                    .map(|racer| usize::from(racer.join().unwrap()))
+                    .sum();
+                assert_eq!(won, 1);
+                assert_eq!(h.audit.count("pre_approval.consumed"), 1);
+            }
+        }
+
+        #[test]
+        fn a_token_lapses_after_its_ttl() {
+            let h = harness();
+            let a = principal(1);
+            issue_token(&h, "r.example", &a);
+            h.clock.advance(PRE_APPROVAL_TTL);
+            h.service.sweep_pre_requests();
+            assert_eq!(h.audit.last("pre_approval.expired")["reason"], "ttl");
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_none()
+            );
+            // Asking again prompts again.
+            assert_eq!(pre_reg(&h, "r.example", &a), PreRequestState::Pending);
+        }
+
+        #[test]
+        fn a_token_lapsing_at_use_is_dropped_not_handed_out() {
+            let h = harness();
+            let a = principal(1);
+            issue_token(&h, "r.example", &a);
+            // No sweep ran: the check at use drops it.
+            h.clock.advance(PRE_APPROVAL_TTL);
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_none()
+            );
+            assert_eq!(h.audit.last("pre_approval.expired")["reason"], "ttl");
+            assert_eq!(h.audit.count("pre_approval.consumed"), 0);
+        }
+
+        #[test]
+        fn a_token_never_outlives_its_principal_session() {
+            let h = harness();
+            let a = principal(1);
+            let mut short = params(pre(CeremonyAction::Register, "r.example", &a));
+            short.session_remaining = Duration::from_secs(90);
+            h.service.pre_request(short);
+            approve_last(&h);
+            match pre_reg(&h, "r.example", &a) {
+                PreRequestState::PreApproved { expires_in } => {
+                    assert!(expires_in <= Duration::from_secs(90))
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(
+                h.audit.last("pre_approval.issued")["ttl_secs"]
+                    .as_u64()
+                    .unwrap()
+                    <= 90
+            );
+        }
+
+        #[test]
+        fn every_revocation_path_drops_the_token() {
+            type Revoke = fn(&Harness, &PrincipalSessionId);
+            let paths: [(&str, Revoke); 6] = [
+                ("session_end", |h, a| h.service.principal_session_ended(a)),
+                ("lease_revoked", |h, a| h.service.lease_revoked(a)),
+                ("policy_reload", |h, _| {
+                    h.service.cancel_profile(&profile("p"))
+                }),
+                ("grant_revoked", |h, _| {
+                    h.service.cancel_rp(&profile("p"), "r.example")
+                }),
+                ("grant_revoked", |h, _| {
+                    h.service.cancel_profile_grants_cleared(&profile("p"))
+                }),
+                ("policy_reload", |h, _| {
+                    h.epoch.bump();
+                    h.service.sweep_pre_requests();
+                }),
+            ];
+            for (reason, revoke) in paths {
+                let h = harness();
+                let a = principal(1);
+                issue_token(&h, "r.example", &a);
+                revoke(&h, &a);
+                assert_eq!(
+                    h.audit.last("pre_approval.expired")["reason"],
+                    reason,
+                    "{reason}"
+                );
+                assert!(
+                    h.service
+                        .take_pre_approval(consumer("r.example", &a))
+                        .is_none(),
+                    "{reason}"
+                );
+            }
+            // A revocation of another RP, or another session's end or lease, leaves it.
+            let h = harness();
+            let a = principal(1);
+            issue_token(&h, "r.example", &a);
+            h.service.cancel_rp(&profile("p"), "other.example");
+            h.service.principal_session_ended(&principal(2));
+            h.service.lease_revoked(&principal(2));
+            assert_eq!(h.audit.count("pre_approval.expired"), 0);
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn an_epoch_bump_at_use_and_a_rule_change_drop_the_token() {
+            let h = harness();
+            let a = principal(1);
+            issue_token(&h, "r.example", &a);
+            h.epoch.bump();
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_none()
+            );
+            assert_eq!(
+                h.audit.last("pre_approval.expired")["reason"],
+                "policy_reload"
+            );
+
+            let h = harness();
+            issue_token(&h, "r.example", &a);
+            let mut through_wildcard = consumer("r.example", &a);
+            through_wildcard.rule = PermittingRule::Wildcard;
+            assert!(h.service.take_pre_approval(through_wildcard).is_none());
+            assert!(
+                h.service
+                    .take_pre_approval(consumer("r.example", &a))
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn a_session_end_withdraws_its_pending_pre_request() {
+            let h = harness();
+            let a = principal(1);
+            pre_reg(&h, "r.example", &a);
+            h.service.principal_session_ended(&a);
+            assert_eq!(h.prompter.withdrawn().len(), 1);
+            assert_eq!(h.audit.last("escalation.expired")["reason"], "aborted");
+            assert!(h.service.lock().pre_requests.is_empty());
+            assert!(h.service.lock().entries.is_empty());
+            // Nothing is left to adopt.
+            assert!(
+                h.service
+                    .precheck(&ceremony_register("r.example", 1, &a))
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_reload_revokes_a_pending_pre_request() {
+            let h = harness();
+            let a = principal(1);
+            pre_auth(&h, "a.example", &a);
+            h.service.cancel_profile(&profile("p"));
+            assert_eq!(pre_auth(&h, "a.example", &a), PreRequestState::Revoked);
+        }
+
+        #[test]
+        fn a_wildcard_token_holds_its_cap_slot_until_used_or_dropped() {
+            let h = harness();
+            let a = principal(1);
+            let wildcard = |rp_id: &str, who: &PrincipalSessionId| EscalationRequest {
+                rule: PermittingRule::Wildcard,
+                mode: AgentMode::SameUser,
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 24,
+                ..pre(CeremonyAction::Register, rp_id, who)
+            };
+            assert_eq!(
+                h.service.pre_request(params(wildcard("w.example", &a))),
+                PreRequestState::Pending
+            );
+            approve_last(&h);
+            // The token holds the only slot: another wildcard registration is refused.
+            let other = EscalationRequest {
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 24,
+                ..wildcard_register("p", "v.example", 1)
+            };
+            assert_eq!(
+                h.service.precheck(&other),
+                Err(EscalationRefusal::WildcardRegistrationCap)
+            );
+            assert_eq!(
+                h.service
+                    .pre_request(params(wildcard("v.example", &principal(2)))),
+                PreRequestState::Refused(EscalationRefusal::WildcardRegistrationCap)
+            );
+            // Dropping it frees the slot.
+            h.service.principal_session_ended(&a);
+            assert_eq!(h.service.precheck(&other), Ok(()));
+        }
+
+        #[test]
+        fn adoption_does_not_count_the_wildcard_limits_twice() {
+            let h = harness();
+            let a = principal(1);
+            let request = EscalationRequest {
+                rule: PermittingRule::Wildcard,
+                mode: AgentMode::SameUser,
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 1,
+                ..pre(CeremonyAction::Register, "w.example", &a)
+            };
+            assert_eq!(
+                h.service.pre_request(params(request)),
+                PreRequestState::Pending
+            );
+            // At the cap and the daily limit, counting the pre-request itself: its own
+            // ceremony still adopts it.
+            let ceremony = EscalationRequest {
+                principal: Some(a.clone()),
+                max_wildcard_registrations: 1,
+                wildcard_registration_prompts_per_day: 1,
+                ..wildcard_register("p", "w.example", 1)
+            };
+            assert_eq!(h.service.precheck(&ceremony), Ok(()));
+            let waiter = h.service.join_or_create(ceremony).unwrap();
+            assert!(waiter.joined());
+        }
+    }
 }

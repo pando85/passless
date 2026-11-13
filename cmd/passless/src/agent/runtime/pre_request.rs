@@ -22,7 +22,7 @@
 //! Every refusal is audited as `policy.deny` and coalesced per principal session, like a
 //! ceremony's. The answer never says whether the user holds a credential, and never contains
 //! anything the agent sent except the validated RP ID. The note goes to `escalation.requested`
-//! only, sanitized with the prompt's rules and cut to [`MAX_ACCESS_NOTE_BYTES`].
+//! only, sanitized with the prompt's rules and cut to [`passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,8 +32,8 @@ use log::info;
 
 use passless_core::agent::config::validate_rp_id;
 use passless_core::agent::protocol::{
-    AccessRequestState, AccessRequestStatus, ErrorCode, GrantAction, MAX_ACCESS_NOTE_BYTES,
-    MAX_ACCESS_WAIT_MS, PrincipalResponse, ProtocolError, RecommendedAction,
+    AccessRequestState, AccessRequestStatus, ErrorCode, GrantAction, MAX_ACCESS_WAIT_MS,
+    PrincipalResponse, ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{
     AgentMode, BrowserScope, PreRequestAction, PrincipalSessionId, ProfileId, RuleAction,
@@ -48,7 +48,7 @@ use crate::agent::escalation::{
     EscalationRefusal, EscalationRequest, PRE_REQUEST_PENDING_LIMIT, PreRequestParams,
     PreRequestState, StoreCounter, WaiterSession,
 };
-use crate::agent::escalation_prompt::sanitize_line;
+use crate::agent::escalation_prompt::sanitize_agent_note;
 use crate::agent::granted_rules::{PermittingRule, RequestSource};
 use crate::agent::refusal_ledger::{RefusalKey, RefusalLedger, SummaryTemplate};
 use crate::agent::register::StorageCounter;
@@ -135,13 +135,6 @@ fn pre_request_action(action: &GrantAction) -> PreRequestAction {
         GrantAction::Authenticate => PreRequestAction::Authenticate,
         GrantAction::Register => PreRequestAction::Register,
     }
-}
-
-/// The agent's note as the audit keeps it: one line, no control, Bidi, zero-width or markup
-/// characters, at most [`MAX_ACCESS_NOTE_BYTES`] bytes; `None` when nothing is left.
-pub(crate) fn sanitize_agent_note(note: Option<&str>) -> Option<String> {
-    let note = sanitize_line(note?, MAX_ACCESS_NOTE_BYTES);
-    (!note.is_empty()).then_some(note)
 }
 
 /// The answer to a pre-request's state. The messages are the daemon's own words; the only input
@@ -576,6 +569,8 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES;
 
     const RP: &str = "example.org";
 
