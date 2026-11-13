@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.26.0](https://github.com/pando85/passless/tree/v0.26.0) - 2026-11-13
+
+### Added
+
+- Let agents register at unlisted sites and keep pins alongside the wildcard (#598) ([136bc47](https://github.com/pando85/passless/commit/136bc47f3e620bdfbdcc4afbcad937fa529fe532))
+
 ## [v0.25.0](https://github.com/pando85/passless/tree/v0.25.0) - 2026-11-13
 
 ### Added
