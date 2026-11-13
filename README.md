@@ -199,8 +199,9 @@ multiple TPMs provisioned from the same recovery seed.
 
 ## Credential protection level
 
-Credentials created while user verification ran (such as `ed25519-sk` SSH keys) can be stored
-with credProtect level 3, which needs a PIN or UV for every use. To change the level of your own
+New credentials default to credProtect level 2 (UV optional with the credential ID list).
+Credentials created by earlier versions, such as `ed25519-sk` SSH keys, can be stored with
+level 3, which needs a PIN or UV for every use. To change the level of your own
 credentials, authorized by your PIN or the verification prompt:
 
 ```bash
