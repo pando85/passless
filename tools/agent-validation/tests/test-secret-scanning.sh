@@ -270,6 +270,46 @@ test_raw_payload_marker_detection() {
     rm -f "$findings_file" "$test_file"
 }
 
+test_agent_note_in_an_audit_record_is_flagged() {
+    log_test "an audit record's agent_note holding a token-shaped string is flagged"
+    setup_env
+    # ADR 0014 amendment section 2.3: the note of a pre-request is stored in the audit log (sanitized, at most 200 bytes,
+    # never shown in a prompt). The scan treats it like any other unlisted key, and a secret an agent put into it is found
+    # by value: this documents that the note is stored, so what an agent writes there is audit content.
+    local fixture="${FIXTURES_DIR}/secret-scan/audit-record-agent-note.json"
+    local findings_file="${TEST_TMP_DIR}/test-findings-agent-note"
+    : > "$findings_file"
+
+    local found=0
+    av_scan_file_for_unknown_keys "$fixture" "$findings_file" || found=$?
+    if [[ $found -gt 0 ]] && grep -q '"key":"agent_note"' "$findings_file"; then
+        log_pass "agent_note is flagged as an unlisted key ($found finding(s))"
+    else
+        log_fail "agent_note was not flagged by the key scan"
+    fi
+
+    local sentinel_file="${TEST_TMP_DIR}/sentinels-agent-note"
+    local token="ghp_0123456789abcdefghijklmnopqrstuv0123"
+    printf 'token=%s\n' "$token" > "$sentinel_file"
+    : > "$findings_file"
+    found=0
+    av_scan_file_for_sentinels "$fixture" "$sentinel_file" "$findings_file" || found=$?
+    if [[ $found -gt 0 ]] && grep -q '"class":"token"' "$findings_file"; then
+        log_pass "a token-shaped string in agent_note is found by value"
+    else
+        log_fail "the token in agent_note was not found by the sentinel scan"
+    fi
+
+    # The record is valid JSON of schema 5 with a null origin, as a pre-request's is.
+    if jq -e '.v == 5 and .origin == null and .source == "pre_request"' "$fixture" >/dev/null; then
+        log_pass "the fixture is a schema 5 pre-request record"
+    else
+        log_fail "the fixture is not a schema 5 pre-request record"
+    fi
+
+    rm -f "$findings_file" "$sentinel_file"
+}
+
 test_fixture_emits_valid_json() {
     log_test "fixture emits valid JSON"
     setup_env
@@ -428,6 +468,7 @@ main() {
     test_prohibited_field_detection
     test_prohibited_field_clean_pass
     test_raw_payload_marker_detection
+    test_agent_note_in_an_audit_record_is_flagged
     test_fixture_emits_valid_json
     test_fixture_emits_only_allowed_keys
     test_fixture_no_sentinel_leak
