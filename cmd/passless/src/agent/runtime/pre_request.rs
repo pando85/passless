@@ -50,7 +50,7 @@ use crate::agent::escalation::{
 };
 use crate::agent::escalation_prompt::sanitize_agent_note;
 use crate::agent::granted_rules::{PermittingRule, RequestSource};
-use crate::agent::refusal_ledger::{RefusalKey, RefusalLedger, SummaryTemplate};
+use crate::agent::refusal_ledger::{Admission, RefusalKey, RefusalLedger, SummaryTemplate};
 use crate::agent::register::StorageCounter;
 use crate::agent::session::CeremonyAction;
 
@@ -111,6 +111,25 @@ impl PreRequestRefusals {
             .entry(session.clone())
             .or_default()
             .clone()
+    }
+
+    /// Account for one refusal of `session` in its ledger. The ledger is created on demand, so a
+    /// refusal that races the session's end would recreate one that nothing removes: when
+    /// `alive()` (called with no lock held) says the session is gone afterwards, the ledger is
+    /// forgotten again, as [`Self::session_ended`] does.
+    fn admit(
+        &self,
+        session: &PrincipalSessionId,
+        key: RefusalKey,
+        now: Instant,
+        template: impl FnOnce() -> SummaryTemplate,
+        alive: impl FnOnce() -> bool,
+    ) -> Admission {
+        let admission = self.ledger(session).admit(key, now, template);
+        if !alive() {
+            self.session_ended(session);
+        }
+        admission
     }
 
     /// Forget a principal session that ended; its pending counts are written as the ledger
@@ -614,13 +633,20 @@ impl AgentRuntime {
                 self.policy_runtime.grant_epoch(),
             )
             .matched(rule, None);
-        let ledger = self.pre_request_refusals.ledger(session);
         let key = RefusalKey::new(audit_action(action), rp_id, reason);
-        let admission = ledger.admit(key, Instant::now(), || SummaryTemplate {
-            gate: self.audit_gate.clone(),
-            profile_id: profile_id.clone(),
-            op: op.clone(),
-        });
+        // Refusals before the escalation service's liveness check (steps 1 to 4) can race the
+        // session's end; its ledger is then dropped again.
+        let admission = self.pre_request_refusals.admit(
+            session,
+            key,
+            Instant::now(),
+            || SummaryTemplate {
+                gate: self.audit_gate.clone(),
+                profile_id: profile_id.clone(),
+                op: op.clone(),
+            },
+            || self.principal_session_alive(profile_id, session),
+        );
         for summary in admission.summaries {
             summary.write();
         }
@@ -658,6 +684,47 @@ mod tests {
         drop(slots);
         assert!(refusals.park(&PrincipalSessionId::new()).is_some());
         const { assert!(MAX_PARKED_PRE_REQUEST_CALLS < super::super::MAX_WORKERS) };
+    }
+
+    #[test]
+    fn a_refusal_that_races_the_end_of_its_session_leaves_no_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate =
+            Arc::new(crate::agent::audit::AuditGate::open(dir.path().join("audit")).unwrap());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let op = OperationRecord::new(profile.clone(), AuditAction::Authenticate, RP);
+        let refusals = PreRequestRefusals::default();
+        let refuse = |session: &PrincipalSessionId, alive: bool| {
+            let key = RefusalKey::new(
+                AuditAction::Authenticate,
+                RP,
+                PolicyDenyReason::PreRequestNotEnabled,
+            );
+            refusals.admit(
+                session,
+                key,
+                Instant::now(),
+                || SummaryTemplate {
+                    gate: gate.clone(),
+                    profile_id: profile.clone(),
+                    op: op.clone(),
+                },
+                || alive,
+            )
+        };
+
+        // A live session keeps its ledger, so its refusals are coalesced.
+        let live = PrincipalSessionId::new();
+        assert!(refuse(&live, true).write_in_full);
+        assert_eq!(refusals.ledgers.lock().unwrap().len(), 1);
+
+        // A session that ended meanwhile does not get one that nothing would remove.
+        let gone = PrincipalSessionId::new();
+        assert!(refuse(&gone, false).write_in_full);
+        let ledgers = refusals.ledgers.lock().unwrap();
+        assert_eq!(ledgers.len(), 1);
+        assert!(ledgers.contains_key(&live));
+        assert!(!ledgers.contains_key(&gone));
     }
 
     #[test]
