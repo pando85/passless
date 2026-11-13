@@ -448,22 +448,41 @@ Look for these log messages:
 | `UV retry limit is almost exhausted: 1 attempt remaining` | One UV attempt left |
 | `UV retries exhausted; built-in user verification is blocked` | UV is blocked (0 retries) |
 | `Built-in UV is blocked; falling back to notification-based verification` | Notification fallback active |
+| `CTAP request answered UV_BLOCKED (0x3c)` | A client was refused because UV is blocked, or because this denial spent the last retry (logged at error level) |
+
+A UV retry is spent only when somebody refuses: clicking **Deny** on the verification
+notification. Ignoring, dismissing or timing out the notification, or an action from an unrelated
+dialog, does not: the request is refused with `CTAP2_ERR_USER_ACTION_TIMEOUT` and the retries stay
+as they were. Servers without a Deny button (notify-osd 1.0, mako 0.0.0 and quickshell use
+default-action mode) can therefore never spend a retry.
+
+Exception: when the cached PIN hint is stale (a synchronized password store that gained a PIN
+while the daemon still believed there was none), passless refuses UV by policy to force the PIN,
+and every such refusal still spends a retry. The fix needs soft-fido2
+([pando85/soft-fido2#179](https://github.com/pando85/soft-fido2/pull/179)).
 
 **Fix:**
 
-Reset UV retries with an authenticated command:
+Restore the UV retries:
 
 ```bash
 passless client pin uv-reset
 ```
 
-This requires PIN authentication and restores UV retries to the configured maximum
-(`pin.max_uv_retries` in config, default 8).
+It asks for the PIN when one is set, and works directly without one. It prints the number of
+attempts now in effect. soft-fido2 refills its in-memory counter to `pin.max_retries` (default 8),
+not to `pin.max_uv_retries`, so with a smaller `pin.max_uv_retries` the daemon allows `pin.max_retries`
+denials until it restarts, after which the stored counter is clamped to `pin.max_uv_retries` again.
 
-**How `pin.enforcement` affects UV fallback:**
+**How a PIN affects built-in UV:**
 
-| `pin.enforcement` | `always_uv` | Behavior when UV blocked |
-|-------------------|-------------|--------------------------|
+With a PIN set, built-in UV is not offered at all: GetInfo advertises `uv: false`, requests that
+ask for `uv` fail with `CTAP2_ERR_INVALID_OPTION` and `getPinUvAuthTokenUsingUv` with
+`CTAP2_ERR_NOT_ALLOWED`, before any prompt, whatever `pin.enforcement` and `always_uv` say. The
+PIN is then the only way to verify. `pin.enforcement` only matters when the PIN hint is stale:
+
+| `pin.enforcement` | `always_uv` | Behavior with a PIN set and a stale hint |
+|-------------------|-------------|------------------------------------------|
 | `required` | any | Built-in UV denied; PIN required |
 | `optional` | `true` | Built-in UV denied; PIN required |
 | `optional` | `false` | Falls back to notification-based UV |

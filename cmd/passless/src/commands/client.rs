@@ -2190,6 +2190,31 @@ pub fn pin_change(
     Ok(())
 }
 
+/// Extract the restored UV retry count from a `0x42` reset response.
+///
+/// The transport has already stripped the CTAP status byte, so `response` is
+/// the bare CBOR map `{1: uvRetries}`. Returns `None` when the authenticator
+/// sent no payload, an empty map, or a map without key 1: the reset still
+/// succeeded in that case, the count is just unknown.
+fn parse_uv_retries_reset_response(response: &[u8]) -> Option<u8> {
+    if response.is_empty() {
+        return None;
+    }
+
+    let soft_fido2_ctap::cbor::Value::Map(map) =
+        soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(response).ok()?
+    else {
+        return None;
+    };
+
+    map.iter()
+        .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
+        .and_then(|(_, v)| match v {
+            soft_fido2_ctap::cbor::Value::Integer(n) => u8::try_from(*n).ok(),
+            _ => None,
+        })
+}
+
 /// Reset built-in user verification retries on authenticator
 pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
     let mut transport = open_authenticator(device)?;
@@ -2300,39 +2325,16 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
             .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
     };
 
-    // Send command 0x42 with the CBOR payload
+    // Send command 0x42 with the CBOR payload.
+    //
+    // `send_ctap_command` parses and consumes the CTAP status byte, surfacing a
+    // non-zero status as `Err`. Reaching this point therefore means the reset
+    // already succeeded, and `response` holds only the bare CBOR response map.
     let response = transport
         .send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &payload_bytes, 30000)
         .map_err(|e| passless_core::Error::Other(format!("UV retry reset failed: {:?}", e)))?;
 
-    let success = response == [0xa0] || response.first() == Some(&0x00);
-    if !success {
-        return Err(passless_core::Error::Other(format!(
-            "UV retry reset failed with status: 0x{:02x}",
-            response.first().copied().unwrap_or(0xff)
-        )));
-    }
-
-    // Parse the UV retries count from the response if available
-    let uv_retries_count = if response.len() > 1 {
-        if let Ok(soft_fido2_ctap::cbor::Value::Map(map)) =
-            soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..])
-        {
-            map.iter()
-                .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
-                .and_then(|(_, v)| {
-                    if let soft_fido2_ctap::cbor::Value::Integer(n) = v {
-                        Some(*n as u8)
-                    } else {
-                        None
-                    }
-                })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let uv_retries_count = parse_uv_retries_reset_response(&response);
 
     match output {
         OutputFormat::Plain => {
@@ -2570,6 +2572,37 @@ fn print_authenticator_info(info: &AuthenticatorInfo) {
 
     if let Some(remaining) = info.remaining_discoverable_credentials {
         println!("\nRemaining Discoverable Credentials: {}", remaining);
+    }
+}
+
+#[cfg(test)]
+mod uv_reset_response_tests {
+    use super::parse_uv_retries_reset_response;
+
+    #[test]
+    fn parses_uv_retries_from_bare_cbor_map() {
+        // What the authenticator returns once the transport has stripped the
+        // status byte: CBOR {1: 8}. A previous version of the client treated
+        // the 0xa1 map header as a CTAP status code and reported a successful
+        // reset as "status: 0xa1".
+        assert_eq!(
+            parse_uv_retries_reset_response(&[0xa1, 0x01, 0x08]),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn handles_responses_without_a_count() {
+        // Empty body, empty map, and a map lacking key 1 are all successful
+        // resets with an unknown count.
+        assert_eq!(parse_uv_retries_reset_response(&[]), None);
+        assert_eq!(parse_uv_retries_reset_response(&[0xa0]), None);
+        assert_eq!(parse_uv_retries_reset_response(&[0xa1, 0x02, 0x08]), None);
+    }
+
+    #[test]
+    fn handles_malformed_cbor() {
+        assert_eq!(parse_uv_retries_reset_response(&[0xa1, 0x01]), None);
     }
 }
 
