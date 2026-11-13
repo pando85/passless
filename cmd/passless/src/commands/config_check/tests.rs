@@ -65,31 +65,110 @@ fn a_valid_configuration_passes_without_warnings() {
 }
 
 #[test]
-fn a_wildcard_with_credential_refs_is_an_error_and_a_doctor_failure() {
-    // The case `doctor --agents` used to pass without a word.
+fn a_wildcard_with_credential_refs_is_valid() {
+    // ADR 0014 amendment change 1: the pins constrain the exact rules; `*` discovers.
     let fixture = Fixture::new();
     let path = fixture.write(
         "acknowledge_global_same_user = [\"p\"]",
         &profile(
             &format!("credential_refs = [\"{REF}\"]"),
-            "rp_id = \"*\"\nauthenticate = \"allow\"",
+            "rp_id = \"*\"\nauthenticate = \"request\"\n\n\
+             [[agents.profiles.p.rules]]\nrp_id = \"github.com\"\nauthenticate = \"allow\"",
         ),
     );
-    let config = load(&path);
+    assert_eq!(check(&load(&path)).unwrap(), Checked::default());
+}
+
+#[test]
+fn wildcard_registration_rules_flow_through_the_startup_check() {
+    let fixture = Fixture::new();
+    let wildcard_register = |register: &str| {
+        profile(
+            "",
+            &format!("rp_id = \"*\"\nauthenticate = \"request\"\nregister = \"{register}\""),
+        )
+    };
+    let all_but_global = "acknowledge_global_same_user = [\"p\"]\n\
+                          acknowledge_same_user_registration = [\"p\"]";
+
+    // `request` without `acknowledge_global_registration`: refused, naming it.
+    let path = fixture.write(all_but_global, &wildcard_register("request"));
     let err = error_of(&path);
     assert!(
-        err.contains("wildcard RP scope '*' requires credential_refs to be omitted"),
+        err.contains("agents.acknowledge_global_registration"),
         "{err}"
     );
-    let checks = config_checks(check(&config));
-    assert_eq!(checks.len(), 1);
-    assert_eq!(checks[0].name, "config");
-    assert!(!checks[0].passed, "{:?}", checks[0]);
+    let checks = config_checks(check(&load(&path)));
+    assert!(!checks[0].passed, "{checks:?}");
+
+    // `allow` on `*`: refused even with every acknowledgement.
+    let all = format!("{all_but_global}\nacknowledge_global_registration = [\"p\"]");
+    let path = fixture.write(&all, &wildcard_register("allow"));
     assert!(
-        checks[0].message.contains("credential_refs"),
-        "{:?}",
-        checks[0]
+        error_of(&path).contains("must not have register = \"allow\""),
+        "{}",
+        error_of(&path)
     );
+
+    // `request` with all three: valid.
+    let path = fixture.write(&all, &wildcard_register("request"));
+    assert_eq!(check(&load(&path)).unwrap(), Checked::default());
+
+    // Out-of-range limits are errors.
+    let path = fixture.write(
+        &all,
+        &profile(
+            "max_wildcard_registrations = 33",
+            "rp_id = \"*\"\nauthenticate = \"request\"\nregister = \"request\"",
+        ),
+    );
+    assert!(error_of(&path).contains("max_wildcard_registrations must be between 1 and 32"));
+}
+
+#[test]
+fn wildcard_registration_advice_is_reported_as_warnings() {
+    let fixture = Fixture::new();
+    let path = fixture.write(
+        "acknowledge_global_registration = [\"p\"]",
+        &profile(
+            "wildcard_registration_prompts_per_day = 2",
+            "rp_id = \"example.com\"\nauthenticate = \"allow\"",
+        ),
+    );
+    let checked = check(&load(&path)).unwrap();
+    assert_eq!(checked.warnings.len(), 2, "{checked:?}");
+    assert!(checked.warnings[0].contains("wildcard_registration_prompts_per_day has no effect"));
+    assert!(checked.warnings[1].contains("acknowledgement is stale"));
+}
+
+#[test]
+fn pre_request_actions_without_a_request_rule_are_reported_as_warnings() {
+    let fixture = Fixture::new();
+    let path = fixture.write(
+        "",
+        &profile(
+            "pre_request_actions = [\"authenticate\", \"register\"]",
+            "rp_id = \"example.com\"\nauthenticate = \"allow\"",
+        ),
+    );
+    let checked = check(&load(&path)).unwrap();
+    assert_eq!(checked.warnings.len(), 2, "{checked:?}");
+    assert!(checked.warnings.iter().any(|w| w.contains(
+        "pre_request_actions lists \"register\" but no rule has register = \"request\""
+    )));
+    assert!(checked.warnings.iter().any(|w| w.contains(
+        "pre_request_actions lists \"authenticate\" but no rule has authenticate = \"request\""
+    )));
+
+    // A duplicate is an error.
+    let path = fixture.write(
+        "",
+        &profile(
+            "pre_request_actions = [\"authenticate\", \"authenticate\"]",
+            "rp_id = \"example.com\"\nauthenticate = \"request\"",
+        ),
+    );
+    assert!(error_of(&path).contains("pre_request_actions lists 'authenticate' twice"));
 }
 
 #[test]

@@ -43,11 +43,18 @@ function makeControl(dir) {
   };
 }
 
-/** The shell lines that serve the FIFO (after `AGENT-READY`). */
+/**
+ * The shell lines that serve the FIFO (after `AGENT-READY`): a line is a browser-control request file, or `run:<script>`, a
+ * script of the harness's (lib/agent-session.js) that runs as a child of this principal session, so that `passless agent
+ * request-access` can be called from the session that owns the browser. Both leave `<file>.out`, `.err` and `.rc`.
+ */
 const serveLines = [
   'exec 9<>"$D/requests"',
   'while read -r req <&9; do',
-  '  "$PASSLESS" agent browser-control --profile "$P" --request-file "$req" --timeout-ms 30000 >"$req.out" 2>"$req.err"',
+  '  case "$req" in',
+  '    run:*) req="${req#run:}"; /bin/bash "$req" >"$req.out" 2>"$req.err" ;;',
+  '    *) "$PASSLESS" agent browser-control --profile "$P" --request-file "$req" --timeout-ms 30000 >"$req.out" 2>"$req.err" ;;',
+  '  esac',
   '  echo $? >"$req.rc.tmp" && mv "$req.rc.tmp" "$req.rc"',
   'done',
 ];

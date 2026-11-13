@@ -13,7 +13,7 @@ use passless_core::{
 };
 
 use passless_core::agent::PrincipalSessionId;
-use passless_core::agent::protocol::{AdminRequest, AuditExportFormat};
+use passless_core::agent::protocol::{AdminRequest, AuditExportFormat, GrantedRuleList};
 
 use serde::Serialize;
 
@@ -578,37 +578,9 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
         .map_err(|e| Error::Other(e.to_string()))?;
     match resp {
         passless_core::agent::AdminResponse::GrantedRuleList(list) => match output {
-            OutputFormat::Json => admin_output_json(&list),
+            OutputFormat::Json => admin_output_json(&display_granted_rules(list)),
             OutputFormat::Plain => {
-                for profile in &list.profiles {
-                    match &profile.disabled_reason {
-                        Some(reason) => {
-                            println!("{}: DISABLED ({})", profile.profile_id, reason)
-                        }
-                        None => println!(
-                            "{}: {} rule(s), digest {}",
-                            profile.profile_id,
-                            profile.rules.len(),
-                            profile.digest
-                        ),
-                    }
-                    for rule in &profile.rules {
-                        print!(
-                            "  {} {} kind={} rule={} granted_at={} request={} origin={}",
-                            rule.rp_id,
-                            rule.action,
-                            rule.kind,
-                            rule.rule,
-                            rule.granted_at,
-                            rule.request_id,
-                            rule.origin
-                        );
-                        if let Some(credential_ref) = &rule.credential_ref {
-                            print!(" credential={}", credential_ref);
-                        }
-                        println!();
-                    }
-                }
+                print!("{}", format_granted_rules(&display_granted_rules(list)));
                 Ok(())
             }
         },
@@ -627,6 +599,108 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
         }
         _ => Err(Error::Other("unexpected response".to_string())),
     }
+}
+
+/// The text of an empty `origin` (an `authenticate` pre-request has no page) in both outputs.
+const NO_ORIGIN: &str = "-";
+
+/// The form both `grants list` outputs show (ADR 0014 amendment section 7): every grant carries
+/// its `source` (`ceremony` when the daemon did not say, as an older one does not) and an empty
+/// `origin` reads `-`.
+fn display_granted_rules(mut list: GrantedRuleList) -> GrantedRuleList {
+    for rule in list.profiles.iter_mut().flat_map(|p| p.rules.iter_mut()) {
+        if rule.source.is_none() {
+            rule.source = Some("ceremony".to_string());
+        }
+        if rule.origin.is_empty() {
+            rule.origin = NO_ORIGIN.to_string();
+        }
+    }
+    list
+}
+
+/// The plain `agent-admin grants list` text: per profile a summary line, then a table with a header
+/// whose `RULE` column says which configured rule permitted each grant (`exact`, or `*` for a grant
+/// under the wildcard rule, ADR 0014 amendment section 2.2), `KIND` whether it came from an
+/// approved sign-in (`escalation`) or a registration (`registration`, with its credential) and
+/// `SOURCE` who raised the escalation (`ceremony`, or `pre_request` for one the agent asked for
+/// in advance, which has no origin).
+fn format_granted_rules(list: &GrantedRuleList) -> String {
+    const HEADER: [&str; 9] = [
+        "RP_ID",
+        "ACTION",
+        "KIND",
+        "RULE",
+        "SOURCE",
+        "GRANTED_AT",
+        "REQUEST",
+        "ORIGIN",
+        "CREDENTIAL",
+    ];
+    let mut out = String::new();
+    for profile in &list.profiles {
+        match &profile.disabled_reason {
+            Some(reason) => {
+                out.push_str(&format!("{}: DISABLED ({})\n", profile.profile_id, reason))
+            }
+            None => out.push_str(&format!(
+                "{}: {} rule(s), digest {}\n",
+                profile.profile_id,
+                profile.rules.len(),
+                profile.digest
+            )),
+        }
+        if profile.rules.is_empty() {
+            continue;
+        }
+        let rows: Vec<[String; 9]> = profile
+            .rules
+            .iter()
+            .map(|rule| {
+                [
+                    rule.rp_id.clone(),
+                    rule.action.clone(),
+                    rule.kind.clone(),
+                    rule.rule.clone(),
+                    rule.source.clone().unwrap_or_else(|| "ceremony".into()),
+                    rule.granted_at.clone(),
+                    rule.request_id.clone(),
+                    if rule.origin.is_empty() {
+                        NO_ORIGIN.to_string()
+                    } else {
+                        rule.origin.clone()
+                    },
+                    rule.credential_ref.clone().unwrap_or_else(|| "-".into()),
+                ]
+            })
+            .collect();
+        // Every column but the last is padded to its widest cell.
+        let widths: Vec<usize> = (0..HEADER.len() - 1)
+            .map(|column| {
+                rows.iter()
+                    .map(|row| row[column].chars().count())
+                    .chain(std::iter::once(HEADER[column].len()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let line = |cells: Vec<&str>| {
+            let mut text = String::from("  ");
+            for (column, cell) in cells.iter().enumerate() {
+                match widths.get(column) {
+                    Some(width) => text.push_str(&format!("{cell:<width$}  ")),
+                    None => text.push_str(cell),
+                }
+            }
+            text.push('\n');
+            text
+        };
+        out.push_str(&line(HEADER.to_vec()));
+        for row in &rows {
+            out.push_str(&line(row.iter().map(String::as_str).collect()));
+        }
+    }
+    out
 }
 
 fn require_confirm(confirm: bool) -> Result<()> {
@@ -651,7 +725,9 @@ fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -
                 .request(req)
                 .map_err(|e| Error::Other(e.to_string()))?;
             match resp {
-                passless_core::agent::AdminResponse::DelegationInfo(info) => match output {
+                // The daemon answers with the `Grant*` variants; the `Delegation*` ones are the old names.
+                passless_core::agent::AdminResponse::GrantInfo(info)
+                | passless_core::agent::AdminResponse::DelegationInfo(info) => match output {
                     OutputFormat::Json => admin_output_json(&info),
                     OutputFormat::Plain => {
                         println!("grant_id: {}", info.grant_id);
@@ -674,7 +750,8 @@ fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -
                 .request(req)
                 .map_err(|e| Error::Other(e.to_string()))?;
             match resp {
-                passless_core::agent::AdminResponse::DelegationList(list) => match output {
+                passless_core::agent::AdminResponse::GrantList(list)
+                | passless_core::agent::AdminResponse::DelegationList(list) => match output {
                     OutputFormat::Json => admin_output_json(&list),
                     OutputFormat::Plain => {
                         println!("total: {}", list.total);
@@ -703,7 +780,8 @@ fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -
                 .request(req)
                 .map_err(|e| Error::Other(e.to_string()))?;
             match resp {
-                passless_core::agent::AdminResponse::DelegationRevoked => {
+                passless_core::agent::AdminResponse::GrantRevoked
+                | passless_core::agent::AdminResponse::DelegationRevoked => {
                     #[derive(Serialize)]
                     struct RevokedOut {
                         grant_id: String,
@@ -1157,6 +1235,163 @@ mod tests {
     use super::*;
 
     use std::os::unix::fs::symlink;
+
+    use passless_core::agent::protocol::{GrantedRuleInfo, ProfileGrantedRules};
+
+    fn info(rp_id: &str, kind: &str, rule: &str, credential: Option<&str>) -> GrantedRuleInfo {
+        GrantedRuleInfo {
+            rp_id: rp_id.into(),
+            action: "authenticate".into(),
+            kind: kind.into(),
+            granted_at: "2026-11-12T10:00:00Z".into(),
+            request_id: "esc-1".into(),
+            origin: format!("https://{rp_id}"),
+            rule: rule.into(),
+            credential_ref: credential.map(str::to_string),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn grants_list_has_a_header_and_shows_rule_and_kind() {
+        let list = GrantedRuleList {
+            profiles: vec![ProfileGrantedRules {
+                profile_id: "coding".into(),
+                enabled: true,
+                disabled_reason: None,
+                digest: "d1".into(),
+                rules: vec![
+                    info("github.com", "escalation", "exact", None),
+                    info("new.example.org", "registration", "*", Some("ab12")),
+                ],
+            }],
+        };
+        let text = format_granted_rules(&list);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "coding: 2 rule(s), digest d1");
+        let header: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(
+            header,
+            [
+                "RP_ID",
+                "ACTION",
+                "KIND",
+                "RULE",
+                "SOURCE",
+                "GRANTED_AT",
+                "REQUEST",
+                "ORIGIN",
+                "CREDENTIAL"
+            ]
+        );
+        let exact: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(
+            exact[..5],
+            [
+                "github.com",
+                "authenticate",
+                "escalation",
+                "exact",
+                "ceremony"
+            ]
+        );
+        assert_eq!(exact[8], "-");
+        let wildcard: Vec<&str> = lines[3].split_whitespace().collect();
+        assert_eq!(
+            wildcard[..5],
+            [
+                "new.example.org",
+                "authenticate",
+                "registration",
+                "*",
+                "ceremony"
+            ]
+        );
+        assert_eq!(wildcard[8], "ab12");
+        // The columns line up: every row starts its RULE cell where the header does.
+        let column = lines[1].find("RULE").unwrap();
+        assert_eq!(&lines[2][column..column + 5], "exact");
+        assert_eq!(&lines[3][column..column + 1], "*");
+    }
+
+    /// A pre-request grant has no origin (it prints `-`) and says where it came from, in the
+    /// plain table and in the JSON; a grant from an older daemon, with no `source`, is a
+    /// ceremony's.
+    #[test]
+    fn grants_list_shows_the_source_and_a_dash_for_an_empty_origin() {
+        let mut pre = info("docs.example.net", "escalation", "*", None);
+        pre.origin = String::new();
+        pre.source = Some("pre_request".into());
+        let mut old = info("github.com", "escalation", "exact", None);
+        old.source = None;
+        let list = display_granted_rules(GrantedRuleList {
+            profiles: vec![ProfileGrantedRules {
+                profile_id: "coding".into(),
+                enabled: true,
+                disabled_reason: None,
+                digest: "d1".into(),
+                rules: vec![pre, old],
+            }],
+        });
+        let json = serde_json::to_value(&list).unwrap();
+        let rules = &json["profiles"][0]["rules"];
+        assert_eq!(rules[0]["source"], "pre_request");
+        assert_eq!(rules[0]["origin"], "-");
+        assert_eq!(rules[1]["source"], "ceremony");
+        assert_eq!(rules[1]["origin"], "https://github.com");
+
+        let text = format_granted_rules(&list);
+        let lines: Vec<&str> = text.lines().collect();
+        let row: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(row[0], "docs.example.net");
+        assert_eq!(row[4], "pre_request");
+        assert_eq!(row[7], "-", "the ORIGIN cell: {}", lines[2]);
+        let column = lines[1].find("SOURCE").unwrap();
+        assert_eq!(&lines[2][column..column + 11], "pre_request");
+        assert_eq!(&lines[3][column..column + 8], "ceremony");
+        // The formatter alone shows the dash too, for a list that was not normalised.
+        let mut raw = info("docs.example.net", "escalation", "*", None);
+        raw.origin = String::new();
+        raw.source = None;
+        let text = format_granted_rules(&GrantedRuleList {
+            profiles: vec![ProfileGrantedRules {
+                profile_id: "p".into(),
+                enabled: true,
+                disabled_reason: None,
+                digest: "d".into(),
+                rules: vec![raw],
+            }],
+        });
+        let row: Vec<&str> = text.lines().nth(2).unwrap().split_whitespace().collect();
+        assert_eq!((row[4], row[7]), ("ceremony", "-"));
+    }
+
+    #[test]
+    fn grants_list_prints_no_header_for_an_empty_or_disabled_profile() {
+        let list = GrantedRuleList {
+            profiles: vec![
+                ProfileGrantedRules {
+                    profile_id: "empty".into(),
+                    enabled: true,
+                    disabled_reason: None,
+                    digest: "d0".into(),
+                    rules: vec![],
+                },
+                ProfileGrantedRules {
+                    profile_id: "broken".into(),
+                    enabled: false,
+                    disabled_reason: Some("mode 0644".into()),
+                    digest: "d0".into(),
+                    rules: vec![],
+                },
+            ],
+        };
+        let text = format_granted_rules(&list);
+        assert_eq!(
+            text,
+            "empty: 0 rule(s), digest d0\nbroken: DISABLED (mode 0644)\n"
+        );
+    }
 
     use tempfile::tempdir;
 

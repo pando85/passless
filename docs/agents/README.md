@@ -16,8 +16,8 @@ application-level authorization proxy.
 1. [Quick start](quick-start.md): one rule, one command, five minutes.
 2. [Browser tools](browser-tools.md): Playwright MCP, chrome-devtools-mcp, the Playwright library,
    browser-use, agent-browser, Stagehand.
-3. [Rules](rules.md): `deny`, `allow`, `request`, escalation prompts, granted rules, registration and
-   the wildcard.
+3. [Rules](rules.md): `deny`, `allow`, `request`, escalation prompts, granted rules, registration, the
+   wildcard and [asking in advance](rules.md#asking-in-advance).
 
 ## Reference
 
@@ -27,7 +27,8 @@ application-level authorization proxy.
 - [Same-user mode](same-user.md) and [isolated mode](isolated.md): whose passkeys the agent uses.
 - [Security model](security.md), [operations](operations.md), [audit](audit.md),
   [troubleshooting](troubleshooting.md).
-- [Migration](migration.md): older configuration spellings and their mapping.
+- [Migration](migration.md): older configuration spellings and their mapping, and what changes on
+  upgrade (the agent pre-request release).
 - [Agent registration](../AGENT_REGISTRATION.md) and
   [registration testing](../AGENT_REGISTRATION_TESTING.md).
 - [ADR 0014](../decisions/0014-agent-delegation.md): the design and its security invariants.
@@ -58,6 +59,9 @@ express actor, audience, scope, lifetime and revocation independently of a brows
   `browser_scope = "profile"`, when the session that owns it ends).
 - **Escalation**: a `request` rule asking you, through a desktop notification, to allow one RP.
   Approving it stores a **granted rule**: a permanent `allow` for that exact RP until you revoke it.
+- **Pre-request**: the agent asks for an escalation before it navigates (`passless agent
+  request-access`, or an MCP tool), when the profile's `pre_request_actions` allow it. It raises the
+  same prompt without a page.
 - **UHID / hidraw**: how Passless appears as a USB security key. UHID is the kernel interface the daemon
   uses to create the virtual device; hidraw is the device node clients and browsers open to talk to it.
   Agents get neither: they reach the daemon through the managed browser.

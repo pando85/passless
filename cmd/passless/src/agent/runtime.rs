@@ -50,8 +50,9 @@ use crate::storage::CredentialStorage;
 mod browser_ensure;
 mod gates;
 mod interception;
+mod pre_request;
 
-const MAX_WORKERS: usize = 16;
+pub(crate) const MAX_WORKERS: usize = 16;
 const MAX_COMPLETED_SESSIONS: usize = 256;
 const COMPLETED_SESSION_TTL: Duration = Duration::from_secs(600);
 const WAIT_PRINCIPAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -158,11 +159,12 @@ fn build_escalation_service(
         audit: audit_gate,
         grants: Arc::new(StoreGrantWriter {
             store: granted_rules,
-            policy: policy_runtime,
+            policy: policy_runtime.clone(),
         }),
         prompter,
         clock: Arc::new(super::identity::SystemClock::new()),
         cooldown: agent_config.escalation_cooldown(),
+        epoch: policy_runtime,
     })
 }
 
@@ -173,6 +175,7 @@ fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> Protocol
         GrantStoreError::InvalidRpId(_) => ErrorCode::BadRequest,
         GrantStoreError::Unavailable(_)
         | GrantStoreError::CapReached(_)
+        | GrantStoreError::WildcardCapReached(_)
         | GrantStoreError::Revoked => ErrorCode::Conflict,
         GrantStoreError::Io(_) => ErrorCode::Internal,
     };
@@ -206,7 +209,7 @@ pub(crate) fn clear_granted_rules(
     let outcome = store
         .clear(policy_runtime, profile_id)
         .map_err(granted_rules_error)?;
-    escalation.cancel_profile(profile_id);
+    escalation.cancel_profile_grants_cleared(profile_id);
     if outcome.revoked > 0 {
         let event = super::audit_events::GrantedRuleRevokeBuilder::new(
             profile_id.clone(),
@@ -536,6 +539,36 @@ impl core::fmt::Debug for ProfileRuntime {
             .field("browser_gid", &self.browser_gid)
             .finish_non_exhaustive()
     }
+}
+
+/// Who a profile report is for. The agent's own `doctor` request gets the health of the
+/// deployment, not the operator's view of the credential store (review L3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportAudience {
+    /// `agent-admin profile check`: the operator.
+    Admin,
+    /// `PrincipalRequest::Doctor`: the agent, over its principal socket.
+    Principal,
+}
+
+/// The profile's credential store as its path index shows it, for the pin checks, or `None` when
+/// `audience` does not get them: then the storage lock is not taken and the store is not asked
+/// anything. Under the storage lock alone; no credential is decrypted or unsealed.
+fn pin_store_view(
+    audience: ReportAudience,
+    storage: &Mutex<Box<dyn CredentialStorage>>,
+) -> Option<super::doctor_pins::StoreView> {
+    if audience != ReportAudience::Admin {
+        return None;
+    }
+    let indexed = super::lock_order::lock(storage, super::lock_order::LockLevel::Storage)
+        .indexed_credentials();
+    Some(match indexed {
+        Some(credentials) => super::doctor_pins::StoreView::from_indexed(credentials),
+        None => super::doctor_pins::StoreView::Unknown(
+            "the backend cannot list its credentials without decrypting them".into(),
+        ),
+    })
 }
 
 impl ProfileRuntime {
@@ -943,6 +976,8 @@ pub struct AgentRuntime {
     escalation: Arc<EscalationService>,
     /// `PASSLESS_INTERACTION_MODE=automatic` was in force at start; reloads keep R19.
     human_path_automatic: bool,
+    /// The refusal ledgers of principal sessions' pre-requests (ADR 0014 amendment 2.3).
+    pre_request_refusals: pre_request::PreRequestRefusals,
 }
 
 impl AgentRuntime {
@@ -1304,6 +1339,20 @@ impl AgentRuntime {
         })?;
 
         let sign_registry = Arc::new(SignContextRegistry::new());
+        {
+            // A revoked lease drops the pre-approvals of the principal session its grant belongs
+            // to (ADR 0014 amendment section 2.3). Called with no registry lock held: policy
+            // grants (70), then the escalation mutex (80) and the audit gate (90).
+            let policy_runtime = policy_runtime.clone();
+            let escalation = escalation.clone();
+            sign_registry.set_lease_observer(Box::new(move |grants| {
+                for grant_id in grants {
+                    if let Some(principal) = policy_runtime.grant_principal_session(grant_id) {
+                        escalation.lease_revoked(&principal);
+                    }
+                }
+            }));
+        }
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));
         let sign_socket_base = daemon_runtime_base()?;
         let sign_socket_path = sign_socket_base.join("agent").join("sign").join("sock");
@@ -1577,6 +1626,7 @@ impl AgentRuntime {
             granted_rules,
             escalation,
             human_path_automatic,
+            pre_request_refusals: pre_request::PreRequestRefusals::default(),
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -2100,6 +2150,8 @@ impl AgentRuntime {
 
             self.worker_tracker.reap_finished();
             self.reap_expired_sessions();
+            // Pre-request deadlines and pre-approval TTLs (ADR 0014 amendment section 2.3).
+            self.escalation.sweep_pre_requests();
             self.prune_completed_sessions();
             // Write the late-use refusal counts of revoked bearers whose window has ended.
             self.sign_registry.flush_due_revoked_refusals();
@@ -2271,6 +2323,11 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
         session_id: &PrincipalSessionId,
     ) {
+        // Every way a principal session ends comes through here: its pending pre-requests are
+        // withdrawn and its pre-approvals dropped (ADR 0014 amendment section 2.3), before its
+        // browser is closed. Escalation mutex and audit only; no lock above rank 5 is held.
+        self.escalation.principal_session_ended(session_id);
+        self.pre_request_refusals.session_ended(session_id);
         let _lifecycle = super::lock_order::lock(
             &profile.lifecycle_lock,
             super::lock_order::LockLevel::ProfileLifecycle,
@@ -2647,7 +2704,17 @@ impl AgentRuntime {
                 })
                 .collect(),
             credentials: AuthorityCredentialScope {
-                dynamic_per_rp: profile_config.credential_refs.is_none(),
+                // Profile pins constrain exact-rule matches only; `*` matches discover (ADR 0014
+                // amendment 2.1).
+                exact_rules: if profile_config.credential_refs.is_some() {
+                    passless_core::agent::protocol::AUTHORITY_SCOPE_PINNED
+                } else {
+                    passless_core::agent::protocol::AUTHORITY_SCOPE_DISCOVERED
+                }
+                .to_string(),
+                wildcard: rules.iter().any(|rule| rule.is_wildcard()).then(|| {
+                    passless_core::agent::protocol::AUTHORITY_SCOPE_DISCOVERED.to_string()
+                }),
                 configured_reference_count: profile_config
                     .credential_refs
                     .as_ref()
@@ -3542,7 +3609,7 @@ impl AgentRuntime {
             )
         })?;
 
-        let report = self.build_profile_report(profile_id, profile);
+        let report = self.build_profile_report(profile_id, profile, ReportAudience::Admin);
         Ok(AdminResponse::ProfileCheck(report))
     }
 
@@ -3550,6 +3617,7 @@ impl AgentRuntime {
         &self,
         profile_id: &ProfileId,
         profile: &ProfileRuntime,
+        audience: ReportAudience,
     ) -> passless_core::agent::ProfileDiagnosticReport {
         let enabled = profile.enabled.load(Ordering::Acquire);
 
@@ -3628,6 +3696,10 @@ impl AgentRuntime {
             self.granted_rules.profile(profile_id).as_deref(),
             &self.granted_rules.path_for(profile_id),
         ));
+        // The profile's credential store as its path index shows it, for the pin checks. Read
+        // before the configuration lock and under the storage lock alone: no credential is
+        // decrypted or unsealed. Not read at all for the agent (review L3).
+        let store_view = pin_store_view(audience, &profile.credential_storage);
         {
             let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
             let config = self
@@ -3645,10 +3717,25 @@ impl AgentRuntime {
                 profile_config,
                 euid,
             ));
+            let grants = self.granted_rules.profile(profile_id);
             report.checks.push(super::doctor_grants::inert_grants_check(
                 profile_config,
-                self.granted_rules.profile(profile_id).as_deref(),
+                grants.as_deref(),
             ));
+            // What the pins cover, inert or missing pins, the wildcard registration count and
+            // the configuration advice that names this profile (ADR 0014 amendment 2.1, 2.2).
+            // Operator surfaces only: they name pinned RP IDs and whether the human's store holds
+            // each pin, which is metadata about the human's store that the agent must not read
+            // through its own doctor (review L3).
+            if let Some(store_view) = &store_view {
+                report.checks.extend(super::doctor_pins::profile_checks(
+                    &config,
+                    profile_id.as_str(),
+                    profile_config,
+                    grants.as_deref(),
+                    store_view,
+                ));
+            }
         }
         // Deprecated config vocabulary is accepted with a warning until the release after next (plan R8):
         // a warning never makes the profile unhealthy, so the check passes and carries the text.
@@ -3903,9 +3990,10 @@ impl AgentRuntime {
                             kind: rule.kind.as_str().to_string(),
                             granted_at: rule.granted_at.clone(),
                             request_id: rule.request_id.clone(),
-                            origin: rule.origin.clone(),
+                            origin: rule.origin_or_empty().to_string(),
                             rule: rule.rule.as_str().to_string(),
                             credential_ref: rule.credential_ref.as_ref().map(|r| r.to_hex()),
+                            source: Some(rule.source.as_str().to_string()),
                         })
                         .collect(),
                 },
@@ -4843,10 +4931,14 @@ impl AgentRuntime {
         );
         if let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None) {
             loop {
-                let rp_allowed = config
-                    .rp_ids
-                    .iter()
-                    .any(|rp| rp.eq_ignore_ascii_case(&cred.rp.id));
+                // A `*` scope covers every RP but `localhost` (ADR 0014 section 6.1).
+                let rp_allowed = config.rp_ids.iter().any(|rp| {
+                    rp.eq_ignore_ascii_case(&cred.rp.id)
+                        || (rp == passless_core::agent::config::ANY_RP_ID
+                            && !cred.rp.id.eq_ignore_ascii_case(
+                                passless_core::agent::config::LOCALHOST_RP_ID,
+                            ))
+                });
                 let credential_ref =
                     passless_core::agent::CredentialRef::with_default_domain(&cred.id);
                 let credential_allowed = profile_config
@@ -4865,7 +4957,16 @@ impl AgentRuntime {
 
         drop(storage);
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
+        // With a `*` rule the pins constrain exact-rule matches only and the sign path reads them
+        // from the live policy, so the grant is created even when no pinned credential is in the
+        // store; its credential list is for audit and `sessions show` only (ADR 0014 amendment
+        // 2.1). Without `*`, as before: pins with no stored credential create no grant.
+        let wildcard_scope = config
+            .rp_ids
+            .iter()
+            .any(|rp| rp == passless_core::agent::config::ANY_RP_ID);
+        let empty_credentials_allowed = dynamic_credential_scope || wildcard_scope;
+        if !config.rp_ids.is_empty() && (empty_credentials_allowed || !credential_refs.is_empty()) {
             let session_id = passless_core::agent::PrincipalSessionId::new();
             let grant_params = super::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
@@ -4885,7 +4986,7 @@ impl AgentRuntime {
             };
             let grant_request = self
                 .policy_runtime
-                .admin_request_session_grant(grant_params, dynamic_credential_scope);
+                .admin_request_session_grant(grant_params, empty_credentials_allowed);
             match grant_request {
                 Ok(request_id) => {
                     match self
@@ -5154,6 +5255,8 @@ impl PrincipalHandler for AgentRuntime {
         let session = &managed.session;
 
         let proc_root = &session.proc_root;
+        // Everything else answers under the slot; a pre-request may wait for the human, so it
+        // copies what it needs and releases the slot first (LOCKING.md rule 3).
         let peer_pid = cred.pid;
 
         if identity.uid != session.identity.uid {
@@ -5217,7 +5320,8 @@ impl PrincipalHandler for AgentRuntime {
                 }))
             }
             PrincipalRequest::Doctor => {
-                let report = self.build_profile_report(&profile_id, profile);
+                let report =
+                    self.build_profile_report(&profile_id, profile, ReportAudience::Principal);
                 Ok(PrincipalResponse::Doctor(DoctorResponse {
                     healthy: report.is_healthy(),
                     checks: report.checks,
@@ -5252,6 +5356,29 @@ impl PrincipalHandler for AgentRuntime {
                 *timeout_ms,
                 profile,
             ),
+            PrincipalRequest::RequestAccess {
+                rp_id,
+                action,
+                note,
+                wait_ms,
+            } => {
+                let requester = pre_request::Requester {
+                    session_id: managed.session_id.clone(),
+                    deadline: managed.deadline,
+                };
+                drop(sessions);
+                self.handle_request_access(
+                    &profile_id,
+                    profile,
+                    requester,
+                    pre_request::AccessRequest {
+                        rp_id,
+                        action,
+                        note: note.as_deref(),
+                        wait_ms: *wait_ms,
+                    },
+                )
+            }
         }
     }
 }
@@ -5309,6 +5436,66 @@ mod tests {
         fn count_credentials(&self) -> usize {
             self.0
         }
+    }
+
+    /// A storage that counts how often the doctor asks it to list its credentials.
+    struct CountingIndexStorage(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CredentialStorage for CountingIndexStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            panic!("the doctor must not read a credential");
+        }
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            panic!("the doctor must not read a credential");
+        }
+        fn read(&mut self, _id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            panic!("the doctor must not read a credential");
+        }
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _id: &[u8]) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn count_credentials(&self) -> usize {
+            0
+        }
+        fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(vec![("pinned.example".to_string(), vec![1; 32])])
+        }
+    }
+
+    /// Review L3: the agent's own doctor must not list the human's store (the pin checks name
+    /// pinned RP IDs and whether the store holds each pin), and must not even take its lock for
+    /// it. The operator's `profile check` still does.
+    #[test]
+    fn the_principal_doctor_does_not_read_the_credential_store_for_pin_checks() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage: Mutex<Box<dyn CredentialStorage>> =
+            Mutex::new(Box::new(CountingIndexStorage(calls.clone())));
+
+        assert!(pin_store_view(ReportAudience::Principal, &storage).is_none());
+        // Held here for the whole call: a principal report that tried to take the lock would
+        // deadlock on it.
+        let held = storage.lock().unwrap();
+        assert!(
+            pin_store_view(ReportAudience::Principal, &storage).is_none(),
+            "no lock is taken for the agent"
+        );
+        drop(held);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The operator's report does read the index, once.
+        let view = pin_store_view(ReportAudience::Admin, &storage).expect("admin view");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            view,
+            super::super::doctor_pins::StoreView::Known(_)
+        ));
     }
 
     /// Review L4: the status counts read a poisoned storage lock with recovery instead of

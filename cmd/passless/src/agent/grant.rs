@@ -397,6 +397,9 @@ pub struct GrantSnapshotForSign {
     pub profile_id: ProfileId,
     /// Digest of the principal process the grant was issued to (ADR 0014 sections 7 and 9).
     pub principal_digest: [u8; 32],
+    /// The principal session the grant was issued to: the owner of every bearer session bound
+    /// to it (ADR 0014 amendment section 2.3, a pre-approval's binding).
+    pub session_id: PrincipalSessionId,
     pub rp_ids: Vec<String>,
     pub credential_refs: Vec<CredentialRef>,
     pub state: GrantState,
@@ -953,6 +956,7 @@ impl GrantRegistry {
             grant_id: grant.id.clone(),
             profile_id: grant.profile_id.clone(),
             principal_digest: grant.principal_digest,
+            session_id: grant.session_id.clone(),
             rp_ids,
             credential_refs: cred_refs,
             state,

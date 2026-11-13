@@ -11,6 +11,9 @@ use passless_core::agent::{
 
 fn isolated_profile() -> AgentProfileConfig {
     AgentProfileConfig {
+        max_wildcard_registrations: None,
+        wildcard_registration_prompts_per_day: None,
+        pre_request_actions: Vec::new(),
         max_granted_rules: 64,
         max_operations: 64,
         max_concurrent_sessions: 1,
@@ -150,6 +153,7 @@ fn invalid_rp_id_in_profile_rejected() {
 #[test]
 fn agent_config_disabled_skips_validation() {
     let config = AgentConfig {
+        acknowledge_global_registration: vec![],
         notify_user: None,
         state_dir: None,
         escalation_timeout: None,
@@ -169,6 +173,7 @@ fn agent_config_disabled_skips_validation() {
 #[test]
 fn agent_config_enabled_requires_audit_path() {
     let config = AgentConfig {
+        acknowledge_global_registration: vec![],
         notify_user: None,
         state_dir: None,
         escalation_timeout: None,
@@ -204,6 +209,7 @@ fn agent_config_detects_overlapping_storage_paths() {
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
+        acknowledge_global_registration: vec![],
         notify_user: None,
         state_dir: None,
         escalation_timeout: None,
@@ -241,6 +247,7 @@ fn agent_config_accepts_profiles_sharing_a_legacy_device_identity() {
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
+        acknowledge_global_registration: vec![],
         notify_user: None,
         state_dir: None,
         escalation_timeout: None,
@@ -277,6 +284,7 @@ fn agent_config_detects_overlap_with_human_backend() {
     profiles.insert("p".to_string(), p);
 
     let config = AgentConfig {
+        acknowledge_global_registration: vec![],
         notify_user: None,
         state_dir: None,
         escalation_timeout: None,

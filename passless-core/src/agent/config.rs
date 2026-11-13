@@ -34,6 +34,16 @@ pub const MAX_ESCALATION_COOLDOWN_SECS: u64 = 86_400;
 pub const MAX_ESCALATION_TIMEOUT_SECS: u64 = 72_000;
 /// Default `agents.state_dir` of a root (system unit) daemon.
 pub const SYSTEM_STATE_DIR: &str = "/var/lib/passless-agent";
+/// Default `max_wildcard_registrations`: wildcard registration grants one profile may hold
+/// (ADR 0014 amendment section 2.2 item 4).
+pub const DEFAULT_MAX_WILDCARD_REGISTRATIONS: u16 = 4;
+/// Upper bound for `max_wildcard_registrations`.
+pub const MAX_WILDCARD_REGISTRATIONS_LIMIT: u16 = 32;
+/// Default `wildcard_registration_prompts_per_day`: wildcard registration prompts per profile in
+/// any rolling 24 hours (ADR 0014 amendment section 2.2 item 5).
+pub const DEFAULT_WILDCARD_REGISTRATION_PROMPTS_PER_DAY: u16 = 3;
+/// Upper bound for `wildcard_registration_prompts_per_day`.
+pub const MAX_WILDCARD_REGISTRATION_PROMPTS_PER_DAY: u16 = 24;
 
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
 const MAX_OPERATIONS: u16 = 4096;
@@ -241,6 +251,30 @@ impl RuleAction {
 }
 
 impl fmt::Display for RuleAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An action the agent may ask for in advance (`pre_request_actions`; ADR 0014 amendment
+/// section 2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreRequestAction {
+    Authenticate,
+    Register,
+}
+
+impl PreRequestAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Authenticate => "authenticate",
+            Self::Register => "register",
+        }
+    }
+}
+
+impl fmt::Display for PreRequestAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -721,6 +755,21 @@ pub struct AgentProfileConfig {
     /// Profile default selection; a rule may override it, and the wildcard rule is always `single`.
     #[serde(default)]
     pub credential_selection: CredentialSelection,
+    /// Most wildcard registration grants (`kind = "registration"`, `rule = "*"`) this profile may
+    /// hold, 1 to 32 (default 4). At the cap a registration through the `*` rule is refused
+    /// without a prompt. Only meaningful with a `*` rule that has `register = "request"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wildcard_registrations: Option<u16>,
+    /// Registration prompts through the `*` rule per rolling 24 hours, 1 to 24 (default 3).
+    /// Beyond it such a registration is refused without a prompt. Only meaningful with a `*`
+    /// rule that has `register = "request"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wildcard_registration_prompts_per_day: Option<u16>,
+    /// Actions the agent may ask for in advance with `passless agent request-access` or the MCP
+    /// access tool (ADR 0014 amendment section 2.3). Default empty: pre-requests are off. Each
+    /// action must also resolve to `request` at the site for a pre-request to prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_request_actions: Vec<PreRequestAction>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<AgentStorageConfig>,
@@ -774,6 +823,12 @@ struct AgentProfileConfigRepr {
     max_granted_rules: u16,
     #[serde(default)]
     credential_selection: CredentialSelection,
+    #[serde(default)]
+    max_wildcard_registrations: Option<u16>,
+    #[serde(default)]
+    wildcard_registration_prompts_per_day: Option<u16>,
+    #[serde(default)]
+    pre_request_actions: Vec<PreRequestAction>,
     #[serde(default)]
     storage: Option<AgentStorageConfig>,
     #[serde(default)]
@@ -837,6 +892,9 @@ impl From<AgentProfileConfigRepr> for AgentProfileConfig {
             browser_scope: repr.browser_scope,
             max_granted_rules: repr.max_granted_rules,
             credential_selection: repr.credential_selection,
+            max_wildcard_registrations: repr.max_wildcard_registrations,
+            wildcard_registration_prompts_per_day: repr.wildcard_registration_prompts_per_day,
+            pre_request_actions: repr.pre_request_actions,
             storage: repr.storage,
             rules,
             device: repr.device,
@@ -894,7 +952,7 @@ impl AgentProfileConfig {
             &self.credential_selection,
             action,
             rp_id,
-            |_| false,
+            |_, _| false,
         )
     }
 
@@ -911,7 +969,7 @@ impl AgentProfileConfig {
             &self.credential_selection,
             action,
             rp_id,
-            |rp_id| grants.is_granted(profile_id, rp_id),
+            |rp_id, rule| grants.is_granted(profile_id, rp_id, rule),
         )
     }
 
@@ -929,6 +987,81 @@ impl AgentProfileConfig {
         self.rules
             .iter()
             .any(|rule| rule.authenticate != RuleAction::Deny)
+    }
+
+    /// Whether the `*` rule asks for registration at unlisted sites (`register = "request"`;
+    /// ADR 0014 amendment section 2.2).
+    pub fn has_wildcard_registration(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.is_wildcard() && rule.register == RuleAction::Request)
+    }
+
+    /// The `max_wildcard_registrations` in force (the default when unset).
+    pub fn effective_max_wildcard_registrations(&self) -> u16 {
+        self.max_wildcard_registrations
+            .unwrap_or(DEFAULT_MAX_WILDCARD_REGISTRATIONS)
+    }
+
+    /// The `wildcard_registration_prompts_per_day` in force (the default when unset).
+    pub fn effective_wildcard_registration_prompts_per_day(&self) -> u16 {
+        self.wildcard_registration_prompts_per_day
+            .unwrap_or(DEFAULT_WILDCARD_REGISTRATION_PROMPTS_PER_DAY)
+    }
+
+    /// Whether `action` is listed in `pre_request_actions`.
+    pub fn pre_request_allows(&self, action: PreRequestAction) -> bool {
+        self.pre_request_actions.contains(&action)
+    }
+
+    /// Advice about a valid configuration that probably does not do what the operator meant:
+    /// the wildcard registration keys set on a profile whose `*` rule never requests
+    /// registration have no effect. Logged by `validate`, reported by `passless config check`.
+    pub fn advisory_warnings(&self, profile_id: &ProfileId) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.has_wildcard_registration() {
+            for (key, set) in [
+                (
+                    "max_wildcard_registrations",
+                    self.max_wildcard_registrations.is_some(),
+                ),
+                (
+                    "wildcard_registration_prompts_per_day",
+                    self.wildcard_registration_prompts_per_day.is_some(),
+                ),
+            ] {
+                if set {
+                    warnings.push(format!(
+                        "agent profile '{}': {} has no effect without a `*` rule with \
+                         register = \"request\"",
+                        profile_id, key
+                    ));
+                }
+            }
+        }
+        for (action, has_request_rule) in [
+            (
+                PreRequestAction::Register,
+                self.rules
+                    .iter()
+                    .any(|rule| rule.register == RuleAction::Request),
+            ),
+            (
+                PreRequestAction::Authenticate,
+                self.rules
+                    .iter()
+                    .any(|rule| rule.authenticate == RuleAction::Request),
+            ),
+        ] {
+            if self.pre_request_allows(action) && !has_request_rule {
+                warnings.push(format!(
+                    "agent profile '{}': pre_request_actions lists \"{}\" but no rule has {} = \
+                     \"request\"; it has no effect",
+                    profile_id, action, action
+                ));
+            }
+        }
+        warnings
     }
 
     /// Deprecation warnings for legacy keys and vocabulary that are still accepted.
@@ -975,6 +1108,9 @@ impl AgentProfileConfig {
         for warning in self.deprecation_warnings(profile_id) {
             log::warn!("{}", warning);
         }
+        for warning in self.advisory_warnings(profile_id) {
+            log::warn!("{}", warning);
+        }
         if self.principal_user.is_empty() {
             return Err(Error::Config(format!(
                 "agent profile '{}': principal_user must not be empty",
@@ -992,6 +1128,31 @@ impl AgentProfileConfig {
                 "agent profile '{}': max_granted_rules must be between 1 and {}",
                 profile_id, MAX_GRANTED_RULES_LIMIT
             )));
+        }
+        if let Some(max) = self.max_wildcard_registrations
+            && (max == 0 || max > MAX_WILDCARD_REGISTRATIONS_LIMIT)
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': max_wildcard_registrations must be between 1 and {}",
+                profile_id, MAX_WILDCARD_REGISTRATIONS_LIMIT
+            )));
+        }
+        if let Some(per_day) = self.wildcard_registration_prompts_per_day
+            && (per_day == 0 || per_day > MAX_WILDCARD_REGISTRATION_PROMPTS_PER_DAY)
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': wildcard_registration_prompts_per_day must be between 1 and {}",
+                profile_id, MAX_WILDCARD_REGISTRATION_PROMPTS_PER_DAY
+            )));
+        }
+        let mut seen_pre_requests = std::collections::BTreeSet::new();
+        for action in &self.pre_request_actions {
+            if !seen_pre_requests.insert(*action) {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': pre_request_actions lists '{}' twice",
+                    profile_id, action
+                )));
+            }
         }
         if self.browser_scope == BrowserScope::Session {
             if self.max_concurrent_sessions == 0
@@ -1081,15 +1242,19 @@ impl AgentProfileConfig {
                     profile_id
                 )));
             }
-            if self.credential_refs.is_some() {
+            // Profile `credential_refs` may coexist with `*`: the pins constrain exact-rule
+            // matches only, and RPs matched by `*` use discovery (ADR 0014 amendment 2.1).
+            //
+            // Registration through `*` is only ever requested, never allowed: one human-approved
+            // registration at a time, behind `acknowledge_global_registration` (checked by
+            // `AgentConfig::validate`) and the cap, daily limit and cooldown (amendment 2.2).
+            // `register = "request"` with `authenticate = "deny"` is refused for every rule above.
+            if wildcard_rule.register == RuleAction::Allow {
                 return Err(Error::Config(format!(
-                    "agent profile '{}': wildcard RP scope '*' requires credential_refs to be omitted for dynamic credential discovery",
-                    profile_id
-                )));
-            }
-            if wildcard_rule.register != RuleAction::Deny {
-                return Err(Error::Config(format!(
-                    "agent profile '{}': wildcard RP scope '*' must have register = \"deny\" (a wildcard never permits or requests registration)",
+                    "agent profile '{}': wildcard RP scope '*' must not have register = \"allow\": \
+                     a wildcard never registers without a human; use register = \"request\" \
+                     (one approved registration at a time, acknowledged in \
+                     agents.acknowledge_global_registration) or \"deny\"",
                     profile_id
                 )));
             }
@@ -1189,6 +1354,13 @@ pub struct AgentConfig {
     /// Profile IDs for which the operator explicitly accepts writes to the human credential backend.
     #[serde(default)]
     pub acknowledge_same_user_registration: Vec<String>,
+
+    /// Profile IDs for which the operator explicitly accepts human-approved registration at sites
+    /// that have no exact rule, through a `*` rule with `register = "request"` (ADR 0014
+    /// amendment section 2.2). The profile must also be in `acknowledge_global_same_user` and
+    /// `acknowledge_same_user_registration`.
+    #[serde(default)]
+    pub acknowledge_global_registration: Vec<String>,
 
     /// Concurrency caps of the agent ceremony server (plan R11). Read when the daemon starts.
     #[serde(default)]
@@ -1320,6 +1492,7 @@ impl Default for AgentConfig {
             audit_path: None,
             acknowledge_global_same_user: Vec::new(),
             acknowledge_same_user_registration: Vec::new(),
+            acknowledge_global_registration: Vec::new(),
             limits: AgentRequestLimits::default(),
             notify_user: None,
             state_dir: None,
@@ -1619,6 +1792,7 @@ impl AgentConfig {
             .acknowledge_global_same_user
             .iter()
             .chain(self.acknowledge_same_user_registration.iter())
+            .chain(self.acknowledge_global_registration.iter())
         {
             if !self.profiles.contains_key(acknowledged) {
                 return Err(Error::Config(format!(
@@ -1663,7 +1837,26 @@ impl AgentConfig {
                 )));
             }
 
+            // Registration at unlisted sites is a third, separate risk (ADR 0014 amendment
+            // 2.2 item 1). `profile.validate` already restricts `*` to same-user profiles.
+            if profile.has_wildcard_registration()
+                && !self
+                    .acknowledge_global_registration
+                    .iter()
+                    .any(|ack| ack == name)
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': the `*` rule has register = \"request\", which lets the agent ask to create passkeys in the human credential store at sites that have no exact rule; this requires explicit operator acknowledgement; add '{}' to agents.acknowledge_global_registration",
+                    name, name,
+                )));
+            }
+
             validated_profiles.push((pid, profile));
+        }
+        // The profile-level advice was logged by `profile.validate`; a stale acknowledgement is
+        // config-level.
+        for warning in self.stale_registration_acknowledgements() {
+            log::warn!("{}", warning);
         }
 
         let mut all_roots: Vec<(String, PathBuf)> = Vec::new();
@@ -1734,6 +1927,45 @@ impl AgentConfig {
                     .map(|id| profile.deprecation_warnings(&id))
             })
             .flatten()
+            .collect()
+    }
+
+    /// Advice about a valid configuration (ADR 0014 amendment section 3): wildcard registration
+    /// keys without effect, and an `acknowledge_global_registration` entry whose profile has no
+    /// `*` rule with `register = "request"` (a stale acknowledgement). Reported by
+    /// `passless config check`; `validate` logs them.
+    pub fn advisory_warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<String> = self
+            .profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                ProfileId::new(name.as_str())
+                    .ok()
+                    .map(|id| profile.advisory_warnings(&id))
+            })
+            .flatten()
+            .collect();
+        warnings.extend(self.stale_registration_acknowledgements());
+        warnings
+    }
+
+    /// `acknowledge_global_registration` entries whose profile has no `*` rule with
+    /// `register = "request"`.
+    fn stale_registration_acknowledgements(&self) -> Vec<String> {
+        self.acknowledge_global_registration
+            .iter()
+            .filter(|acknowledged| {
+                self.profiles
+                    .get(acknowledged.as_str())
+                    .is_some_and(|profile| !profile.has_wildcard_registration())
+            })
+            .map(|acknowledged| {
+                format!(
+                    "agents.acknowledge_global_registration lists profile '{}', which has no `*` \
+                     rule with register = \"request\": the acknowledgement is stale",
+                    acknowledged
+                )
+            })
             .collect()
     }
 
@@ -2091,6 +2323,9 @@ mod tests {
 
     fn make_isolated_profile() -> AgentProfileConfig {
         AgentProfileConfig {
+            max_wildcard_registrations: None,
+            wildcard_registration_prompts_per_day: None,
+            pre_request_actions: Vec::new(),
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
@@ -2144,6 +2379,16 @@ mod tests {
         assert_eq!(profile.max_granted_rules, 64);
     }
 
+    /// A one-profile (`coding`) config acknowledged in `acknowledge_global_same_user`,
+    /// `acknowledge_same_user_registration` and `acknowledge_global_registration`, per flag.
+    fn agent_config_with(profile: AgentProfileConfig, acks: [bool; 3]) -> AgentConfig {
+        let mut config = agent_config(profile, acks[0], acks[1]);
+        if acks[2] {
+            config.acknowledge_global_registration = vec!["coding".to_string()];
+        }
+        config
+    }
+
     fn agent_config(
         profile: AgentProfileConfig,
         acknowledge_global: bool,
@@ -2152,6 +2397,7 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert("coding".to_string(), profile);
         AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2228,6 +2474,7 @@ product_id = 22136
             profiles.insert(name.to_string(), profile);
         }
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2401,6 +2648,9 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2427,6 +2677,7 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2454,6 +2705,9 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2480,6 +2734,7 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2527,6 +2782,7 @@ product_id = 2
     #[test]
     fn test_enabled_requires_audit_path() {
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2547,6 +2803,7 @@ product_id = 2
     #[test]
     fn test_disabled_does_not_require_audit_path() {
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2569,6 +2826,9 @@ product_id = 2
         profiles.insert(
             "myprofile".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2595,6 +2855,7 @@ product_id = 2
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2620,6 +2881,9 @@ product_id = 2
             profiles.insert(
                 name.to_string(),
                 AgentProfileConfig {
+                    max_wildcard_registrations: None,
+                    wildcard_registration_prompts_per_day: None,
+                    pre_request_actions: Vec::new(),
                     max_granted_rules: 64,
                     max_operations: 64,
                     max_concurrent_sessions: 1,
@@ -2747,6 +3011,9 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2773,6 +3040,7 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2810,6 +3078,9 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2836,6 +3107,7 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -2865,6 +3137,9 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2891,6 +3166,7 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -3217,6 +3493,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3245,6 +3524,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3271,6 +3553,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -3327,6 +3610,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3355,6 +3641,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3381,6 +3670,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -3406,6 +3696,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3432,6 +3725,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -4453,21 +4747,17 @@ authenticate = "request"
     }
 
     #[test]
-    fn wildcard_requires_register_deny_including_request() {
-        for register in [RuleAction::Allow, RuleAction::Request] {
-            let profile = same_user_profile(vec![rule("*", RuleAction::Allow, register)]);
-            let err = profile.validate(&pid("test")).unwrap_err().to_string();
-            assert!(
-                err.contains("register = \"deny\""),
-                "register = {register}: {err}"
-            );
-            // The acknowledgements do not lift the restriction.
-            let err = agent_config(profile, true, true)
-                .validate(None)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("register = \"deny\""), "{err}");
-        }
+    fn wildcard_register_allow_is_rejected_and_points_to_request() {
+        let profile = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Allow)]);
+        let err = profile.validate(&pid("test")).unwrap_err().to_string();
+        assert!(err.contains("must not have register = \"allow\""), "{err}");
+        assert!(err.contains("register = \"request\""), "{err}");
+        // No acknowledgement lifts it.
+        let err = agent_config_with(profile, [true, true, true])
+            .validate(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not have register = \"allow\""), "{err}");
     }
 
     #[test]
@@ -4500,11 +4790,43 @@ authenticate = "request"
     }
 
     #[test]
-    fn wildcard_forbids_credential_refs() {
-        let mut profile = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Deny)]);
-        profile.credential_refs = Some(vec![CredentialRef::with_default_domain(b"restricted")]);
+    fn wildcard_accepts_credential_refs() {
+        // Amendment change 1: the pins constrain exact rules only; `*` uses discovery.
+        let pinned = CredentialRef::with_default_domain(b"restricted");
+        let mut profile = same_user_profile(vec![
+            rule("*", RuleAction::Request, RuleAction::Deny),
+            rule("github.com", RuleAction::Allow, RuleAction::Deny),
+        ]);
+        profile.credential_refs = Some(vec![pinned.clone()]);
+        profile.validate(&pid("test")).unwrap();
+        agent_config_with(profile.clone(), [true, false, false])
+            .validate(None)
+            .unwrap();
+
+        // An empty pin list is valid too (every exact RP is pinned to nothing but what a
+        // registration grant adds).
+        profile.credential_refs = Some(vec![]);
+        profile.validate(&pid("test")).unwrap();
+
+        // `credential:<ref>` on an exact rule must still name a pinned credential.
+        let other = CredentialRef::with_default_domain(b"other");
+        profile.credential_refs = Some(vec![pinned.clone()]);
+        profile.rules[1].credential_selection = Some(CredentialSelection::Credential(other));
         let err = profile.validate(&pid("test")).unwrap_err().to_string();
-        assert!(err.contains("credential_refs to be omitted"), "{err}");
+        assert!(err.contains("must be included in credential_refs"), "{err}");
+        profile.rules[1].credential_selection = Some(CredentialSelection::Credential(pinned));
+        profile.validate(&pid("test")).unwrap();
+    }
+
+    #[test]
+    fn wildcard_in_isolated_profile_is_still_rejected_with_pins_or_registration() {
+        for register in [RuleAction::Deny, RuleAction::Request] {
+            let mut profile = make_isolated_profile();
+            profile.credential_refs = Some(vec![CredentialRef::with_default_domain(b"p")]);
+            profile.rules = vec![rule("*", RuleAction::Request, register)];
+            let err = profile.validate(&pid("test")).unwrap_err().to_string();
+            assert!(err.contains("only supported in same-user mode"), "{err}");
+        }
     }
 
     // ---- validation: register = request ----
@@ -4539,10 +4861,289 @@ authenticate = "request"
     }
 
     #[test]
-    fn register_request_rejected_on_wildcard() {
+    fn wildcard_register_request_requires_all_three_acknowledgements() {
         let profile = same_user_profile(vec![rule("*", RuleAction::Request, RuleAction::Request)]);
+        profile.validate(&pid("coding")).unwrap();
+
+        // Each missing acknowledgement fails startup with a message naming it.
+        for (acks, missing) in [
+            ([false, true, true], "acknowledge_global_same_user"),
+            ([true, false, true], "acknowledge_same_user_registration"),
+            ([true, true, false], "acknowledge_global_registration"),
+            ([false, false, false], "acknowledge_global_same_user"),
+        ] {
+            let err = agent_config_with(profile.clone(), acks)
+                .validate(None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(missing), "{acks:?}: {err}");
+            assert!(err.contains("'coding'"), "{acks:?}: {err}");
+        }
+        agent_config_with(profile.clone(), [true, true, true])
+            .validate(None)
+            .unwrap();
+
+        // `authenticate = "allow"` is accepted as well.
+        let allow = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Request)]);
+        agent_config_with(allow, [true, true, true])
+            .validate(None)
+            .unwrap();
+    }
+
+    #[test]
+    fn wildcard_register_request_needs_authenticate_and_single_selection() {
+        let profile = same_user_profile(vec![rule("*", RuleAction::Deny, RuleAction::Request)]);
         let err = profile.validate(&pid("test")).unwrap_err().to_string();
-        assert!(err.contains("register = \"deny\""), "{err}");
+        assert!(
+            err.contains("register = \"request\" with authenticate = \"deny\""),
+            "{err}"
+        );
+
+        let mut wildcard = rule("*", RuleAction::Request, RuleAction::Request);
+        wildcard.credential_selection = Some(CredentialSelection::Newest);
+        let err = same_user_profile(vec![wildcard.clone()])
+            .validate(&pid("test"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always selects with `single`"), "{err}");
+        wildcard.credential_selection = Some(CredentialSelection::Single);
+        same_user_profile(vec![wildcard])
+            .validate(&pid("test"))
+            .unwrap();
+    }
+
+    #[test]
+    fn global_registration_acknowledgement_rejects_unknown_profile() {
+        let mut config = agent_config_with(
+            same_user_profile(vec![rule("*", RuleAction::Request, RuleAction::Request)]),
+            [true, true, true],
+        );
+        config
+            .acknowledge_global_registration
+            .push("missing".to_string());
+        let err = config.validate(None).unwrap_err().to_string();
+        assert!(err.contains("unknown profile 'missing'"), "{err}");
+    }
+
+    #[test]
+    fn wildcard_registration_keys_are_bounded() {
+        let wildcard =
+            || same_user_profile(vec![rule("*", RuleAction::Request, RuleAction::Request)]);
+        for (max, ok) in [(0, false), (1, true), (4, true), (32, true), (33, false)] {
+            let mut profile = wildcard();
+            profile.max_wildcard_registrations = Some(max);
+            let result = profile.validate(&pid("test"));
+            assert_eq!(result.is_ok(), ok, "max_wildcard_registrations = {max}");
+            if let Err(err) = result {
+                assert!(
+                    err.to_string()
+                        .contains("max_wildcard_registrations must be between 1 and 32"),
+                    "{err}"
+                );
+            }
+        }
+        for (per_day, ok) in [(0, false), (1, true), (3, true), (24, true), (25, false)] {
+            let mut profile = wildcard();
+            profile.wildcard_registration_prompts_per_day = Some(per_day);
+            let result = profile.validate(&pid("test"));
+            assert_eq!(result.is_ok(), ok, "per_day = {per_day}");
+            if let Err(err) = result {
+                assert!(
+                    err.to_string()
+                        .contains("wildcard_registration_prompts_per_day must be between 1 and 24"),
+                    "{err}"
+                );
+            }
+        }
+        // Out of range is invalid even where the keys have no effect.
+        let mut exact_only = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Allow,
+            RuleAction::Deny,
+        )]);
+        exact_only.max_wildcard_registrations = Some(0);
+        assert!(exact_only.validate(&pid("test")).is_err());
+    }
+
+    #[test]
+    fn wildcard_registration_keys_default_and_parse() {
+        let profile = parse_profile("").unwrap();
+        assert_eq!(profile.max_wildcard_registrations, None);
+        assert_eq!(profile.effective_max_wildcard_registrations(), 4);
+        assert_eq!(profile.effective_wildcard_registration_prompts_per_day(), 3);
+        let profile = parse_profile(
+            "max_wildcard_registrations = 7\nwildcard_registration_prompts_per_day = 2\n",
+        )
+        .unwrap();
+        assert_eq!(profile.effective_max_wildcard_registrations(), 7);
+        assert_eq!(profile.effective_wildcard_registration_prompts_per_day(), 2);
+    }
+
+    #[test]
+    fn wildcard_registration_keys_without_effect_and_stale_acknowledgements_warn() {
+        let mut exact_only = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Allow,
+            RuleAction::Deny,
+        )]);
+        exact_only.max_wildcard_registrations = Some(2);
+        exact_only.wildcard_registration_prompts_per_day = Some(2);
+        let mut config = agent_config_with(exact_only, [false, false, true]);
+        // Valid: these are warnings, not errors.
+        config.validate(None).unwrap();
+        let warnings = config.advisory_warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("max_wildcard_registrations has no effect"));
+        assert!(warnings[1].contains("wildcard_registration_prompts_per_day has no effect"));
+        assert!(warnings[2].contains("acknowledgement is stale"));
+
+        // A `*` rule that only authenticates does not use the keys either.
+        config.profiles.get_mut("coding").unwrap().rules =
+            vec![rule("*", RuleAction::Request, RuleAction::Deny)];
+        config.acknowledge_global_same_user = vec!["coding".to_string()];
+        config.validate(None).unwrap();
+        assert_eq!(config.advisory_warnings().len(), 3);
+
+        // With a `*` registration rule, the keys and the acknowledgement are in use.
+        let mut wildcard =
+            same_user_profile(vec![rule("*", RuleAction::Request, RuleAction::Request)]);
+        wildcard.max_wildcard_registrations = Some(2);
+        let config = agent_config_with(wildcard, [true, true, true]);
+        config.validate(None).unwrap();
+        assert!(config.advisory_warnings().is_empty());
+    }
+
+    #[test]
+    fn pre_request_actions_default_empty_and_parse() {
+        let profile = parse_profile("").unwrap();
+        assert!(profile.pre_request_actions.is_empty());
+        assert!(!profile.pre_request_allows(PreRequestAction::Authenticate));
+        assert!(!profile.pre_request_allows(PreRequestAction::Register));
+
+        let profile =
+            parse_profile("pre_request_actions = [\"authenticate\", \"register\"]\n").unwrap();
+        assert_eq!(
+            profile.pre_request_actions,
+            vec![PreRequestAction::Authenticate, PreRequestAction::Register]
+        );
+        assert!(profile.pre_request_allows(PreRequestAction::Authenticate));
+        assert!(profile.pre_request_allows(PreRequestAction::Register));
+
+        let profile = parse_profile("pre_request_actions = [\"register\"]\n").unwrap();
+        assert!(!profile.pre_request_allows(PreRequestAction::Authenticate));
+        assert!(profile.pre_request_allows(PreRequestAction::Register));
+        assert_eq!(PreRequestAction::Authenticate.as_str(), "authenticate");
+        assert_eq!(PreRequestAction::Register.as_str(), "register");
+    }
+
+    #[test]
+    fn pre_request_actions_rejects_unknown_value() {
+        for value in ["[\"delete\"]", "[\"authenticate\", \"Register\"]", "[1]"] {
+            assert!(
+                parse_profile(&format!("pre_request_actions = {value}\n")).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_request_actions_rejects_duplicates() {
+        let mut profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Request,
+            RuleAction::Deny,
+        )]);
+        profile.pre_request_actions = vec![PreRequestAction::Authenticate];
+        profile.validate(&pid("test")).unwrap();
+        profile.pre_request_actions = vec![
+            PreRequestAction::Authenticate,
+            PreRequestAction::Register,
+            PreRequestAction::Authenticate,
+        ];
+        let err = profile.validate(&pid("test")).unwrap_err().to_string();
+        assert!(
+            err.contains("pre_request_actions lists 'authenticate' twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pre_request_actions_without_a_request_rule_warn() {
+        let mut profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Allow,
+            RuleAction::Deny,
+        )]);
+        assert!(profile.advisory_warnings(&pid("test")).is_empty());
+
+        profile.pre_request_actions =
+            vec![PreRequestAction::Authenticate, PreRequestAction::Register];
+        let warnings = profile.advisory_warnings(&pid("test"));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains(
+            "agent profile 'test': pre_request_actions lists \"register\" but no rule has register = \"request\"; it has no effect"
+        )));
+        assert!(warnings.iter().any(|w| w.contains(
+            "pre_request_actions lists \"authenticate\" but no rule has authenticate = \"request\"; it has no effect"
+        )));
+        // Valid: advice only.
+        profile.validate(&pid("test")).unwrap();
+
+        // A `request` rule for the action silences its warning (exact or `*`).
+        profile.rules = vec![
+            rule("example.com", RuleAction::Allow, RuleAction::Request),
+            rule("*", RuleAction::Request, RuleAction::Deny),
+        ];
+        assert!(profile.advisory_warnings(&pid("test")).is_empty());
+
+        // Only one of the two is satisfied.
+        profile.rules = vec![rule("example.com", RuleAction::Request, RuleAction::Deny)];
+        let warnings = profile.advisory_warnings(&pid("test"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("lists \"register\""));
+    }
+
+    #[test]
+    fn amendment_example_configuration_validates() {
+        // ADR 0014 amendment section 3, without the Phase 2 key.
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit-amendment"
+acknowledge_global_same_user = ["coding"]
+acknowledge_same_user_registration = ["coding"]
+acknowledge_global_registration = ["coding"]
+
+[profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+credential_selection = "single"
+credential_refs = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+max_wildcard_registrations = 4
+wildcard_registration_prompts_per_day = 3
+
+[[profiles.coding.rules]]
+rp_id = "github.com"
+authenticate = "allow"
+register = "request"
+
+[[profiles.coding.rules]]
+rp_id = "*"
+authenticate = "request"
+register = "request"
+"#;
+        let config: AgentConfig = toml::from_str(raw).unwrap();
+        config.validate(None).unwrap();
+        assert!(config.advisory_warnings().is_empty());
+        let profile = &config.profiles["coding"];
+        assert!(profile.has_wildcard_registration());
+        // Without the new acknowledgement the same configuration is refused.
+        let mut unacknowledged = config.clone();
+        unacknowledged.acknowledge_global_registration.clear();
+        let err = unacknowledged.validate(None).unwrap_err().to_string();
+        assert!(
+            err.contains("agents.acknowledge_global_registration"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -43,6 +43,7 @@ fn request(client: McpInstallClient, yes: bool) -> InstallRequest<'static> {
         yes,
         skill: false,
         passless_path: None,
+        with_access_tool: false,
     }
 }
 
@@ -322,7 +323,14 @@ fn a_jsonc_file_is_refused_with_yes_and_left_alone() {
 
 #[test]
 fn the_report_says_what_changes_and_what_is_dropped() {
-    let plan = mcp_clients::plan(McpInstallClient::ClaudeCode, CALYPSO, PASSLESS, "agent").unwrap();
+    let plan = mcp_clients::plan(
+        McpInstallClient::ClaudeCode,
+        CALYPSO,
+        PASSLESS,
+        "agent",
+        false,
+    )
+    .unwrap();
     let text = report(
         Path::new("/p/.mcp.json"),
         McpInstallClient::ClaudeCode,
@@ -343,8 +351,14 @@ fn the_report_says_what_changes_and_what_is_dropped() {
     assert!(text.contains("note: dropped `--browser`"), "{text}");
 
     let wrapped = plan.new_text.unwrap();
-    let plan =
-        mcp_clients::plan(McpInstallClient::ClaudeCode, &wrapped, PASSLESS, "agent").unwrap();
+    let plan = mcp_clients::plan(
+        McpInstallClient::ClaudeCode,
+        &wrapped,
+        PASSLESS,
+        "agent",
+        false,
+    )
+    .unwrap();
     let text = report(
         Path::new("/p/.mcp.json"),
         McpInstallClient::ClaudeCode,

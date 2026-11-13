@@ -36,6 +36,12 @@
 //!   instance (the daemon is gone, or another daemon process answers), an expired one (once per
 //!   expiry, and not a renewal that expired before its first use), and one the wrapper revoked
 //!   itself (its broker did not answer in time, or broke the protocol);
+//! - the broker also answers one more request since protocol 2, "request access" (ADR 0014
+//!   amendment section 2.3), which it maps one to one to `PrincipalRequest::RequestAccess` on its
+//!   own session. The session owns the browser, so a `register` approval binds to the right
+//!   ceremonies. The wrapper sends it only for the opt-in `--with-access-tool` relay
+//!   ([`super::mcp_relay`]), which is otherwise absent: without the flag the Playwright MCP server
+//!   inherits the client's stdio and the broker never sees that request;
 //! - this applies only when the session runs as the wrapper's own Unix user. A profile whose
 //!   sessions run as another user needs the MCP server to run as that user, inside the session, so
 //!   the wrapper falls back to the in-session server, which does not survive a restart.
@@ -49,7 +55,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
-use passless_core::agent::protocol::{AdminRequest, AdminResponse, ErrorCode};
+use passless_core::agent::protocol::{
+    AccessRequestStatus, AdminRequest, AdminResponse, ErrorCode, GrantAction, ProtocolError,
+    RecommendedAction,
+};
 use passless_core::agent::{
     PrincipalRequest, PrincipalResponse, PrincipalSessionId, ProfileId, SessionEndReason,
 };
@@ -62,10 +71,13 @@ use crate::agent::client::{
     AdminClient, ClientError, DaemonInstance, PrincipalClient, resolve_runtime_base,
 };
 
+use super::mcp_relay::{AccessCall, AccessTool, ToolResult};
+
 /// The hidden subcommand the wrapper launches as its principal session.
 const BROKER_SUBCOMMAND: &str = "mcp-session-broker";
 /// The broker protocol (one JSON object per line). A broker of another version is refused.
-const BROKER_PROTOCOL: u32 = 1;
+/// Version 2 adds `RequestAccess`.
+const BROKER_PROTOCOL: u32 = 2;
 /// Bounds on admin requests: a launch, and the cheap ones (probe, revoke).
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -73,6 +85,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long one "ensure the browser" may take: a launch waits up to 30 s for the extension.
 const ENSURE_TIMEOUT: Duration = Duration::from_secs(90);
+/// What a "request access" may take beyond its own `wait_ms`: the daemon answers within it, so
+/// this only bounds a broker that stopped answering.
+const ACCESS_MARGIN: Duration = Duration::from_secs(30);
 /// How long a session lost while its daemon still answers may stay undecided: a daemon that is
 /// shutting down stops answering within this time; one that keeps answering ended the session.
 const LOST_GRACE: Duration = Duration::from_secs(10);
@@ -85,9 +100,18 @@ const MAX_LINE: u64 = 64 * 1024;
 
 /// What the wrapper asks the broker.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum BrokerRequest {
     Ensure,
+    /// Protocol 2: `PrincipalRequest::RequestAccess` on the broker's own session.
+    RequestAccess {
+        rp_id: String,
+        action: GrantAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
 }
 
 /// What the broker says, one line each.
@@ -98,6 +122,8 @@ enum BrokerMessage {
     Hello { protocol: u32, uid: u32, gid: u32 },
     /// The managed browser's CDP websocket endpoint.
     Ensured { endpoint: String },
+    /// The daemon's answer to a `RequestAccess` (every state is a normal answer).
+    AccessRequest { status: AccessRequestStatus },
     /// The daemon refused or failed. `session_gone`: the session itself is no longer valid, and
     /// the broker exits after saying so.
     Failed { message: String, session_gone: bool },
@@ -138,7 +164,15 @@ pub fn serve_broker(profile: &str, url: Option<&str>) -> Result<()> {
         &mut std::io::stdout().lock(),
         identity,
         &|| unsafe { libc::getppid() } == parent,
-        &mut || broker_ensure(profile, url),
+        &mut |request| match request {
+            BrokerRequest::Ensure => broker_ensure(profile, url),
+            BrokerRequest::RequestAccess {
+                rp_id,
+                action,
+                note,
+                wait_ms,
+            } => broker_request_access(profile, rp_id, action, note, wait_ms),
+        },
     )
 }
 
@@ -149,7 +183,7 @@ fn serve<R: Read + AsRawFd, W: Write>(
     output: &mut W,
     (uid, gid): (u32, u32),
     parented: &dyn Fn() -> bool,
-    ensure: &mut dyn FnMut() -> BrokerMessage,
+    handle: &mut dyn FnMut(BrokerRequest) -> BrokerMessage,
 ) -> Result<()> {
     let io_error = |e: std::io::Error| Error::Other(format!("broker link: {e}"));
     write_message(
@@ -177,23 +211,19 @@ fn serve<R: Read + AsRawFd, W: Write>(
         };
         let request: BrokerRequest = serde_json::from_slice(&line)
             .map_err(|e| Error::Other(format!("broker link: malformed request: {e}")))?;
-        match request {
-            BrokerRequest::Ensure => {
-                let reply = ensure();
-                let gone = matches!(
-                    reply,
-                    BrokerMessage::Failed {
-                        session_gone: true,
-                        ..
-                    }
-                );
-                write_message(output, &reply).map_err(io_error)?;
-                if gone {
-                    return Err(Error::Other(
-                        "the principal session is no longer valid".to_string(),
-                    ));
-                }
+        let reply = handle(request);
+        let gone = matches!(
+            reply,
+            BrokerMessage::Failed {
+                session_gone: true,
+                ..
             }
+        );
+        write_message(output, &reply).map_err(io_error)?;
+        if gone {
+            return Err(Error::Other(
+                "the principal session is no longer valid".to_string(),
+            ));
         }
     }
 }
@@ -220,6 +250,40 @@ fn broker_ensure(profile: &str, url: Option<&str>) -> BrokerMessage {
         },
         Ok(_) => BrokerMessage::Failed {
             message: "agent returned an unexpected EnsureBrowser response".to_string(),
+            session_gone: false,
+        },
+        Err(e) => BrokerMessage::Failed {
+            session_gone: session_gone(&e),
+            message: e.to_string(),
+        },
+    }
+}
+
+/// `RequestAccess` over this session's capability (ADR 0014 amendment section 2.3): the session
+/// that owns the browser asks, so a `register` approval binds to this browser's ceremonies. The
+/// daemon answers within `wait_ms`; every state is an answer, a refusal of the request itself
+/// (malformed, unauthorized) a `Failed`.
+fn broker_request_access(
+    profile: &str,
+    rp_id: String,
+    action: GrantAction,
+    note: Option<String>,
+    wait_ms: Option<u64>,
+) -> BrokerMessage {
+    let result = resolve_runtime_base()
+        .and_then(|base| PrincipalClient::connect_launched(&base, profile))
+        .and_then(|mut client| {
+            client.request(PrincipalRequest::RequestAccess {
+                rp_id,
+                action,
+                note,
+                wait_ms,
+            })
+        });
+    match result {
+        Ok(PrincipalResponse::AccessRequest(status)) => BrokerMessage::AccessRequest { status },
+        Ok(_) => BrokerMessage::Failed {
+            message: "agent returned an unexpected RequestAccess response".to_string(),
             session_gone: false,
         },
         Err(e) => BrokerMessage::Failed {
@@ -299,6 +363,8 @@ pub(crate) enum LinkLost {
 #[derive(Debug, PartialEq)]
 pub(crate) enum BrokerReply {
     Endpoint(String),
+    /// The daemon's answer to a request for access.
+    Access(AccessRequestStatus),
     /// The daemon refused or failed; the session is fine.
     Refused(String),
     /// The session is no longer valid (the broker exits).
@@ -318,6 +384,8 @@ pub(crate) trait Daemon {
 
 pub(crate) trait Link {
     fn ensure(&mut self) -> std::result::Result<BrokerReply, LinkLost>;
+    /// Ask the broker's session for access (`RequestAccess`); may wait for the human.
+    fn request_access(&mut self, call: &AccessCall) -> std::result::Result<BrokerReply, LinkLost>;
     /// Without blocking: whether the broker went away (`Closed`) or spoke unasked (`Broken`)
     /// since the last request.
     fn lost(&mut self) -> Option<LinkLost>;
@@ -394,6 +462,32 @@ impl<D: Daemon> SessionKeeper<D> {
     /// the session if its daemon went away or it expired. At most one launch per call, and never
     /// blocks beyond the admin and link timeouts.
     pub(crate) fn ensure(&mut self) -> std::result::Result<String, EnsureError> {
+        match self.dispatch(&mut |link| link.ensure())? {
+            BrokerReply::Endpoint(endpoint) => Ok(endpoint),
+            _ => Err(unexpected_reply()),
+        }
+    }
+
+    /// Ask the current session's daemon for access (`RequestAccess`), after re-establishing the
+    /// session like [`Self::ensure`] does. Blocks for the human's decision, up to the call's
+    /// `wait_ms` plus [`ACCESS_MARGIN`]; the keeper is held meanwhile, so the wrapper's other
+    /// requests to its broker queue behind it.
+    pub(crate) fn request_access(
+        &mut self,
+        call: &AccessCall,
+    ) -> std::result::Result<AccessRequestStatus, EnsureError> {
+        match self.dispatch(&mut |link| link.request_access(call))? {
+            BrokerReply::Access(status) => Ok(status),
+            _ => Err(unexpected_reply()),
+        }
+    }
+
+    /// Run `request` on the current session's link; a lost link is resolved (and the session
+    /// re-established when the daemon's answers say so) exactly as for an ensure.
+    fn dispatch(
+        &mut self,
+        request: &mut dyn FnMut(&mut D::Link) -> std::result::Result<BrokerReply, LinkLost>,
+    ) -> std::result::Result<BrokerReply, EnsureError> {
         let mut launched = false;
         // Enough for: a lost link, its resolution, a launch, the request on the new link and,
         // if that one is lost too, its resolution (the single launch bounds the rest).
@@ -404,16 +498,18 @@ impl<D: Daemon> SessionKeeper<D> {
                     instance,
                     session,
                     mut origin,
-                } => match link.ensure() {
-                    Ok(BrokerReply::Endpoint(endpoint)) => {
-                        origin.served = true;
+                } => match request(&mut link) {
+                    Ok(reply @ (BrokerReply::Endpoint(_) | BrokerReply::Access(_))) => {
+                        if matches!(reply, BrokerReply::Endpoint(_)) {
+                            origin.served = true;
+                        }
                         self.state = State::Live {
                             link,
                             instance,
                             session,
                             origin,
                         };
-                        return Ok(endpoint);
+                        return Ok(reply);
                     }
                     Ok(BrokerReply::Refused(message)) => {
                         self.state = State::Live {
@@ -666,6 +762,13 @@ fn describe(reason: SessionEndReason) -> &'static str {
     }
 }
 
+fn unexpected_reply() -> EnsureError {
+    EnsureError::new(
+        "protocol",
+        "the broker answered a request with a reply of another kind",
+    )
+}
+
 fn unavailable(detail: &str) -> EnsureError {
     EnsureError::new(
         "daemon_unreachable",
@@ -760,27 +863,18 @@ impl Daemon for AdminDaemon {
             .map_err(|_| LinkLost::Broken)
             .and_then(|mut link| link.hello(HELLO_TIMEOUT).map(|hello| (link, hello)));
         match hello {
-            Ok((link, (BROKER_PROTOCOL, uid, gid))) if (uid, gid) == own_ids() => Ok(Launched {
-                link,
-                instance,
-                session,
-            }),
-            Ok((link, (BROKER_PROTOCOL, uid, gid))) => {
-                drop(link);
-                let _ = self.revoke(&session);
-                Err(LaunchError::ForeignUser { uid, gid })
-            }
-            Ok((link, (protocol, _, _))) => {
-                drop(link);
-                let _ = self.revoke(&session);
-                Err(LaunchError::Refused {
-                    message: format!(
-                        "the principal session speaks broker protocol {protocol}, this MCP \
-                         server {BROKER_PROTOCOL} (passless was upgraded): restart the MCP server"
-                    ),
-                    fatal: true,
-                })
-            }
+            Ok((link, hello)) => match check_hello(hello, own_ids()) {
+                Ok(()) => Ok(Launched {
+                    link,
+                    instance,
+                    session,
+                }),
+                Err(refusal) => {
+                    drop(link);
+                    let _ = self.revoke(&session);
+                    Err(refusal)
+                }
+            },
             Err(_) => {
                 let _ = self.revoke(&session);
                 Err(LaunchError::Refused {
@@ -868,20 +962,52 @@ impl BrokerLink {
     }
 }
 
+impl BrokerLink {
+    /// Send one request line and read the broker's one answer line within `timeout`.
+    fn exchange(
+        &mut self,
+        request: &BrokerRequest,
+        timeout: Duration,
+    ) -> std::result::Result<BrokerMessage, LinkLost> {
+        let mut line = serde_json::to_vec(request).map_err(|_| LinkLost::Broken)?;
+        line.push(b'\n');
+        self.writer.write_all(&line).map_err(|e| lost_by(&e))?;
+        self.receive(timeout)
+    }
+}
+
 impl Link for BrokerLink {
     fn ensure(&mut self) -> std::result::Result<BrokerReply, LinkLost> {
-        let mut request =
-            serde_json::to_vec(&BrokerRequest::Ensure).map_err(|_| LinkLost::Broken)?;
-        request.push(b'\n');
-        self.writer.write_all(&request).map_err(|e| lost_by(&e))?;
-        match self.receive(self.ensure_timeout)? {
+        match self.exchange(&BrokerRequest::Ensure, self.ensure_timeout)? {
             BrokerMessage::Ensured { endpoint } => Ok(BrokerReply::Endpoint(endpoint)),
             BrokerMessage::Failed {
                 message,
                 session_gone: true,
             } => Ok(BrokerReply::SessionGone(message)),
             BrokerMessage::Failed { message, .. } => Ok(BrokerReply::Refused(message)),
-            BrokerMessage::Hello { .. } => Err(LinkLost::Broken),
+            // An answer of the other kind, or a second hello, is not the protocol.
+            BrokerMessage::Hello { .. } | BrokerMessage::AccessRequest { .. } => {
+                Err(LinkLost::Broken)
+            }
+        }
+    }
+
+    fn request_access(&mut self, call: &AccessCall) -> std::result::Result<BrokerReply, LinkLost> {
+        let request = BrokerRequest::RequestAccess {
+            rp_id: call.rp_id.clone(),
+            action: call.action.clone(),
+            note: call.note.clone(),
+            wait_ms: Some(call.wait_ms),
+        };
+        let timeout = Duration::from_millis(call.wait_ms) + ACCESS_MARGIN;
+        match self.exchange(&request, timeout)? {
+            BrokerMessage::AccessRequest { status } => Ok(BrokerReply::Access(status)),
+            BrokerMessage::Failed {
+                message,
+                session_gone: true,
+            } => Ok(BrokerReply::SessionGone(message)),
+            BrokerMessage::Failed { message, .. } => Ok(BrokerReply::Refused(message)),
+            BrokerMessage::Hello { .. } | BrokerMessage::Ensured { .. } => Err(LinkLost::Broken),
         }
     }
 
@@ -914,6 +1040,29 @@ impl Link for BrokerLink {
     }
 }
 
+/// Whether a broker's hello (protocol, uid, gid) is one this wrapper can use: its own protocol,
+/// and the wrapper's own Unix user. A broker of another protocol (passless was upgraded under a
+/// running MCP server, in either direction) is refused for good: restarting the MCP server is the
+/// fix.
+fn check_hello(
+    (protocol, uid, gid): (u32, u32, u32),
+    own: (u32, u32),
+) -> std::result::Result<(), LaunchError> {
+    if protocol != BROKER_PROTOCOL {
+        return Err(LaunchError::Refused {
+            message: format!(
+                "the principal session speaks broker protocol {protocol}, this MCP server \
+                 {BROKER_PROTOCOL} (passless was upgraded): restart the MCP server"
+            ),
+            fatal: true,
+        });
+    }
+    if (uid, gid) != own {
+        return Err(LaunchError::ForeignUser { uid, gid });
+    }
+    Ok(())
+}
+
 /// A closed socket is a gone broker; anything else (a timeout, bad data) is a broken one.
 fn lost_by(error: &std::io::Error) -> LinkLost {
     match error.kind() {
@@ -935,6 +1084,7 @@ pub(super) fn run_playwright(
     profile: &str,
     url: Option<&str>,
     command: &[PathBuf],
+    with_access_tool: bool,
 ) -> Result<Option<()>> {
     let executable = super::playwright_mcp::check_command(command)?;
     let daemon = AdminDaemon {
@@ -968,9 +1118,29 @@ pub(super) fn run_playwright(
         &token,
         false,
     );
-    let result = supervise(child_command, executable, &keeper);
+    // The opt-in relay (`--with-access-tool`): the server's stdio goes through it; without the
+    // flag the server inherits the client's.
+    let tool: Option<Arc<dyn AccessTool>> = with_access_tool.then(|| {
+        Arc::new(KeeperTool {
+            keeper: Arc::clone(&keeper),
+        }) as Arc<dyn AccessTool>
+    });
+    let result = supervise(child_command, executable, &keeper, tool);
     drop(bootstrap);
     result.map(Some)
+}
+
+/// `passless_request_access` through the wrapper's own principal session (its broker).
+struct KeeperTool {
+    keeper: Arc<Mutex<SessionKeeper<AdminDaemon>>>,
+}
+
+impl AccessTool for KeeperTool {
+    fn call(&self, call: AccessCall) -> ToolResult {
+        lock(&self.keeper).request_access(&call).map_err(|e| {
+            ProtocolError::new(ErrorCode::Internal, e.message, RecommendedAction::Retry)
+        })
+    }
 }
 
 /// This executable, by the path it was started from: after an upgrade replaced the file, a new
@@ -1006,6 +1176,7 @@ fn supervise<D: Daemon>(
     mut child_command: Command,
     executable: &Path,
     keeper: &Mutex<SessionKeeper<D>>,
+    relay: Option<Arc<dyn AccessTool>>,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
@@ -1013,7 +1184,12 @@ fn supervise<D: Daemon>(
             .map_err(|e| Error::Other(format!("failed to register a signal handler: {e}")))?;
     }
     let parent = unsafe { libc::getppid() };
-    let mut child = child_command.spawn().map_err(|e| {
+    let spawned = match relay {
+        Some(tool) => super::mcp_relay::spawn_relayed(&mut child_command, tool)
+            .map(|(child, handle)| (child, Some(handle))),
+        None => child_command.spawn().map(|child| (child, None)),
+    };
+    let (mut child, relay) = spawned.map_err(|e| {
         Error::Other(format!(
             "failed to start Playwright MCP executable '{}': {e}",
             executable.display()
@@ -1024,6 +1200,10 @@ fn supervise<D: Daemon>(
         match child.try_wait() {
             Ok(Some(status)) => {
                 shutdown(keeper, false);
+                // The server's last output still reaches the client.
+                if let Some(relay) = relay {
+                    relay.finish();
+                }
                 return super::playwright_mcp::exit_result("Playwright MCP", status);
             }
             Ok(None) => {}
@@ -1186,6 +1366,28 @@ mod tests {
                     "ws://127.0.0.1:9/devtools/browser/{}",
                     self.session
                 )))
+            })
+        }
+
+        fn request_access(
+            &mut self,
+            call: &AccessCall,
+        ) -> std::result::Result<BrokerReply, LinkLost> {
+            lock(&self.journal)
+                .calls
+                .push(format!("access@{}:{}", self.session, call.rp_id));
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(LinkLost::Closed);
+            }
+            self.replies.pop_front().unwrap_or_else(|| {
+                Ok(BrokerReply::Access(AccessRequestStatus {
+                    state: passless_core::agent::protocol::AccessRequestState::Approved,
+                    rp_id: call.rp_id.clone(),
+                    action: call.action.clone(),
+                    expires_in_secs: None,
+                    retry_after_secs: None,
+                    message: format!("approved through session {}", self.session),
+                }))
             })
         }
 
@@ -1721,12 +1923,12 @@ mod tests {
 
     /// A broker on one end of a socketpair, the real link on the other.
     fn broker_pair(
-        mut ensure: impl FnMut() -> BrokerMessage + Send + 'static,
+        mut handle_request: impl FnMut(BrokerRequest) -> BrokerMessage + Send + 'static,
     ) -> (BrokerLink, std::thread::JoinHandle<Result<()>>) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let mut output = theirs.try_clone().unwrap();
-            serve(theirs, &mut output, (7, 8), &|| true, &mut ensure)
+            serve(theirs, &mut output, (7, 8), &|| true, &mut handle_request)
         });
         (
             BrokerLink::new(ours, Duration::from_secs(5)).unwrap(),
@@ -1745,7 +1947,7 @@ mod tests {
                 endpoint: "ws://127.0.0.1:9/devtools/browser/x".into(),
             },
         ];
-        let (mut link, broker) = broker_pair(move || answers.pop().unwrap());
+        let (mut link, broker) = broker_pair(move |_| answers.pop().unwrap());
         assert_eq!(
             link.hello(Duration::from_secs(5)),
             Ok((BROKER_PROTOCOL, 7, 8))
@@ -1768,7 +1970,7 @@ mod tests {
 
     #[test]
     fn a_broker_whose_session_is_gone_says_so_and_exits() {
-        let (mut link, broker) = broker_pair(|| BrokerMessage::Failed {
+        let (mut link, broker) = broker_pair(|_| BrokerMessage::Failed {
             message: "the passless daemon is not running".into(),
             session_gone: true,
         });
@@ -1780,7 +1982,13 @@ mod tests {
             ))
         );
         assert!(broker.join().unwrap().is_err());
-        // Its exit is the link's EOF, seen without a request.
+        // Its exit is the link's EOF, seen without a request. (A process forked by another test
+        // at this very moment may hold the broker's end of the socket until its exec: wait it
+        // out.)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while link.lost().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(link.lost(), Some(LinkLost::Closed));
         assert_eq!(link.ensure(), Err(LinkLost::Closed));
     }
@@ -1817,7 +2025,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let mut output = theirs.try_clone().unwrap();
-            serve(theirs, &mut output, (1, 1), &|| true, &mut || {
+            serve(theirs, &mut output, (1, 1), &|| true, &mut |_| {
                 unreachable!("no request is valid")
             })
         });
@@ -1837,13 +2045,194 @@ mod tests {
             &mut output,
             (1, 1),
             &|| false,
-            &mut || unreachable!(),
+            &mut |_| unreachable!(),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("daemon that launched"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(3));
         drop(ours);
+    }
+
+    fn access_call(rp_id: &str) -> AccessCall {
+        AccessCall {
+            rp_id: rp_id.into(),
+            action: GrantAction::Register,
+            note: Some("why".into()),
+            wait_ms: 5_000,
+        }
+    }
+
+    fn access_status(
+        state: passless_core::agent::protocol::AccessRequestState,
+    ) -> AccessRequestStatus {
+        AccessRequestStatus {
+            state,
+            rp_id: "example.org".into(),
+            action: GrantAction::Register,
+            expires_in_secs: Some(597),
+            retry_after_secs: None,
+            message: "m".into(),
+        }
+    }
+
+    /// Broker protocol 2: a request for access crosses the link as one line each way and maps to
+    /// the same `PrincipalRequest` fields; every state is an answer, a refusal is not.
+    #[test]
+    fn a_request_for_access_crosses_the_link_and_every_state_is_an_answer() {
+        use passless_core::agent::protocol::AccessRequestState;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_broker = Arc::clone(&seen);
+        let mut answers = vec![
+            BrokerMessage::Failed {
+                message: "malformed".into(),
+                session_gone: false,
+            },
+            BrokerMessage::AccessRequest {
+                status: access_status(AccessRequestState::Pending),
+            },
+            BrokerMessage::AccessRequest {
+                status: access_status(AccessRequestState::Approved),
+            },
+        ];
+        let (mut link, broker) = broker_pair(move |request| {
+            lock(&seen_by_broker).push(request);
+            answers.pop().unwrap()
+        });
+        link.hello(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            link.request_access(&access_call("example.org")),
+            Ok(BrokerReply::Access(access_status(
+                AccessRequestState::Approved
+            )))
+        );
+        assert_eq!(
+            link.request_access(&access_call("example.org")),
+            Ok(BrokerReply::Access(access_status(
+                AccessRequestState::Pending
+            )))
+        );
+        assert_eq!(
+            link.request_access(&access_call("example.org")),
+            Ok(BrokerReply::Refused("malformed".into()))
+        );
+        // The broker got the call's fields, with the wait in milliseconds, and the same link
+        // still serves an ensure.
+        assert_eq!(
+            lock(&seen)[0],
+            BrokerRequest::RequestAccess {
+                rp_id: "example.org".into(),
+                action: GrantAction::Register,
+                note: Some("why".into()),
+                wait_ms: Some(5_000),
+            }
+        );
+        drop(link);
+        broker.join().unwrap().unwrap();
+    }
+
+    /// The wire form of the new request, and that a version 1 wrapper's `"ensure"` is unchanged.
+    #[test]
+    fn the_broker_requests_have_a_stable_wire_form() {
+        assert_eq!(
+            serde_json::to_string(&BrokerRequest::Ensure).unwrap(),
+            r#""ensure""#
+        );
+        let request = BrokerRequest::RequestAccess {
+            rp_id: "example.org".into(),
+            action: GrantAction::Authenticate,
+            note: None,
+            wait_ms: Some(0),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"request_access":{"rp_id":"example.org","action":"authenticate","wait_ms":0}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<BrokerRequest>(&json).unwrap(),
+            request
+        );
+        for bad in [
+            r#"{"request_access":{"rp_id":"a.b","action":"authenticate","extra":1}}"#,
+            r#"{"request_access":{"action":"authenticate"}}"#,
+            r#"{"exec":{}}"#,
+        ] {
+            assert!(serde_json::from_str::<BrokerRequest>(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A broker of protocol 1 (an older passless under a running MCP server, or the reverse) is
+    /// refused for good with a message that says what to do; so is a foreign Unix user.
+    #[test]
+    fn a_broker_of_another_protocol_is_refused_cleanly() {
+        assert_eq!(check_hello((BROKER_PROTOCOL, 5, 6), (5, 6)), Ok(()));
+        let Err(LaunchError::Refused { message, fatal }) = check_hello((1, 5, 6), (5, 6)) else {
+            panic!("a protocol 1 broker is refused");
+        };
+        assert!(fatal);
+        assert!(message.contains("broker protocol 1"), "{message}");
+        assert!(message.contains("restart the MCP server"), "{message}");
+        assert!(matches!(
+            check_hello((BROKER_PROTOCOL + 1, 5, 6), (5, 6)),
+            Err(LaunchError::Refused { fatal: true, .. })
+        ));
+        assert_eq!(
+            check_hello((BROKER_PROTOCOL, 7, 8), (5, 6)),
+            Err(LaunchError::ForeignUser { uid: 7, gid: 8 })
+        );
+        // A hello of the old protocol is read as one: the wrapper learns the version, whatever
+        // else the line says.
+        let (mut link, broker) = broker_pair(|_| unreachable!());
+        link.hello(Duration::from_secs(5)).unwrap();
+        drop(link);
+        broker.join().unwrap().unwrap();
+    }
+
+    /// A request for access goes through the same session handling as an ensure: it uses the live
+    /// session, and a session that expired or whose daemon restarted is re-established by it.
+    #[test]
+    fn a_request_for_access_uses_and_re_establishes_the_session_like_an_ensure() {
+        use passless_core::agent::protocol::AccessRequestState;
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        let status = keeper.request_access(&access_call("example.org")).unwrap();
+        assert_eq!(status.state, AccessRequestState::Approved);
+        assert_eq!(status.message, "approved through session 1");
+        assert_eq!(keeper.state_name(), "live");
+        // It did not count as handing out an endpoint: `served` is for the renewal limit.
+        assert_eq!(calls_to(&journal, 1), 0, "no ensure was sent");
+
+        // The broker's daemon is replaced: the next request re-establishes the session.
+        broker_exits(&keeper, 1);
+        keeper.daemon.up = Some(B);
+        let status = keeper.request_access(&access_call("example.org")).unwrap();
+        assert_eq!(status.message, "approved through session 2");
+        assert_eq!(lock(&journal).launched, [1, 2]);
+
+        // A refusal keeps the session, and an ensure after it still works.
+        keeper.daemon.replies = VecDeque::new();
+        if let State::Live { link, .. } = &mut keeper.state {
+            link.replies
+                .push_back(Ok(BrokerReply::Refused("the daemon said no".into())));
+        }
+        let error = keeper
+            .request_access(&access_call("example.org"))
+            .unwrap_err();
+        assert_eq!(error.message, "the daemon said no");
+        assert_eq!(keeper.state_name(), "live");
+        assert!(keeper.ensure().is_ok());
+    }
+
+    #[test]
+    fn an_ensure_that_gets_an_access_answer_is_a_protocol_error() {
+        let (mut keeper, _journal) = keeper(LOST_GRACE);
+        if let State::Live { link, .. } = &mut keeper.state {
+            link.replies.push_back(Ok(BrokerReply::Access(access_status(
+                passless_core::agent::protocol::AccessRequestState::Approved,
+            ))));
+        }
+        let error = keeper.ensure().unwrap_err();
+        assert!(error.message.contains("another kind"), "{}", error.message);
     }
 
     #[test]

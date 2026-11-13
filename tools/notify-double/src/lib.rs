@@ -41,6 +41,9 @@ pub enum StepAction {
     Ignore,
     /// Emit `ActionInvoked` with this key, then `NotificationClosed` (dismissed).
     Invoke(String),
+    /// Invoke the notification's approving action: Passless's "Register once" on a registration
+    /// prompt, else "Allow always" (see [`resolve_approve_key`]).
+    Approve,
     /// Emit only `NotificationClosed` (dismissed).
     Close,
 }
@@ -71,8 +74,22 @@ fn parse_delay(s: &str) -> Result<u64, ScriptError> {
         .map_err(|_| ScriptError::InvalidDelay(s.to_string()))
 }
 
-/// The action key `approve` invokes: Passless's "Allow always" (ADR 0014 section 8.1).
+/// The action key `approve` invokes on a sign-in prompt: Passless's "Allow always" (ADR 0014
+/// section 8.1).
 pub const APPROVE_ACTION: &str = "allow_always";
+/// The action key `approve` invokes on a registration prompt: Passless's "Register once"
+/// (ADR 0014 amendment section 5.1).
+pub const REGISTER_ONCE_ACTION: &str = "register_once";
+
+/// The key `approve` emits for a notification with `actions`: its "Register once" key when it has
+/// one (a registration prompt), else its "Allow always" key ([`resolve_action_key`] for each).
+pub fn resolve_approve_key(actions: &[String]) -> String {
+    let register = resolve_action_key(REGISTER_ONCE_ACTION, actions);
+    if actions.iter().step_by(2).any(|key| *key == register) {
+        return register;
+    }
+    resolve_action_key(APPROVE_ACTION, actions)
+}
 
 /// Which notification server the double behaves like.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -126,8 +143,8 @@ pub fn resolve_action_key(key: &str, actions: &[String]) -> String {
 
 /// Parse a single script step.
 ///
-/// Grammar: `approve[:ms]` (invokes [`APPROVE_ACTION`]), `deny[:ms]`, `ignore`, `close[:ms]`,
-/// `invoke=<key>[:ms]`.
+/// Grammar: `approve[:ms]` (invokes the approving action, [`resolve_approve_key`]), `deny[:ms]`,
+/// `ignore`, `close[:ms]`, `invoke=<key>[:ms]` (exactly that key, also a mismatched one).
 pub fn parse_step(spec: &str) -> Result<Step, ScriptError> {
     let text = spec.trim();
     if text.is_empty() {
@@ -145,7 +162,7 @@ pub fn parse_step(spec: &str) -> Result<Step, ScriptError> {
         StepAction::Invoke(key.to_string())
     } else {
         match head {
-            "approve" => StepAction::Invoke(APPROVE_ACTION.to_string()),
+            "approve" => StepAction::Approve,
             "deny" => StepAction::Invoke("deny".to_string()),
             "close" => StepAction::Close,
             "ignore" if delay.is_none() => StepAction::Ignore,
@@ -329,7 +346,7 @@ mod tests {
     #[test]
     fn parses_basic_steps() {
         let s = parse_step("approve").unwrap();
-        assert_eq!(s.action, StepAction::Invoke("allow_always".into()));
+        assert_eq!(s.action, StepAction::Approve);
         assert_eq!(s.delay_ms, 0);
         let s = parse_step("deny:250").unwrap();
         assert_eq!(s.action, StepAction::Invoke("deny".into()));
@@ -348,6 +365,28 @@ mod tests {
         let s = parse_step("invoke=weird key:5").unwrap();
         assert_eq!(s.action, StepAction::Invoke("weird key".into()));
         assert_eq!(s.delay_ms, 5);
+    }
+
+    #[test]
+    fn approve_resolves_to_register_once_on_a_registration_prompt() {
+        let registration: Vec<String> =
+            ["register_once:ab12", "Register once", "deny:ab12", "Deny"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(resolve_approve_key(&registration), "register_once:ab12");
+        let sign_in: Vec<String> = ["allow_always:cd34", "Allow always", "deny:cd34", "Deny"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(resolve_approve_key(&sign_in), "allow_always:cd34");
+        // Without either key it falls back to the bare sign-in key, as before.
+        assert_eq!(resolve_approve_key(&[]), "allow_always");
+        // `invoke=` still sends exactly the key asked for, also a mismatched one.
+        assert_eq!(
+            resolve_action_key("allow_always", &registration),
+            "allow_always"
+        );
     }
 
     #[test]

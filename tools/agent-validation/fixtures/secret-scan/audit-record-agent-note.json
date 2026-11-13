@@ -1,0 +1,1 @@
+{"v":5,"kind":"escalation.requested","escalation_id":"esc-fixture","profile_id":"coding","action":"authenticate","rp_id":"example.org","origin":null,"rule":"exact","source":"pre_request","principal_session_id_hash":"0000000000000000000000000000000000000000000000000000000000000000","agent_note":"ghp_0123456789abcdefghijklmnopqrstuv0123"}

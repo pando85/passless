@@ -9,7 +9,8 @@ use passless_core::agent::protocol::GrantAction;
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
     GrantId, GrantSource, MatchedRule, NoGrantedRules, Policy, PolicyAction, PolicyDigest,
-    PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId, RuleAction, resolve_rules,
+    PolicyGenerationId, PolicyParams, PreRequestAction, PrincipalSessionId, ProfileId, RuleAction,
+    RuleIdentity, resolve_rules,
 };
 
 use super::audit::AuditGate;
@@ -25,7 +26,12 @@ pub struct PolicySnapshot {
     pub digest: PolicyDigest,
     pub mode: AgentMode,
     pub normalized_rp_ids: Vec<String>,
+    /// Profile `credential_refs` (empty when unset; see [`Self::credential_refs_configured`]).
     pub credential_refs: Vec<CredentialRef>,
+    /// Profile `credential_refs` is set: exact-rule matches are pinned to it (plus the
+    /// registration-granted credentials). Unset: exact-rule matches discover. `*` matches never
+    /// use the pins (ADR 0014 amendment section 2.1).
+    pub credential_refs_configured: bool,
     pub max_grant_ttl_secs: u64,
     pub max_session_ttl_secs: u64,
     pub max_concurrent_grants: u64,
@@ -37,6 +43,14 @@ pub struct PolicySnapshot {
     /// Profile default credential selection (a rule may override it; the wildcard is `single`).
     pub credential_selection: CredentialSelection,
     pub rules: Vec<AgentRpRule>,
+    /// The profile is listed in `agents.acknowledge_global_registration`.
+    pub acknowledged_global_registration: bool,
+    /// Cap on the profile's wildcard registration grants, read live.
+    pub max_wildcard_registrations: u16,
+    /// Wildcard registration prompts per rolling 24 hours, read live.
+    pub wildcard_registration_prompts_per_day: u16,
+    /// Actions the agent may pre-request (`pre_request_actions`), sorted and deduplicated.
+    pub pre_request_actions: Vec<PreRequestAction>,
 }
 
 impl PolicySnapshot {
@@ -89,7 +103,7 @@ impl PolicySnapshot {
             &self.credential_selection,
             policy_action(action),
             rp_id,
-            |rp_id| grants.is_granted(&self.profile_id, rp_id),
+            |rp_id, rule| grants.is_granted(&self.profile_id, rp_id, rule),
         )
     }
 }
@@ -109,6 +123,32 @@ pub struct EscalationProfile {
     pub max_granted_rules: usize,
     /// `agents.escalation_timeout`, when set.
     pub escalation_timeout: Option<Duration>,
+    /// Registration through the `*` rule is acknowledged (`acknowledge_global_registration`).
+    /// Validation already requires it; the escalation checks it again (fail closed).
+    pub wildcard_registration_acknowledged: bool,
+    /// The live `max_wildcard_registrations`.
+    pub max_wildcard_registrations: usize,
+    /// The live `wildcard_registration_prompts_per_day`.
+    pub wildcard_registration_prompts_per_day: usize,
+    /// The live `pre_request_actions`, sorted and deduplicated.
+    pub pre_request_actions: Vec<PreRequestAction>,
+}
+
+/// A profile's `credential_refs` as the sign path sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfilePins {
+    /// `credential_refs` is set (possibly to an empty list): exact-rule matches are pinned.
+    Configured(Vec<CredentialRef>),
+    /// `credential_refs` is not set: exact-rule matches discover per RP.
+    Unset,
+}
+
+/// Which dangerous-profile acknowledgements list a profile.
+#[derive(Debug, Clone, Copy)]
+struct Acknowledgements {
+    global_same_user: bool,
+    same_user_registration: bool,
+    global_registration: bool,
 }
 
 /// The global escalation keys that are part of every profile's policy digest.
@@ -154,6 +194,8 @@ pub struct GrantSignSnapshot {
     pub profile_id: ProfileId,
     /// Digest of the principal the grant was issued to; a session must match it (ADR 0014 section 7).
     pub principal_digest: [u8; 32],
+    /// The principal session the grant was issued to.
+    pub session_id: PrincipalSessionId,
     pub rp_ids: Vec<String>,
     pub credential_refs: Vec<CredentialRef>,
     pub state: super::grant::GrantState,
@@ -275,8 +317,13 @@ impl PolicyRuntime {
             let snapshot = Self::compile_snapshot(
                 &profile_id,
                 profile_config,
-                config.acknowledge_global_same_user.contains(name),
-                config.acknowledge_same_user_registration.contains(name),
+                Acknowledgements {
+                    global_same_user: config.acknowledge_global_same_user.contains(name),
+                    same_user_registration: config
+                        .acknowledge_same_user_registration
+                        .contains(name),
+                    global_registration: config.acknowledge_global_registration.contains(name),
+                },
                 EscalationSettings::of(config),
             )?;
             snapshots.push(snapshot);
@@ -310,8 +357,7 @@ impl PolicyRuntime {
     fn compile_snapshot(
         profile_id: &ProfileId,
         config: &AgentProfileConfig,
-        acknowledged_global_same_user: bool,
-        acknowledged_same_user_registration: bool,
+        acknowledged: Acknowledgements,
         escalation: EscalationSettings,
     ) -> Result<PolicySnapshot, PolicyRuntimeError> {
         let mut rules = config.rules.clone();
@@ -324,6 +370,14 @@ impl PolicyRuntime {
         normalized_rp_ids.dedup();
 
         let credential_refs = config.credential_refs.clone().unwrap_or_default();
+        let credential_refs_configured = config.credential_refs.is_some();
+        let max_wildcard_registrations = config.effective_max_wildcard_registrations();
+        let wildcard_registration_prompts_per_day =
+            config.effective_wildcard_registration_prompts_per_day();
+
+        let mut pre_request_actions = config.pre_request_actions.clone();
+        pre_request_actions.sort();
+        pre_request_actions.dedup();
 
         let mut allowed_actions = BTreeSet::new();
         if rules
@@ -372,8 +426,8 @@ impl PolicyRuntime {
                 .unwrap_or_default(),
             browser_cdp_port: u64::from(config.browser_cdp_port.unwrap_or(0)),
             credential_selection: config.credential_selection.clone(),
-            acknowledged_global_same_user,
-            acknowledged_same_user_registration,
+            acknowledged_global_same_user: acknowledged.global_same_user,
+            acknowledged_same_user_registration: acknowledged.same_user_registration,
             storage_backend,
             storage_path,
             browser_user: config.browser_user.clone().unwrap_or_default(),
@@ -386,6 +440,14 @@ impl PolicyRuntime {
             max_granted_rules: u64::from(config.max_granted_rules),
             escalation_timeout: escalation.timeout_secs,
             escalation_cooldown: escalation.cooldown_secs,
+            credential_refs_configured,
+            acknowledged_global_registration: acknowledged.global_registration,
+            max_wildcard_registrations: u64::from(max_wildcard_registrations),
+            wildcard_registration_prompts_per_day: u64::from(wildcard_registration_prompts_per_day),
+            pre_request_actions: pre_request_actions
+                .iter()
+                .map(|action| action.as_str().to_string())
+                .collect(),
         };
 
         let policy = Policy::from_params(params)
@@ -400,6 +462,7 @@ impl PolicyRuntime {
             mode: config.mode,
             normalized_rp_ids,
             credential_refs,
+            credential_refs_configured,
             max_grant_ttl_secs,
             max_session_ttl_secs,
             max_concurrent_grants,
@@ -408,6 +471,10 @@ impl PolicyRuntime {
             allowed_actions,
             credential_selection: config.credential_selection.clone(),
             rules,
+            acknowledged_global_registration: acknowledged.global_registration,
+            max_wildcard_registrations,
+            wildcard_registration_prompts_per_day,
+            pre_request_actions,
         })
     }
 
@@ -470,6 +537,26 @@ impl PolicyRuntime {
                 max_granted_rules: usize::from(snapshot.max_granted_rules),
                 escalation_timeout: (snapshot.policy.escalation_timeout > 0)
                     .then(|| Duration::from_secs(snapshot.policy.escalation_timeout)),
+                wildcard_registration_acknowledged: snapshot.acknowledged_global_registration,
+                max_wildcard_registrations: usize::from(snapshot.max_wildcard_registrations),
+                wildcard_registration_prompts_per_day: usize::from(
+                    snapshot.wildcard_registration_prompts_per_day,
+                ),
+                pre_request_actions: snapshot.pre_request_actions.clone(),
+            })
+    }
+
+    /// The profile's configured pins, read from the LIVE snapshot rather than a copy frozen into
+    /// the session grant (ADR 0014 amendment 2.1). `None` when the profile does not exist.
+    pub fn profile_pins(&self, profile_id: &ProfileId) -> Option<ProfilePins> {
+        self.current_generation()
+            .find_snapshot(profile_id)
+            .map(|snapshot| {
+                if snapshot.credential_refs_configured {
+                    ProfilePins::Configured(snapshot.credential_refs.clone())
+                } else {
+                    ProfilePins::Unset
+                }
             })
     }
 
@@ -479,9 +566,23 @@ impl PolicyRuntime {
         &self,
         profile_id: &ProfileId,
         rp_id: &str,
+        rule: &RuleIdentity,
     ) -> Vec<CredentialRef> {
         self.granted_rules
-            .granted_credential_refs(profile_id, rp_id)
+            .granted_credential_refs(profile_id, rp_id, rule)
+    }
+
+    /// Whether the grants through `rule` at exactly `rp_id` include an approved `authenticate`
+    /// escalation, as opposed to registration grants only (see
+    /// [`GrantSource::has_escalation_grant`]).
+    pub fn has_escalation_grant(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+    ) -> bool {
+        self.granted_rules
+            .has_escalation_grant(profile_id, rp_id, rule)
     }
 
     /// Resolve `(action, rp_id)` for `profile_id` against the LIVE compiled policy (the current
@@ -503,7 +604,7 @@ impl PolicyRuntime {
                 &CredentialSelection::default(),
                 policy_action(action),
                 rp_id,
-                |_| false,
+                |_, _| false,
             ),
         }
     }
@@ -601,6 +702,7 @@ impl PolicyRuntime {
             grant_id: snap.grant_id,
             profile_id: snap.profile_id,
             principal_digest: snap.principal_digest,
+            session_id: snap.session_id,
             rp_ids: snap.rp_ids,
             credential_refs: snap.credential_refs,
             state: snap.state,
@@ -608,6 +710,16 @@ impl PolicyRuntime {
             is_revoked,
         })
     }
+    /// The principal session the session grant `grant_id` was issued to, whatever its state
+    /// (a revoked lease's grant still names its owner). `None` when no profile holds it.
+    pub fn grant_principal_session(&self, grant_id: &GrantId) -> Option<PrincipalSessionId> {
+        let grants_map = self.lock_grants();
+        grants_map
+            .values()
+            .find_map(|registry| registry.snapshot_for_sign(grant_id))
+            .map(|snap| snap.session_id)
+    }
+
     pub fn active_grant_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
         let grants = self.lock_grants();
         grants
@@ -844,6 +956,9 @@ mod tests {
         profiles.insert(
             profile_name.to_string(),
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -882,6 +997,7 @@ mod tests {
             },
         );
         AgentConfig {
+            acknowledge_global_registration: vec![],
             notify_user: None,
             state_dir: None,
             escalation_timeout: None,
@@ -927,7 +1043,7 @@ mod tests {
     }
 
     impl GrantSource for TestGrants {
-        fn is_granted(&self, profile_id: &ProfileId, rp_id: &str) -> bool {
+        fn is_granted(&self, profile_id: &ProfileId, rp_id: &str, _rule: &RuleIdentity) -> bool {
             self.0
                 .iter()
                 .any(|(p, r)| p == profile_id.as_str() && r == rp_id)
@@ -942,6 +1058,75 @@ mod tests {
         profile.storage = None;
         profile.rules = rules;
         config
+    }
+
+    #[test]
+    fn snapshot_carries_live_pins_and_the_wildcard_registration_settings() {
+        let pinned = CredentialRef::with_default_domain(b"pinned");
+        let mut config = same_user_config(
+            "coding",
+            vec![
+                AgentRpRule {
+                    rp_id: "*".to_string(),
+                    register: RuleAction::Request,
+                    authenticate: RuleAction::Request,
+                    credential_selection: None,
+                },
+                AgentRpRule {
+                    rp_id: "github.com".to_string(),
+                    register: RuleAction::Deny,
+                    authenticate: RuleAction::Allow,
+                    credential_selection: None,
+                },
+            ],
+        );
+        config.acknowledge_same_user_registration = vec!["coding".to_string()];
+        config.acknowledge_global_registration = vec!["coding".to_string()];
+        {
+            let profile = config.profiles.get_mut("coding").unwrap();
+            profile.credential_refs = Some(vec![pinned.clone()]);
+            profile.max_wildcard_registrations = Some(7);
+        }
+        let runtime = PolicyRuntime::new(&config, test_clock(), None).unwrap();
+        let id = ProfileId::new("coding").unwrap();
+        assert_eq!(
+            runtime.profile_pins(&id),
+            Some(ProfilePins::Configured(vec![pinned]))
+        );
+        assert_eq!(
+            runtime.profile_pins(&ProfileId::new("missing").unwrap()),
+            None
+        );
+        let escalation = runtime.escalation_profile(&id).unwrap();
+        assert!(escalation.wildcard_registration_acknowledged);
+        assert_eq!(escalation.max_wildcard_registrations, 7);
+        assert_eq!(escalation.wildcard_registration_prompts_per_day, 3);
+
+        // A reload that drops the pins (or the acknowledgement) is a policy change: new digest,
+        // and the live snapshot reflects it.
+        let before = runtime.digest();
+        let mut unpinned = config.clone();
+        unpinned.profiles.get_mut("coding").unwrap().credential_refs = None;
+        assert!(runtime.reload(&unpinned).unwrap().changed);
+        assert_ne!(runtime.digest(), before);
+        assert_eq!(runtime.profile_pins(&id), Some(ProfilePins::Unset));
+        // An empty pin list is not the same as no pin list (digest version 6).
+        let mut empty = unpinned.clone();
+        empty.profiles.get_mut("coding").unwrap().credential_refs = Some(vec![]);
+        assert!(runtime.reload(&empty).unwrap().changed);
+        assert_eq!(
+            runtime.profile_pins(&id),
+            Some(ProfilePins::Configured(vec![]))
+        );
+        let mut unacknowledged = empty.clone();
+        unacknowledged.acknowledge_global_registration.clear();
+        assert!(runtime.reload(&unacknowledged).unwrap().changed);
+        assert!(
+            !runtime
+                .escalation_profile(&id)
+                .unwrap()
+                .wildcard_registration_acknowledged
+        );
     }
 
     #[test]
@@ -1485,5 +1670,53 @@ mod tests {
             .unwrap()
             .digest;
         assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn test_pre_request_actions_reach_the_escalation_profile_and_the_digest() {
+        let config = make_isolated_config("pre", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        let id = ProfileId::new("pre").unwrap();
+        assert!(
+            runtime
+                .escalation_profile(&id)
+                .unwrap()
+                .pre_request_actions
+                .is_empty()
+        );
+        let before = runtime.digest();
+
+        // A reload that changes only `pre_request_actions` is a policy change.
+        let mut changed = config.clone();
+        changed.profiles.get_mut("pre").unwrap().pre_request_actions = vec![
+            PreRequestAction::Register,
+            PreRequestAction::Authenticate,
+            PreRequestAction::Register,
+        ];
+        let outcome = runtime.reload(&changed).unwrap();
+        assert!(outcome.changed);
+        assert_ne!(outcome.digest, before);
+        // Sorted and deduplicated in the live snapshot, the policy and the escalation profile.
+        let expected = vec![PreRequestAction::Authenticate, PreRequestAction::Register];
+        assert_eq!(
+            runtime.escalation_profile(&id).unwrap().pre_request_actions,
+            expected
+        );
+        let generation = runtime.current_generation();
+        let snapshot = generation.find_snapshot(&id).unwrap();
+        assert_eq!(snapshot.pre_request_actions, expected);
+        assert_eq!(
+            snapshot.policy.pre_request_actions,
+            vec!["authenticate", "register"]
+        );
+
+        // Listing the same actions in another order is not a change.
+        let mut reordered = changed.clone();
+        reordered
+            .profiles
+            .get_mut("pre")
+            .unwrap()
+            .pre_request_actions = vec![PreRequestAction::Authenticate, PreRequestAction::Register];
+        assert!(!runtime.reload(&reordered).unwrap().changed);
     }
 }

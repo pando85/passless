@@ -14,9 +14,11 @@
 //!    rejected;
 //! 4. subscribe to `ActionInvoked`/`NotificationClosed` filtered on that unique sender, and to
 //!    `NameOwnerChanged` for the well-known name, all before `Notify`;
-//! 5. `Notify` with `expire_timeout = 0`, critical urgency and exactly two actions, labelled
-//!    "Allow always" and "Deny", whose keys are `allow_always:<nonce>` and `deny:<nonce>` with a
-//!    fresh 128-bit nonce per prompt (the labels never show it);
+//! 5. `Notify` with `expire_timeout = 0`, critical urgency and exactly two actions: for a sign-in
+//!    prompt "Allow always" and "Deny", for a registration prompt "Register once" and "Deny"
+//!    (ADR 0014 amendment section 5), whose keys are `allow_always:<nonce>` (or
+//!    `register_once:<nonce>`) and `deny:<nonce>` with a fresh 128-bit nonce per prompt (the labels
+//!    never show it);
 //! 6. report `shown`, then exactly one of `decision`, `closed` or `server_lost` and exit. A
 //!    `{"withdraw":true}` line or EOF on stdin closes the notification (`CloseNotification`) and
 //!    exits. The child has no prompt timeout of its own: the daemon withdraws it.
@@ -31,17 +33,21 @@
 //! action or the daemon's withdrawal; `CloseNotification(0)` is not sent, so a withdrawn dialog may
 //! stay visible (inert).
 //!
-//! Protocol (JSON lines). Daemon to child: first
-//! `{"v":1,"summary":…,"body":…,"actions":[["allow_always","Allow always"],["deny","Deny"]],"min_review_delay_ms":…}`,
-//! later `{"withdraw":true}` or EOF. Child to daemon: `{"event":"shown","id":…,"server":…}`,
-//! `{"event":"decision","action":…}`, `{"event":"closed","reason":…}`, `{"event":"server_lost"}`,
-//! `{"event":"error","kind":…}`.
+//! Protocol version 2 (JSON lines). Daemon to child: first
+//! `{"v":2,"summary":…,"body":…,"actions":[["allow_always","Allow always"],["deny","Deny"]],"min_review_delay_ms":…}`
+//! (or `[["register_once","Register once"],["deny","Deny"]]` for a registration prompt; no other
+//! action set is accepted), later `{"withdraw":true}` or EOF. Child to daemon:
+//! `{"event":"shown","id":…,"server":…}`, `{"event":"decision","action":…}`,
+//! `{"event":"closed","reason":…}`, `{"event":"server_lost"}`, `{"event":"error","kind":…}`.
 //!
-//! The request and the `decision` event carry the bare keys `allow_always` and `deny`: the nonce
-//! never leaves the child.
+//! The request and the `decision` event carry the bare keys (`allow_always` or `register_once`,
+//! and `deny`): the nonce never leaves the child. Only the approving key of the request's own
+//! action set is ever sent to the server, so only it can come back.
 //!
-//! An "Allow always" that arrives before `min_review_delay_ms` has passed since `Notify` returned
-//! is reported as a `deny` decision. The daemon applies the same rule against its own clock.
+//! An approval that arrives before `min_review_delay_ms` has passed since `Notify` returned is
+//! reported as a `deny` decision. The daemon applies the same rule against its own clock, and
+//! accepts `register_once` only for a registration prompt and `allow_always` only for a sign-in
+//! prompt.
 //!
 //! This file is also compiled into `agent-prompt-probe` through `#[path]`, so it depends only on
 //! `std` and external crates.
@@ -65,13 +71,17 @@ use zbus::{Connection, MatchRule, Message, MessageStream};
 
 /// The hidden first argument that turns the daemon binary into a prompt child.
 pub const HIDDEN_ARG: &str = "__agent-escalation-prompt";
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 2 (ADR 0014 amendment section 5.4): a registration prompt has its own action set.
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const ACTION_ALLOW_ALWAYS: &str = "allow_always";
+/// The approving action of a registration prompt: one registration, not a standing grant.
+pub const ACTION_REGISTER_ONCE: &str = "register_once";
 pub const ACTION_DENY: &str = "deny";
 pub const LABEL_ALLOW_ALWAYS: &str = "Allow always";
+pub const LABEL_REGISTER_ONCE: &str = "Register once";
 pub const LABEL_DENY: &str = "Deny";
-/// The minimum review delay: an earlier "Allow always" is a deny (a heuristic, not
-/// authentication; ADR 0014 section 8.2).
+/// The minimum review delay: an earlier approval is a deny (a heuristic, not authentication;
+/// ADR 0014 section 8.2).
 pub const DEFAULT_MIN_REVIEW_DELAY_MS: u64 = 1000;
 /// Longest protocol line accepted on either side.
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
@@ -104,23 +114,34 @@ pub struct PromptRequest {
 }
 
 impl PromptRequest {
-    /// A request with the only allowed action set.
-    pub fn new(summary: String, body: String, min_review_delay_ms: u64) -> Self {
+    /// A request with the action set of `verb`, the only one allowed for it.
+    pub fn new(verb: PromptVerb, summary: String, body: String, min_review_delay_ms: u64) -> Self {
         Self {
             v: PROTOCOL_VERSION,
             summary,
             body,
-            actions: allowed_actions(),
+            actions: allowed_actions(verb),
             min_review_delay_ms,
         }
+    }
+
+    /// The approving action of this request's action set (`allow_always` or `register_once`),
+    /// if the set is one of the two allowed ones.
+    pub fn approve_action(&self) -> Option<&'static str> {
+        [PromptVerb::Authenticate, PromptVerb::Register]
+            .into_iter()
+            .find(|verb| self.actions == allowed_actions(*verb))
+            .map(PromptVerb::approve_action)
     }
 
     fn validate(&self) -> Result<(), &'static str> {
         if self.v != PROTOCOL_VERSION {
             return Err("unsupported protocol version");
         }
-        if self.actions != allowed_actions() {
-            return Err("the actions must be exactly allow_always and deny");
+        if self.approve_action().is_none() {
+            return Err(
+                "the actions must be exactly allow_always and deny, or register_once and deny",
+            );
         }
         if self.summary.is_empty() {
             return Err("empty summary");
@@ -129,12 +150,14 @@ impl PromptRequest {
     }
 }
 
-fn allowed_actions() -> Vec<(String, String)> {
+/// The one action set a prompt for `verb` may carry.
+fn allowed_actions(verb: PromptVerb) -> Vec<(String, String)> {
+    let (approve, label) = match verb {
+        PromptVerb::Authenticate => (ACTION_ALLOW_ALWAYS, LABEL_ALLOW_ALWAYS),
+        PromptVerb::Register => (ACTION_REGISTER_ONCE, LABEL_REGISTER_ONCE),
+    };
     vec![
-        (
-            ACTION_ALLOW_ALWAYS.to_string(),
-            LABEL_ALLOW_ALWAYS.to_string(),
-        ),
+        (approve.to_string(), label.to_string()),
         (ACTION_DENY.to_string(), LABEL_DENY.to_string()),
     ]
 }
@@ -245,37 +268,50 @@ pub fn server_support(
     Err("the notification server does not support actions")
 }
 
-/// This prompt's action keys: `<key>:<nonce>` for each allowed key.
+/// This prompt's two action keys: `<key>:<nonce>` for its approving action (`allow_always` or
+/// `register_once`) and for `deny`. The other approving key is never generated, so it can neither
+/// be sent to the server nor decoded.
 struct PromptKeys {
-    allow_always: String,
+    /// The bare approving action of this prompt.
+    approve_action: &'static str,
+    approve: String,
     deny: String,
 }
 
 impl PromptKeys {
-    /// Fresh keys from the OS random source. `None` if it fails.
-    fn generate() -> Option<Self> {
+    /// Fresh keys for a prompt approved by `approve_action`, from the OS random source. `None`
+    /// if it fails or the action is not an approving one.
+    fn generate(approve_action: &str) -> Option<Self> {
+        let approve_action = match approve_action {
+            ACTION_ALLOW_ALWAYS => ACTION_ALLOW_ALWAYS,
+            ACTION_REGISTER_ONCE => ACTION_REGISTER_ONCE,
+            _ => return None,
+        };
         let mut bytes = [0u8; NONCE_BYTES];
         OsRng.try_fill_bytes(&mut bytes).ok()?;
         let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         Some(Self {
-            allow_always: format!("{ACTION_ALLOW_ALWAYS}:{nonce}"),
+            approve_action,
+            approve: format!("{approve_action}:{nonce}"),
             deny: format!("{ACTION_DENY}:{nonce}"),
         })
     }
 
     /// The key sent to the server for the bare request key `key`.
     fn wire(&self, key: &str) -> Option<&str> {
-        match key {
-            ACTION_ALLOW_ALWAYS => Some(&self.allow_always),
-            ACTION_DENY => Some(&self.deny),
-            _ => None,
+        if key == self.approve_action {
+            Some(&self.approve)
+        } else if key == ACTION_DENY {
+            Some(&self.deny)
+        } else {
+            None
         }
     }
 
     /// The bare action of a received key: only an exact match of this prompt's keys.
     fn decode(&self, key: &str) -> Option<&'static str> {
-        if key == self.allow_always {
-            Some(ACTION_ALLOW_ALWAYS)
+        if key == self.approve {
+            Some(self.approve_action)
         } else if key == self.deny {
             Some(ACTION_DENY)
         } else {
@@ -291,6 +327,25 @@ pub enum PromptVerb {
     Register,
 }
 
+impl PromptVerb {
+    /// The bare key of the action that approves a prompt of this verb.
+    pub fn approve_action(self) -> &'static str {
+        match self {
+            Self::Authenticate => ACTION_ALLOW_ALWAYS,
+            Self::Register => ACTION_REGISTER_ONCE,
+        }
+    }
+}
+
+/// Which configured rule made the prompt necessary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRule {
+    /// The site's own (exact) rule.
+    Exact,
+    /// The `*` rule: the site is not on the operator's list.
+    Wildcard,
+}
+
 /// The daemon-derived fields a prompt shows (ADR 0014 section 8.1 step 4). Nothing here comes
 /// from the page or the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,8 +356,17 @@ pub struct PromptFields {
     pub verb: PromptVerb,
     /// The normalized RP ID; rendered in its ASCII (punycode) form.
     pub rp_id: String,
-    /// The validated origin; rendered in its ASCII serialization.
-    pub origin: String,
+    /// The validated origin; rendered in its ASCII serialization. `None` for a pre-request no
+    /// page is behind (ADR 0014 amendment section 2.3): rendered as `none yet`.
+    pub origin: Option<String>,
+    /// The agent asked in advance (`RequestAccess`): the body says that no page is waiting
+    /// (amendment sections 5.1 and 5.3). Nothing the agent supplied is shown.
+    pub requested_in_advance: bool,
+    /// The rule that resolved to `request`.
+    pub rule: PromptRule,
+    /// Registration only: how many passkeys the target store holds for the RP, when the backend
+    /// can count them without decrypting (amendment section 5.2). `None` omits the clause.
+    pub store_count: Option<usize>,
 }
 
 fn is_bidi_or_zero_width_control(ch: char) -> bool {
@@ -319,7 +383,7 @@ fn is_bidi_or_zero_width_control(ch: char) -> bool {
 
 /// One bounded visual line: no line breaks, no control, Bidi or zero-width characters, and no
 /// markup characters (servers with `body-markup` would interpret them).
-fn sanitize_line(input: &str, max_bytes: usize) -> String {
+pub(crate) fn sanitize_line(input: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(input.len().min(max_bytes));
     let mut previous_was_space = false;
     for original in input.chars() {
@@ -347,6 +411,15 @@ fn sanitize_line(input: &str, max_bytes: usize) -> String {
     out.trim().to_string()
 }
 
+/// An agent's note as the audit keeps it (ADR 0014 amendment section 2.3): the prompt's line
+/// rules (one line; no control, Bidi, zero-width or markup characters), cut at a character
+/// boundary to [`passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES`]; `None` when nothing is
+/// left. It is never shown in a prompt.
+pub(crate) fn sanitize_agent_note(note: Option<&str>) -> Option<String> {
+    let note = sanitize_line(note?, passless_core::agent::protocol::MAX_ACCESS_NOTE_BYTES);
+    (!note.is_empty()).then_some(note)
+}
+
 /// The RP ID in ASCII (punycode) form.
 pub fn ascii_rp_id(rp_id: &str) -> Result<String, String> {
     match url::Host::parse(rp_id.trim()) {
@@ -367,25 +440,95 @@ pub fn ascii_origin(origin: &str) -> Result<String, String> {
     Ok(origin.ascii_serialization())
 }
 
+/// The registration summary (ADR 0014 amendment section 5.1).
+pub const REGISTER_SUMMARY: &str = "Passless: CREATE A NEW PASSKEY? (not a sign-in)";
+
+/// The store-count clause of the registration prompt's "Stored in" line.
+fn store_count_clause(count: Option<usize>) -> String {
+    match count {
+        None => String::new(),
+        Some(0) => ", which holds no passkey for this site yet".to_string(),
+        Some(1) => ", which already holds 1 passkey for this site".to_string(),
+        Some(n) => format!(", which already holds {n} passkeys for this site"),
+    }
+}
+
+/// What the origin line shows: the validated origin, or `none yet` for a pre-request.
+fn origin_line(origin: Option<&str>) -> Result<String, String> {
+    match origin {
+        Some(origin) => Ok(sanitize_line(&ascii_origin(origin)?, 300)),
+        None => Ok(ORIGIN_NONE_YET.to_string()),
+    }
+}
+
+/// The origin line of a pre-request prompt (ADR 0014 amendment sections 5.1 and 5.3).
+pub const ORIGIN_NONE_YET: &str = "none yet";
+/// Who asked, on a pre-request prompt (amendment sections 5.1 and 5.3).
+pub const REQUESTED_IN_ADVANCE: &str = "the agent in advance (no page is waiting)";
+
+/// The registration prompt (ADR 0014 amendment section 5.1): six lines, each a daemon-derived
+/// fact; the summary says it is not a sign-in.
+fn render_registration(fields: &PromptFields, rp_id: &str, origin: &str) -> (String, String) {
+    let site = match fields.rule {
+        PromptRule::Exact => "your rule for this site",
+        PromptRule::Wildcard => "NOT on your list; matched by the * rule",
+    };
+    let profile = sanitize_line(&fields.profile, 128);
+    // Anything but an isolated profile writes to the human's own store: say so.
+    let store = if fields.mode == "isolated" {
+        format!("the agent's own store (isolated profile \"{profile}\")")
+    } else {
+        format!(
+            "YOUR passkey store ({} profile \"{profile}\")",
+            sanitize_line(&fields.mode, 32)
+        )
+    };
+    let body = format!(
+        "Action: create a new passkey and register it at this site\n\
+         Site: {} ({})\n\
+         Origin: {}\n\
+         Stored in: {}{}\n\
+         Approving allows this one registration, then lets the agent sign in here without asking.\n\
+         Requested by: {}, principal user {}",
+        sanitize_line(rp_id, 253),
+        site,
+        origin,
+        store,
+        store_count_clause(fields.store_count),
+        if fields.requested_in_advance {
+            REQUESTED_IN_ADVANCE
+        } else {
+            "a page now"
+        },
+        sanitize_line(&fields.principal_user, 64),
+    );
+    (REGISTER_SUMMARY.to_string(), body)
+}
+
 /// The notification summary and body built from daemon-derived fields only.
 pub fn render_prompt(fields: &PromptFields) -> Result<(String, String), String> {
     let rp_id = ascii_rp_id(&fields.rp_id)?;
-    let origin = ascii_origin(&fields.origin)?;
+    let origin = origin_line(fields.origin.as_deref())?;
     let (summary, action) = match fields.verb {
         PromptVerb::Authenticate => ("Passless: agent sign-in request", "sign in with a passkey"),
-        PromptVerb::Register => (
-            "Passless: agent registration request",
-            "register a new passkey",
-        ),
+        PromptVerb::Register => return Ok(render_registration(fields, &rp_id, &origin)),
+    };
+    // A pre-request adds one daemon-derived line (amendment section 5.3): seven in all, which
+    // still fits notify-osd's fallback dialog.
+    let requested_by = if fields.requested_in_advance {
+        format!("Requested by: {REQUESTED_IN_ADVANCE}\n")
+    } else {
+        String::new()
     };
     let body = format!(
-        "Profile: {} ({})\nPrincipal user: {}\nAction: {}\nSite: {} (any page under this site)\nOrigin: {}\n\"Allow always\" is saved permanently.",
+        "Profile: {} ({})\nPrincipal user: {}\nAction: {}\nSite: {} (any page under this site)\nOrigin: {}\n{}\"Allow always\" is saved permanently.",
         sanitize_line(&fields.profile, 128),
         sanitize_line(&fields.mode, 32),
         sanitize_line(&fields.principal_user, 64),
         action,
         sanitize_line(&rp_id, 253),
-        sanitize_line(&origin, 300),
+        origin,
+        requested_by,
     );
     Ok((summary.to_string(), body))
 }
@@ -751,7 +894,10 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
     }
 
     // 5. Notify, with this prompt's own action keys.
-    let Some(keys) = PromptKeys::generate() else {
+    let Some(approve_action) = request.approve_action() else {
+        return fail(output, ChildErrorKind::BadRequest);
+    };
+    let Some(keys) = PromptKeys::generate(approve_action) else {
         warn!("escalation prompt: no randomness for the action keys");
         return fail(output, ChildErrorKind::Internal);
     };
@@ -820,7 +966,9 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
                         continue;
                     };
                     let action = match action {
-                        ACTION_ALLOW_ALWAYS if shown_at.elapsed() < min_review_delay => {
+                        ACTION_ALLOW_ALWAYS | ACTION_REGISTER_ONCE
+                            if shown_at.elapsed() < min_review_delay =>
+                        {
                             warn!(
                                 "escalation prompt: approval after {} ms, before the {} ms review \
                                  delay; denying",
@@ -906,7 +1054,24 @@ mod tests {
             principal_user: "agent".to_string(),
             verb: PromptVerb::Authenticate,
             rp_id: "bücher.example".to_string(),
-            origin: "https://login.bücher.example:8443".to_string(),
+            origin: Some("https://login.bücher.example:8443".to_string()),
+            requested_in_advance: false,
+            rule: PromptRule::Exact,
+            store_count: Some(3),
+        }
+    }
+
+    fn registration(mode: &str, rule: PromptRule, store_count: Option<usize>) -> PromptFields {
+        PromptFields {
+            profile: "coding".to_string(),
+            mode: mode.to_string(),
+            principal_user: "alice".to_string(),
+            verb: PromptVerb::Register,
+            rp_id: "example.org".to_string(),
+            origin: Some("https://www.example.org".to_string()),
+            requested_in_advance: false,
+            rule,
+            store_count,
         }
     }
 
@@ -923,12 +1088,90 @@ mod tests {
     }
 
     #[test]
-    fn render_register_names_the_action() {
-        let mut fields = fields();
-        fields.verb = PromptVerb::Register;
-        let (summary, body) = render_prompt(&fields).unwrap();
-        assert!(summary.contains("registration"));
-        assert!(body.contains("Action: register a new passkey"));
+    fn render_sign_in_ignores_the_registration_fields() {
+        // The sign-in prompt is unchanged (amendment section 5.3): no rule or count line.
+        let mut wildcard = fields();
+        wildcard.rule = PromptRule::Wildcard;
+        wildcard.store_count = None;
+        assert_eq!(render_prompt(&wildcard), render_prompt(&fields()));
+    }
+
+    #[test]
+    fn render_wildcard_registration_matches_the_amendment_text() {
+        let (summary, body) =
+            render_prompt(&registration("same-user", PromptRule::Wildcard, Some(1))).unwrap();
+        assert_eq!(summary, "Passless: CREATE A NEW PASSKEY? (not a sign-in)");
+        assert_eq!(
+            body,
+            "Action: create a new passkey and register it at this site\n\
+             Site: example.org (NOT on your list; matched by the * rule)\n\
+             Origin: https://www.example.org\n\
+             Stored in: YOUR passkey store (same-user profile \"coding\"), which already holds 1 passkey for this site\n\
+             Approving allows this one registration, then lets the agent sign in here without asking.\n\
+             Requested by: a page now, principal user alice"
+        );
+        // notify-osd's fallback dialog has room for seven lines.
+        assert!(body.lines().count() <= 7);
+        assert!(!body.contains("Allow always"));
+    }
+
+    #[test]
+    fn render_registration_variants_of_rule_store_and_count() {
+        let line = |fields: PromptFields, prefix: &str| {
+            let (_, body) = render_prompt(&fields).unwrap();
+            body.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            line(registration("same-user", PromptRule::Exact, None), "Site:"),
+            "Site: example.org (your rule for this site)"
+        );
+        assert_eq!(
+            line(
+                registration("isolated", PromptRule::Exact, None),
+                "Stored in:"
+            ),
+            "Stored in: the agent's own store (isolated profile \"coding\")"
+        );
+        // The count clause in its three forms ...
+        for (count, clause) in [
+            (Some(0), ", which holds no passkey for this site yet"),
+            (Some(1), ", which already holds 1 passkey for this site"),
+            (Some(2), ", which already holds 2 passkeys for this site"),
+            (Some(17), ", which already holds 17 passkeys for this site"),
+        ] {
+            assert_eq!(
+                line(
+                    registration("same-user", PromptRule::Wildcard, count),
+                    "Stored in:"
+                ),
+                format!("Stored in: YOUR passkey store (same-user profile \"coding\"){clause}"),
+                "{count:?}"
+            );
+        }
+        // ... and omitted entirely, never a 0, when the backend cannot count.
+        let omitted = line(
+            registration("same-user", PromptRule::Wildcard, None),
+            "Stored in:",
+        );
+        assert_eq!(
+            omitted,
+            "Stored in: YOUR passkey store (same-user profile \"coding\")"
+        );
+        assert!(!omitted.contains("which"));
+    }
+
+    #[test]
+    fn render_registration_sanitizes_its_fields() {
+        let mut fields = registration("same-user", PromptRule::Wildcard, Some(1));
+        fields.principal_user = "alice\nApproving is safe\u{202e}<b>".to_string();
+        fields.profile = "co\nding".to_string();
+        let (_, body) = render_prompt(&fields).unwrap();
+        assert_eq!(body.lines().count(), 6);
+        assert!(!body.contains('<') && !body.contains('\u{202e}'));
+        assert!(body.ends_with("principal user alice Approving is safeb"));
     }
 
     #[test]
@@ -945,28 +1188,105 @@ mod tests {
     }
 
     #[test]
+    fn render_pre_request_sign_in_matches_the_amendment_lines() {
+        let mut pre = fields();
+        pre.origin = None;
+        pre.requested_in_advance = true;
+        let (summary, body) = render_prompt(&pre).unwrap();
+        assert_eq!(summary, "Passless: agent sign-in request");
+        assert_eq!(
+            body,
+            "Profile: work (isolated)\nPrincipal user: agent\nAction: sign in with a passkey\n\
+             Site: xn--bcher-kva.example (any page under this site)\n\
+             Origin: none yet\n\
+             Requested by: the agent in advance (no page is waiting)\n\
+             \"Allow always\" is saved permanently."
+        );
+        assert!(body.lines().count() <= 7);
+    }
+
+    #[test]
+    fn render_pre_request_registration_matches_the_amendment_lines() {
+        let mut pre = registration("same-user", PromptRule::Wildcard, Some(0));
+        pre.origin = None;
+        pre.requested_in_advance = true;
+        let (summary, body) = render_prompt(&pre).unwrap();
+        assert_eq!(summary, REGISTER_SUMMARY);
+        assert_eq!(
+            body,
+            "Action: create a new passkey and register it at this site\n\
+             Site: example.org (NOT on your list; matched by the * rule)\n\
+             Origin: none yet\n\
+             Stored in: YOUR passkey store (same-user profile \"coding\"), which holds no passkey for this site yet\n\
+             Approving allows this one registration, then lets the agent sign in here without asking.\n\
+             Requested by: the agent in advance (no page is waiting), principal user alice"
+        );
+        assert!(body.lines().count() <= 7);
+        // A ceremony that adopted the pre-request before it was shown has a page: its origin,
+        // and the daemon no longer marks the request as made in advance (review N2).
+        pre.origin = Some("https://www.example.org".to_string());
+        pre.requested_in_advance = false;
+        let (_, body) = render_prompt(&pre).unwrap();
+        assert!(body.contains("\nOrigin: https://www.example.org\n"));
+        assert!(!body.contains("in advance"), "{body}");
+        assert!(!body.contains("no page is waiting"), "{body}");
+    }
+
+    #[test]
     fn render_rejects_an_opaque_origin() {
         let mut fields = fields();
-        fields.origin = "data:text/html,x".to_string();
+        fields.origin = Some("data:text/html,x".to_string());
         assert!(render_prompt(&fields).is_err());
     }
 
     #[test]
-    fn request_validation_pins_the_action_set() {
-        let request = PromptRequest::new("s".to_string(), "b".to_string(), 1000);
+    fn request_validation_pins_the_action_set_per_verb() {
+        let request = PromptRequest::new(
+            PromptVerb::Authenticate,
+            "s".to_string(),
+            "b".to_string(),
+            1000,
+        );
         assert!(request.validate().is_ok());
+        assert_eq!(request.approve_action(), Some(ACTION_ALLOW_ALWAYS));
         let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["v"], 2);
         assert_eq!(
             json["actions"],
             serde_json::json!([["allow_always", "Allow always"], ["deny", "Deny"]])
         );
+
+        let register =
+            PromptRequest::new(PromptVerb::Register, "s".to_string(), "b".to_string(), 1000);
+        assert!(register.validate().is_ok());
+        assert_eq!(register.approve_action(), Some(ACTION_REGISTER_ONCE));
+        assert_eq!(
+            serde_json::to_value(&register).unwrap()["actions"],
+            serde_json::json!([["register_once", "Register once"], ["deny", "Deny"]])
+        );
+
+        // Nothing else is accepted: an extra action, a mixed or relabelled set, three actions.
         let mut extra = request.clone();
         extra
             .actions
             .push(("default".to_string(), "Open".to_string()));
         assert!(extra.validate().is_err());
+        let mut mixed = register.clone();
+        mixed.actions[0].1 = LABEL_ALLOW_ALWAYS.to_string();
+        assert!(mixed.validate().is_err());
+        let mut both = request.clone();
+        both.actions.insert(
+            1,
+            (
+                ACTION_REGISTER_ONCE.to_string(),
+                LABEL_REGISTER_ONCE.to_string(),
+            ),
+        );
+        assert!(both.validate().is_err());
+        assert_eq!(both.approve_action(), None);
+        // Version 1 (one action set only) is refused.
         let mut version = request;
-        version.v = 2;
+        version.v = 1;
         assert!(version.validate().is_err());
     }
 
@@ -1047,9 +1367,42 @@ mod tests {
     }
 
     #[test]
+    fn registration_prompt_keys_are_distinct_and_nonced() {
+        let keys = PromptKeys::generate(ACTION_REGISTER_ONCE).unwrap();
+        let register = keys.wire(ACTION_REGISTER_ONCE).unwrap();
+        let deny = keys.wire(ACTION_DENY).unwrap();
+        let nonce = register.strip_prefix("register_once:").unwrap();
+        assert_eq!(nonce.len(), NONCE_BYTES * 2);
+        assert_eq!(deny, format!("deny:{nonce}"));
+        assert_eq!(keys.decode(register), Some(ACTION_REGISTER_ONCE));
+        assert_eq!(keys.decode(deny), Some(ACTION_DENY));
+        // The sign-in key is never generated for a registration prompt: it can be neither sent
+        // nor decoded, even with this prompt's own nonce.
+        assert_eq!(keys.wire(ACTION_ALLOW_ALWAYS), None);
+        assert_eq!(keys.decode(&format!("allow_always:{nonce}")), None);
+        assert_eq!(keys.decode(ACTION_REGISTER_ONCE), None);
+        // And the other way round.
+        let sign_in = PromptKeys::generate(ACTION_ALLOW_ALWAYS).unwrap();
+        assert_eq!(sign_in.wire(ACTION_REGISTER_ONCE), None);
+        let sign_in_nonce = sign_in
+            .wire(ACTION_ALLOW_ALWAYS)
+            .unwrap()
+            .strip_prefix("allow_always:")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            sign_in.decode(&format!("register_once:{sign_in_nonce}")),
+            None
+        );
+        // Only approving actions have keys.
+        assert!(PromptKeys::generate(ACTION_DENY).is_none());
+        assert!(PromptKeys::generate("default").is_none());
+    }
+
+    #[test]
     fn prompt_keys_are_unique_per_prompt_and_match_exactly() {
-        let a = PromptKeys::generate().unwrap();
-        let b = PromptKeys::generate().unwrap();
+        let a = PromptKeys::generate(ACTION_ALLOW_ALWAYS).unwrap();
+        let b = PromptKeys::generate(ACTION_ALLOW_ALWAYS).unwrap();
         let allow = a.wire(ACTION_ALLOW_ALWAYS).unwrap();
         let deny = a.wire(ACTION_DENY).unwrap();
         let nonce = allow.strip_prefix("allow_always:").unwrap();

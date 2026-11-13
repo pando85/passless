@@ -34,9 +34,13 @@ impl std::error::Error for PolicyError {}
 /// Bumped whenever the digest input changes (version 4: rule actions replace evidence tables, and
 /// the digest covers profile and rule `credential_selection`, the acknowledgements and the
 /// operation/concurrency limits; version 5: `max_granted_rules` and the escalation timeout and
-/// cooldown). Granted rules themselves are not in this digest: they have their own
-/// `grants_digest`, so a reload compares configuration only.
-pub const CURRENT_POLICY_VERSION: u8 = 5;
+/// cooldown; version 6 (ADR 0014 amendment section 3): `acknowledge_global_registration`,
+/// `max_wildcard_registrations`, `wildcard_registration_prompts_per_day`, and whether
+/// `credential_refs` is configured at all, which an empty list does not tell apart from an absent
+/// one; version 7 (ADR 0014 amendment section 3, Phase 2): `pre_request_actions`). Granted rules
+/// themselves are not in this digest: they have their own `grants_digest`, so
+/// a reload compares configuration only.
+pub const CURRENT_POLICY_VERSION: u8 = 7;
 const MAX_TTL: u64 = 86400 * 365;
 const MAX_CONCURRENT_GRANTS_LIMIT: u64 = 1000;
 
@@ -75,6 +79,17 @@ pub struct PolicyParams {
     pub escalation_timeout: u64,
     /// `agents.escalation_cooldown` in seconds.
     pub escalation_cooldown: u64,
+    /// Profile `credential_refs` is set (possibly to an empty list): exact-rule matches are
+    /// pinned. Unset: they use discovery.
+    pub credential_refs_configured: bool,
+    /// The profile is listed in `agents.acknowledge_global_registration`.
+    pub acknowledged_global_registration: bool,
+    /// The profile's `max_wildcard_registrations` in force.
+    pub max_wildcard_registrations: u64,
+    /// The profile's `wildcard_registration_prompts_per_day` in force.
+    pub wildcard_registration_prompts_per_day: u64,
+    /// The profile's `pre_request_actions` as wire strings (sorted and deduplicated on build).
+    pub pre_request_actions: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +122,11 @@ pub struct Policy {
     pub max_granted_rules: u64,
     pub escalation_timeout: u64,
     pub escalation_cooldown: u64,
+    pub credential_refs_configured: bool,
+    pub acknowledged_global_registration: bool,
+    pub max_wildcard_registrations: u64,
+    pub wildcard_registration_prompts_per_day: u64,
+    pub pre_request_actions: Vec<String>,
 }
 
 impl Policy {
@@ -123,6 +143,10 @@ impl Policy {
         let mut sorted_actions = params.allowed_actions;
         sorted_actions.sort();
         sorted_actions.dedup();
+
+        let mut sorted_pre_requests = params.pre_request_actions;
+        sorted_pre_requests.sort();
+        sorted_pre_requests.dedup();
 
         let mut sorted_rules = params.rules;
         sorted_rules.sort_by_key(|rule| rule.rp_id.trim().to_ascii_lowercase());
@@ -156,6 +180,11 @@ impl Policy {
             max_granted_rules: params.max_granted_rules,
             escalation_timeout: params.escalation_timeout,
             escalation_cooldown: params.escalation_cooldown,
+            credential_refs_configured: params.credential_refs_configured,
+            acknowledged_global_registration: params.acknowledged_global_registration,
+            max_wildcard_registrations: params.max_wildcard_registrations,
+            wildcard_registration_prompts_per_day: params.wildcard_registration_prompts_per_day,
+            pre_request_actions: sorted_pre_requests,
         };
         policy.validate()?;
         Ok(policy)
@@ -195,6 +224,11 @@ impl Policy {
             max_granted_rules: 0,
             escalation_timeout: 0,
             escalation_cooldown: 0,
+            credential_refs_configured: false,
+            acknowledged_global_registration: false,
+            max_wildcard_registrations: 0,
+            wildcard_registration_prompts_per_day: 0,
+            pre_request_actions: vec![],
         })
     }
 
@@ -523,6 +557,32 @@ pub mod cbor {
                 "escalation_cooldown".to_string(),
                 encode_uint(policy.escalation_cooldown),
             ),
+            (
+                "credential_refs_configured".to_string(),
+                encode_bool(policy.credential_refs_configured),
+            ),
+            (
+                "acknowledged_global_registration".to_string(),
+                encode_bool(policy.acknowledged_global_registration),
+            ),
+            (
+                "max_wildcard_registrations".to_string(),
+                encode_uint(policy.max_wildcard_registrations),
+            ),
+            (
+                "wildcard_registration_prompts_per_day".to_string(),
+                encode_uint(policy.wildcard_registration_prompts_per_day),
+            ),
+            (
+                "pre_request_actions".to_string(),
+                encode_text_array(
+                    &policy
+                        .pre_request_actions
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
         ];
         encode_map_sorted(&entries)
     }
@@ -602,6 +662,11 @@ pub mod cbor {
             "max_granted_rules",
             "escalation_timeout",
             "escalation_cooldown",
+            "credential_refs_configured",
+            "acknowledged_global_registration",
+            "max_wildcard_registrations",
+            "wildcard_registration_prompts_per_day",
+            "pre_request_actions",
         ];
         keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         keys
@@ -633,10 +698,10 @@ mod tests {
         Policy::new(&ProfileId::new("a").unwrap(), vec!["act".to_string()], 1, 1).unwrap()
     }
 
-    /// The policy map has 28 entries: one byte of length follows the map header (`0xb8`).
+    /// The policy map has 33 entries: one byte of length follows the map header (`0xb8`).
     fn assert_map_header(cbor: &[u8]) {
         assert_eq!(cbor[0], 0xb8, "map header with one length byte");
-        assert_eq!(cbor[1], 28, "map of 28 entries");
+        assert_eq!(cbor[1], 33, "map of 33 entries");
     }
 
     #[test]
@@ -1133,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_policy_version_constant() {
-        assert_eq!(CURRENT_POLICY_VERSION, 5);
+        assert_eq!(CURRENT_POLICY_VERSION, 7);
     }
 
     #[test]
@@ -1144,7 +1209,7 @@ mod tests {
     #[test]
     fn test_sorted_keys_complete() {
         let keys = cbor::sorted_keys_for_policy();
-        assert_eq!(keys.len(), 28);
+        assert_eq!(keys.len(), 33);
         for key in [
             "version",
             "profile_id",
@@ -1174,6 +1239,11 @@ mod tests {
             "max_granted_rules",
             "escalation_timeout",
             "escalation_cooldown",
+            "credential_refs_configured",
+            "acknowledged_global_registration",
+            "max_wildcard_registrations",
+            "wildcard_registration_prompts_per_day",
+            "pre_request_actions",
         ] {
             assert!(keys.contains(&key), "missing policy key {key}");
         }
@@ -1210,12 +1280,17 @@ mod tests {
                 "browser_cdp_expose",
                 "escalation_timeout",
                 "escalation_cooldown",
+                "pre_request_actions",
                 "browser_runtime_root",
                 "credential_selection",
                 "max_concurrent_grants",
                 "max_concurrent_sessions",
+                "credential_refs_configured",
+                "max_wildcard_registrations",
                 "acknowledged_global_same_user",
+                "acknowledged_global_registration",
                 "acknowledged_same_user_registration",
+                "wildcard_registration_prompts_per_day",
             ]
         );
     }
@@ -1291,6 +1366,11 @@ mod tests {
             max_granted_rules: 64,
             escalation_timeout: 0,
             escalation_cooldown: 600,
+            credential_refs_configured: false,
+            acknowledged_global_registration: false,
+            max_wildcard_registrations: 4,
+            wildcard_registration_prompts_per_day: 3,
+            pre_request_actions: vec![],
         }
     }
 
@@ -1358,6 +1438,21 @@ mod tests {
             ("max_granted_rules", |p| p.max_granted_rules += 1),
             ("escalation_timeout", |p| p.escalation_timeout = 300),
             ("escalation_cooldown", |p| p.escalation_cooldown += 1),
+            ("credential_refs_configured", |p| {
+                p.credential_refs_configured = true
+            }),
+            ("acknowledged_global_registration", |p| {
+                p.acknowledged_global_registration = true
+            }),
+            ("max_wildcard_registrations", |p| {
+                p.max_wildcard_registrations += 1
+            }),
+            ("wildcard_registration_prompts_per_day", |p| {
+                p.wildcard_registration_prompts_per_day += 1
+            }),
+            ("pre_request_actions", |p| {
+                p.pre_request_actions.push("authenticate".to_string())
+            }),
             ("rules: add a rule", |p| {
                 p.rules
                     .push(rule("added.example", RuleAction::Allow, RuleAction::Deny))
@@ -1447,10 +1542,12 @@ mod tests {
         a.normalized_rp_ids = vec!["a.example".to_string(), "b.example".to_string()];
         a.allowed_actions = vec!["authenticate".to_string(), "register".to_string()];
         a.credential_refs = vec![ref_a.clone(), ref_b.clone()];
+        a.pre_request_actions = vec!["authenticate".to_string(), "register".to_string()];
         let mut b = base_params();
         b.normalized_rp_ids = vec!["b.example".to_string(), "a.example".to_string()];
         b.allowed_actions = vec!["register".to_string(), "authenticate".to_string()];
         b.credential_refs = vec![ref_b, ref_a];
+        b.pre_request_actions = vec!["register".to_string(), "authenticate".to_string()];
         assert_eq!(digest_of(a), digest_of(b));
     }
 
@@ -1464,13 +1561,76 @@ mod tests {
         assert_eq!(policy.max_granted_rules, 0);
         assert_eq!(policy.escalation_timeout, 0);
         assert_eq!(policy.escalation_cooldown, 0);
-        assert_eq!(policy.version, 5);
+        assert!(!policy.credential_refs_configured);
+        assert!(!policy.acknowledged_global_registration);
+        assert_eq!(policy.max_wildcard_registrations, 0);
+        assert_eq!(policy.wildcard_registration_prompts_per_day, 0);
+        assert!(policy.pre_request_actions.is_empty());
+        assert_eq!(policy.version, 7);
     }
 
     #[test]
     fn policy_rejects_previous_version() {
         let mut policy = test_policy();
-        policy.version = 4;
-        assert_eq!(policy.validate(), Err(PolicyError::InvalidVersion(4)));
+        policy.version = 6;
+        assert_eq!(policy.validate(), Err(PolicyError::InvalidVersion(6)));
+    }
+
+    #[test]
+    fn digest_version_6_covers_the_wildcard_registration_keys() {
+        // Each new key alone changes the digest (one revocation of every session on upgrade, and
+        // on every later change of one of them).
+        let base = digest_of(base_params());
+        let mutations: [(&str, Mutation); 4] = [
+            ("credential_refs_configured", |p| {
+                p.credential_refs_configured = true
+            }),
+            ("acknowledged_global_registration", |p| {
+                p.acknowledged_global_registration = true
+            }),
+            ("max_wildcard_registrations", |p| {
+                p.max_wildcard_registrations += 1
+            }),
+            ("wildcard_registration_prompts_per_day", |p| {
+                p.wildcard_registration_prompts_per_day += 1
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut params = base_params();
+            mutate(&mut params);
+            assert_ne!(digest_of(params), base, "{name}");
+        }
+        // An empty pin list and no pin list differ only through `credential_refs_configured`.
+        let mut empty_pins = base_params();
+        empty_pins.credential_refs = vec![];
+        empty_pins.credential_refs_configured = true;
+        assert_ne!(digest_of(empty_pins), base);
+    }
+
+    #[test]
+    fn digest_version_7_covers_pre_request_actions() {
+        let with = |actions: &[&str]| {
+            let mut params = base_params();
+            params.pre_request_actions = actions.iter().map(|a| a.to_string()).collect();
+            digest_of(params)
+        };
+        let base = digest_of(base_params());
+        // Any change of the list changes the digest.
+        assert_ne!(with(&["authenticate"]), base);
+        assert_ne!(with(&["register"]), base);
+        assert_ne!(with(&["authenticate", "register"]), with(&["authenticate"]));
+        assert_ne!(with(&["authenticate"]), with(&["register"]));
+        // The order of the input list does not, and neither does a repeated value.
+        assert_eq!(
+            with(&["authenticate", "register"]),
+            with(&["register", "authenticate"])
+        );
+        assert_eq!(with(&["register", "register"]), with(&["register"]));
+        let policy = {
+            let mut params = base_params();
+            params.pre_request_actions = vec!["register".to_string(), "authenticate".to_string()];
+            Policy::from_params(params).unwrap()
+        };
+        assert_eq!(policy.pre_request_actions, vec!["authenticate", "register"]);
     }
 }

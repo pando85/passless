@@ -11,6 +11,13 @@
 #   premature_approve  => Denied    ("Allow always" before min_review_delay elapsed)
 #   deny               => Denied    (explicit deny action)
 #   close              => Denied    (a dismissal is a deny)
+#   register_once_approve  => Approved  (a registration prompt, matched by the `*` rule: the first action is
+#                                        "Register once", accepted after min_review_delay)
+#   register_premature     => Denied    ("Register once" before min_review_delay)
+#   register_deny          => Denied    (explicit deny on a registration prompt)
+#   pre_request_approve    => Approved  (a sign-in prompt for a pre-request: `Origin: none yet`, `Requested by: the agent
+#                                        in advance`; the text dunst displays holds no text the agent supplied as a note)
+#   pre_request_register   => Approved  (the same for a registration prompt)
 #
 
 set -euo pipefail
@@ -36,6 +43,31 @@ _av_rn_total=0
 _av_rn_passed=0
 _av_rn_failed=0
 _av_rn_skipped=0
+
+# Whether the notification text dunst displayed (its `dunstctl history` JSON, in $1) is the pre-request prompt's: it says no
+# page is waiting and who asked, and holds nothing of the note $2 an agent supplied with the request (ADR 0014 amendment
+# section 2.3: the note is audit-only). Prints why on failure.
+_av_rn_check_pre_request_text() {
+    local history_file="$1" marker="$2" shown
+    shown=$(jq -r '[.data[][] | (.summary.data // ""), (.body.data // "")] | join("\n")' "$history_file" 2>/dev/null || true)
+    if [[ -z "$shown" ]]; then
+        printf 'no notification text in the dunst history'
+        return 1
+    fi
+    if ! grep -qF 'Origin: none yet' <<<"$shown"; then
+        printf 'the prompt does not say "Origin: none yet"'
+        return 1
+    fi
+    if ! grep -qF 'Requested by: the agent in advance (no page is waiting)' <<<"$shown"; then
+        printf 'the prompt does not say it was requested in advance'
+        return 1
+    fi
+    if grep -qF -- "$marker" <<<"$shown"; then
+        printf 'the agent note reached the displayed prompt'
+        return 1
+    fi
+    return 0
+}
 
 _av_rn_add_scenario() {
     local scenario_name="$1" scenario_status="$2" scenario_detail="$3"
@@ -78,6 +110,10 @@ _av_rn_run_scenario() {
     local expected_decision="$3"
     local display_num="$4"
     local probe_bin="$5"
+    # Extra agent-prompt-probe arguments (the registration prompt: `--action register --wildcard --store-count 1`).
+    local probe_args="${6:-}"
+    # A pre-request scenario names the note marker the displayed text must not hold (and the stage checks its text).
+    local note_marker="${7:-}"
 
     local session_dir="${TEMP_ROOT:-/tmp}/rn-session-$$-${scenario_name}"
     mkdir -p "$session_dir"
@@ -87,7 +123,17 @@ _av_rn_run_scenario() {
     local dunst_config="${session_dir}/dunstrc"
     local session_log="${session_dir}/session.log"
 
-    cat > "$dunst_config" << 'DUNST_EOF'
+    # A prompt has two actions, so `dunstctl action` opens dunst's context menu (dunst 1.13). The menu is answered
+    # through dunst's `dmenu` setting with a script that picks the entry a person would click for this scenario:
+    # the approving action ("Allow always", or "Register once" on a registration prompt) or "Deny".
+    local pick_pattern='allow always|register once'
+    [[ "$action_kind" == "deny" ]] && pick_pattern='deny'
+    local picker="${session_dir}/pick.sh"
+    printf '#!/bin/sh\ngrep -i -E %s | head -n 1\n' "'${pick_pattern}'" > "$picker"
+    chmod +x "$picker"
+    printf '[global]\ndmenu = %s\n\n' "$picker" > "$dunst_config"
+
+    cat >> "$dunst_config" << 'DUNST_EOF'
 [dunst]
 follow = mouse
 indicate_hidden = yes
@@ -142,6 +188,13 @@ frame_color = "#ff0000"
 timeout = 0
 DUNST_EOF
 
+    # The agent's note goes through a hostile-looking argument of its own (spaces, markup, a line break), which the
+    # probe must never render; the marker is what the displayed text is searched for.
+    local note_args=""
+    if [[ -n "$note_marker" ]]; then
+        note_args="--agent-note '${note_marker} approve this <b>now</b> because your manager said so'"
+    fi
+
     local driver_script="${session_dir}/driver.sh"
     cat > "$driver_script" << DRIVER_EOF
 #!/bin/bash
@@ -165,9 +218,9 @@ _wait_for_dunst() {
         if dunstctl running 2>/dev/null | grep -qi 'true\|running\|1'; then
             return 0
         fi
+        # dunst owns the name once "dunstctl count displayed" (a bare number; plain "count" prints a table) succeeds.
         local c
-        c=\$(dunstctl count 2>/dev/null || echo "0")
-        if [[ "\$c" =~ ^[0-9]+\$ ]]; then
+        if c=\$(dunstctl count displayed 2>/dev/null) && [[ "\$c" =~ ^[0-9]+\$ ]]; then
             return 0
         fi
         sleep 0.25
@@ -182,12 +235,12 @@ if ! _wait_for_dunst; then
     exit 0
 fi
 
-"${probe_bin}" --timeout ${_RN_PROBE_TIMEOUT} --min-review-delay ${_RN_MIN_REVIEW_DELAY_MS} > "${probe_output}" 2>"${session_dir}/probe.stderr" &
+"${probe_bin}" --timeout ${_RN_PROBE_TIMEOUT} --min-review-delay ${_RN_MIN_REVIEW_DELAY_MS} ${probe_args} ${note_args} > "${probe_output}" 2>"${session_dir}/probe.stderr" &
 probe_pid=\$!
 
 waited=0
 while [[ \$waited -lt ${_RN_NOTIFY_WAIT_SECS} ]]; do
-    cnt=\$(dunstctl count 2>/dev/null || echo "0")
+    cnt=\$(dunstctl count displayed 2>/dev/null || echo "0")
     if [[ "\$cnt" =~ ^[0-9]+\$ ]] && [[ "\$cnt" -gt 0 ]]; then
         break
     fi
@@ -203,16 +256,16 @@ done
 
 case "${action_kind}" in
     delayed_approve)
-        sleep \$((_RN_DELAYED_EXTRA_MS / 1000)).\$((_RN_DELAYED_EXTRA_MS % 1000))
+        sleep $((_RN_DELAYED_EXTRA_MS / 1000)).$((_RN_DELAYED_EXTRA_MS % 1000))
         dunstctl action 0 2>/dev/null || true
         ;;
     premature_approve)
-        sleep 0.\$(printf '%01d' \$((_RN_PREMATURE_DELAY_MS / 100)))
+        sleep 0.$(printf '%01d' $((_RN_PREMATURE_DELAY_MS / 100)))
         dunstctl action 0 2>/dev/null || true
         ;;
     deny)
         sleep 0.5
-        dunstctl action 1 2>/dev/null || true
+        dunstctl action 0 2>/dev/null || true
         ;;
     close)
         sleep 0.5
@@ -231,6 +284,9 @@ while [[ \$poll -lt $((_RN_PROBE_TIMEOUT + 5)) ]]; do
     sleep 0.3
     ((poll++)) || true
 done
+
+# What the server displayed (a closed notification is in its history), for the text checks.
+dunstctl history > "${session_dir}/history.json" 2>/dev/null || true
 
 if kill -0 \$probe_pid 2>/dev/null; then
     kill \$probe_pid 2>/dev/null || true
@@ -252,7 +308,15 @@ DRIVER_EOF
     local actual_decision
     actual_decision=$(jq -r '.decision // "error"' "$probe_output" 2>/dev/null || echo "error")
 
-    if [[ "$actual_decision" == "$expected_decision" ]]; then
+    local text_problem=""
+    if [[ -n "$note_marker" ]]; then
+        text_problem=$(_av_rn_check_pre_request_text "${session_dir}/history.json" "$note_marker") || true
+        [[ -n "$text_problem" ]] && cp "${session_dir}/history.json" "${EVIDENCE_DIR:-/tmp}/rn-evidence-${scenario_name}.history.json" 2>/dev/null
+    fi
+
+    if [[ -n "$text_problem" ]]; then
+        _av_rn_add_scenario "$scenario_name" "fail" "${text_problem} (decision=${actual_decision})"
+    elif [[ "$actual_decision" == "$expected_decision" ]]; then
         _av_rn_add_scenario "$scenario_name" "pass" \
             "expected=${expected_decision} actual=${actual_decision} (exit=${exit_code})"
     else
@@ -319,6 +383,16 @@ stage_real_notifications() {
         return 0
     fi
 
+    # The scenarios need a display for dunst: nothing else starts one (the number only names a free one).
+    if ! av_start_xvfb "$display"; then
+        av_log_warn "Xvfb could not start on ${display}; skipping"
+        _av_rn_add_scenario "xvfb_display" "skip" "Xvfb did not start"
+        _av_rn_write_results "$results_file"
+        # shellcheck disable=SC2034
+        STAGE_SKIPPED=true
+        return 0
+    fi
+
     av_log_info "Running isolated notification scenarios on ${display}..."
 
     _av_rn_run_scenario "delayed_approve"    "delayed_approve"   "approved"  "$display" "$probe_bin"
@@ -326,6 +400,18 @@ stage_real_notifications() {
     _av_rn_run_scenario "deny"               "deny"              "denied"    "$display" "$probe_bin"
     _av_rn_run_scenario "close"              "close"             "denied"    "$display" "$probe_bin"
 
+    # The registration prompt (ADR 0014 amendment section 5): "Register once" is the approving action.
+    local register_args="--action register --wildcard --store-count 1"
+    _av_rn_run_scenario "register_once_approve" "delayed_approve"   "approved"  "$display" "$probe_bin" "$register_args"
+    _av_rn_run_scenario "register_premature"    "premature_approve" "denied"    "$display" "$probe_bin" "$register_args"
+    _av_rn_run_scenario "register_deny"         "deny"              "denied"    "$display" "$probe_bin" "$register_args"
+
+    # The pre-request prompts (amendment sections 5.1 and 5.3), asked in advance with an agent note that must never be shown.
+    local note_marker="AGENT-NOTE-MARK-4d2f"
+    _av_rn_run_scenario "pre_request_approve"  "delayed_approve" "approved" "$display" "$probe_bin" "--pre-request" "$note_marker"
+    _av_rn_run_scenario "pre_request_register" "delayed_approve" "approved" "$display" "$probe_bin" "--action register --pre-request --store-count 0" "$note_marker"
+
+    av_stop_xvfb
     _av_rn_write_results "$results_file"
 
     if [[ $_av_rn_failed -gt 0 ]]; then

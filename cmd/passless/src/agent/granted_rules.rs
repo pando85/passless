@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
-use passless_core::agent::{CredentialRef, GrantSource, ProfileId, validate_rp_id};
+use passless_core::agent::{CredentialRef, GrantSource, ProfileId, RuleIdentity, validate_rp_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -32,8 +32,13 @@ use super::lock_order::{self, LockLevel};
 use super::policy_engine::PolicyRuntime;
 use super::safe_fs::Dir;
 
-/// The only store format version.
-pub const GRANTED_RULES_VERSION: u32 = 1;
+/// The newest store format version (ADR 0014 amendment section 7). Version 2 adds `source` and
+/// makes `origin` optional; the writer writes the lowest version that represents its entries
+/// ([`store_version_for`]), so a store without a pre-request grant stays readable by a daemon
+/// that knows version 1 only.
+pub const GRANTED_RULES_VERSION: u32 = 2;
+/// The original store format version: every entry has an origin and came from a ceremony.
+pub const GRANTED_RULES_VERSION_1: u32 = 1;
 /// Largest store file that is loaded; a larger one disables the profile's grants.
 pub const MAX_STORE_FILE_BYTES: u64 = 256 * 1024;
 /// The store's directory under `agents.state_dir`.
@@ -74,6 +79,32 @@ impl GrantKind {
     }
 }
 
+/// Who raised the escalation behind a granted rule (store version 2, audit version 5).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestSource {
+    /// A ceremony (a page's WebAuthn call) that resolved to `request`.
+    #[default]
+    Ceremony,
+    /// The agent asked in advance (`PrincipalRequest::RequestAccess`; ADR 0014 amendment 2.3).
+    PreRequest,
+}
+
+impl RequestSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ceremony => "ceremony",
+            Self::PreRequest => "pre_request",
+        }
+    }
+
+    pub fn is_ceremony(&self) -> bool {
+        *self == Self::Ceremony
+    }
+}
+
 /// The configured rule that permitted the escalation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PermittingRule {
@@ -106,12 +137,17 @@ pub struct GrantedRule {
     pub granted_at: String,
     /// The approving escalation's ID.
     pub request_id: String,
-    /// The origin of the ceremony that requested the escalation.
-    pub origin: String,
+    /// The origin of the ceremony that requested the escalation. Absent only for an
+    /// `authenticate` pre-request, which has no page (store version 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub rule: PermittingRule,
     /// The credential a registration grant pins (ADR 0014 section 8.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<CredentialRef>,
+    /// Who raised the escalation (store version 2); `ceremony` when absent.
+    #[serde(default, skip_serializing_if = "RequestSource::is_ceremony")]
+    pub source: RequestSource,
 }
 
 impl GrantedRule {
@@ -130,19 +166,51 @@ impl GrantedRule {
             kind,
             granted_at: rfc3339_utc(SystemTime::now()),
             request_id: request_id.to_string(),
-            origin: origin.to_string(),
+            origin: Some(origin.to_string()),
             rule,
             credential_ref,
+            source: RequestSource::Ceremony,
         }
     }
 
+    /// The grant of an escalation raised by `source`, with `origin` when a page was involved
+    /// (ADR 0014 amendment section 7: only an `authenticate` pre-request has none).
+    pub fn from_escalation(
+        rp_id: &str,
+        kind: GrantKind,
+        request_id: &str,
+        origin: Option<&str>,
+        rule: PermittingRule,
+        credential_ref: Option<CredentialRef>,
+        source: RequestSource,
+    ) -> Self {
+        Self {
+            origin: origin.map(str::to_string),
+            source,
+            ..Self::new(rp_id, kind, request_id, "", rule, credential_ref)
+        }
+    }
+
+    /// Whether store version 1 can represent this entry (an origin, from a ceremony).
+    pub fn fits_version_1(&self) -> bool {
+        self.origin.is_some() && self.source == RequestSource::Ceremony
+    }
+
+    /// The origin as shown by the admin listings (empty when the entry has none).
+    pub fn origin_or_empty(&self) -> &str {
+        self.origin.as_deref().unwrap_or("")
+    }
+
     /// Two entries with the same key are duplicates. A registration grant per credential may sit
-    /// next to the RP's escalation grant.
-    fn key(&self) -> (String, GrantedAction, Option<String>) {
+    /// next to the RP's escalation grant, and a grant approved through `*` is a different grant
+    /// from one approved through the exact rule: each upgrades only its own rule, so an approval
+    /// under a new rule must not be swallowed as already granted.
+    fn key(&self) -> (String, GrantedAction, Option<String>, PermittingRule) {
         (
             self.rp_id.clone(),
             self.action,
             self.credential_ref.as_ref().map(CredentialRef::to_hex),
+            self.rule,
         )
     }
 }
@@ -191,6 +259,9 @@ pub enum GrantStoreError {
     Unavailable(String),
     /// The profile holds `max_granted_rules` entries already.
     CapReached(usize),
+    /// The profile holds `max_wildcard_registrations` wildcard registration grants already
+    /// (ADR 0014 amendment section 2.2 item 4).
+    WildcardCapReached(usize),
     InvalidRpId(String),
     /// No matching granted rule.
     NotFound,
@@ -209,6 +280,11 @@ impl fmt::Display for GrantStoreError {
             Self::CapReached(max) => {
                 write!(f, "the profile already holds max_granted_rules ({})", max)
             }
+            Self::WildcardCapReached(max) => write!(
+                f,
+                "the profile already holds max_wildcard_registrations ({}) wildcard registration grants",
+                max
+            ),
             Self::InvalidRpId(e) => write!(f, "invalid RP ID: {}", e),
             Self::NotFound => write!(f, "no matching granted rule"),
             Self::Io(e) => write!(f, "granted-rules store write failed: {}", e),
@@ -419,9 +495,24 @@ impl GrantedRulesStore {
         &self,
         policy: &PolicyRuntime,
         profile: &ProfileId,
+        rule: GrantedRule,
+        max_rules: usize,
+        token: Option<RevokeToken>,
+    ) -> Result<AddOutcome, GrantStoreError> {
+        self.add_with_wildcard_cap(policy, profile, rule, max_rules, token, None)
+    }
+
+    /// [`Self::add_unless_revoked`], also refused with [`GrantStoreError::WildcardCapReached`]
+    /// when `wildcard_cap` is given and the profile already holds that many wildcard registration
+    /// grants ([`wildcard_registration_count`]), checked under the same writer as the write.
+    pub fn add_with_wildcard_cap(
+        &self,
+        policy: &PolicyRuntime,
+        profile: &ProfileId,
         mut rule: GrantedRule,
         max_rules: usize,
         token: Option<RevokeToken>,
+        wildcard_cap: Option<usize>,
     ) -> Result<AddOutcome, GrantStoreError> {
         let normalized =
             validate_rp_id(&rule.rp_id).map_err(|e| GrantStoreError::InvalidRpId(e.to_string()))?;
@@ -442,6 +533,11 @@ impl GrantedRulesStore {
             }
             if rules.len() >= max_rules {
                 return Err(GrantStoreError::CapReached(max_rules));
+            }
+            if let Some(cap) = wildcard_cap
+                && wildcard_registration_count(&rules) >= cap
+            {
+                return Err(GrantStoreError::WildcardCapReached(cap));
             }
             rules.push(rule);
             self.persist_and_swap(profile, rules)?;
@@ -581,7 +677,7 @@ impl GrantedRulesStore {
     ) -> Result<(), GrantStoreError> {
         rules.sort_by_key(GrantedRule::key);
         let file = StoreFile {
-            version: GRANTED_RULES_VERSION,
+            version: store_version_for(&rules),
             profile: profile.as_str().to_string(),
             grants: rules,
         };
@@ -606,30 +702,84 @@ impl GrantedRulesStore {
 }
 
 impl GrantSource for GrantedRulesStore {
-    fn is_granted(&self, profile_id: &ProfileId, rp_id: &str) -> bool {
-        let Ok(normalized) = validate_rp_id(rp_id) else {
-            return false;
-        };
-        self.profile(profile_id).is_some_and(|view| {
-            view.rules()
-                .iter()
-                .any(|rule| rule.rp_id == normalized && rule.action == GrantedAction::Authenticate)
-        })
+    fn is_granted(&self, profile_id: &ProfileId, rp_id: &str, rule: &RuleIdentity) -> bool {
+        self.matching(profile_id, rp_id, rule, |_| true)
+            .next()
+            .is_some()
     }
 
-    fn granted_credential_refs(&self, profile_id: &ProfileId, rp_id: &str) -> Vec<CredentialRef> {
-        let Ok(normalized) = validate_rp_id(rp_id) else {
-            return Vec::new();
-        };
-        let Some(view) = self.profile(profile_id) else {
-            return Vec::new();
-        };
-        view.rules()
-            .iter()
-            .filter(|rule| rule.rp_id == normalized && rule.action == GrantedAction::Authenticate)
-            .filter_map(|rule| rule.credential_ref.clone())
+    fn granted_credential_refs(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+    ) -> Vec<CredentialRef> {
+        self.matching(profile_id, rp_id, rule, |_| true)
+            .filter_map(|grant| grant.credential_ref)
             .collect()
     }
+
+    fn has_escalation_grant(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+    ) -> bool {
+        self.matching(profile_id, rp_id, rule, |grant| {
+            grant.kind == GrantKind::Escalation
+        })
+        .next()
+        .is_some()
+    }
+}
+
+impl GrantedRulesStore {
+    /// The `authenticate` grants of `profile_id` for exactly `rp_id` that were approved through
+    /// the configured rule `rule` and satisfy `keep`. A grant made through `*` never matches an
+    /// exact rule and the reverse; `RuleIdentity::None` matches nothing.
+    fn matching(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+        keep: impl Fn(&GrantedRule) -> bool,
+    ) -> std::vec::IntoIter<GrantedRule> {
+        let permitting = match rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => return Vec::new().into_iter(),
+        };
+        let Ok(normalized) = validate_rp_id(rp_id) else {
+            return Vec::new().into_iter();
+        };
+        let Some(view) = self.profile(profile_id) else {
+            return Vec::new().into_iter();
+        };
+        let found: Vec<GrantedRule> = view
+            .rules()
+            .iter()
+            .filter(|grant| {
+                grant.rp_id == normalized
+                    && grant.action == GrantedAction::Authenticate
+                    && grant.rule == permitting
+                    && keep(grant)
+            })
+            .cloned()
+            .collect();
+        found.into_iter()
+    }
+}
+
+/// How many of `rules` are wildcard registration grants: `kind = "registration"` with
+/// `rule = "*"`. This is what `max_wildcard_registrations` caps (ADR 0014 amendment section 2.2
+/// item 4); revoking such a grant frees a slot.
+pub fn wildcard_registration_count(rules: &[GrantedRule]) -> usize {
+    rules
+        .iter()
+        .filter(|rule| {
+            rule.kind == GrantKind::Registration && rule.rule == PermittingRule::Wildcard
+        })
+        .count()
 }
 
 fn store_path(dir: &Path, profile: &ProfileId) -> PathBuf {
@@ -804,11 +954,32 @@ fn check_dir_handle(handle: &Dir, dir: &Path, owner_uid: u32) -> Result<(), Stri
     Ok(())
 }
 
+/// The lowest store version that represents `rules` (ADR 0014 amendment section 7): version 1
+/// while every entry has an origin and came from a ceremony, version 2 otherwise. A store is
+/// rewritten as version 2 only once a pre-request grant exists, so a downgrade works until then.
+pub fn store_version_for(rules: &[GrantedRule]) -> u32 {
+    if rules.iter().all(GrantedRule::fits_version_1) {
+        GRANTED_RULES_VERSION_1
+    } else {
+        GRANTED_RULES_VERSION
+    }
+}
+
 fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, String> {
     let text = std::str::from_utf8(content).map_err(|_| "not UTF-8".to_string())?;
     let file: StoreFile = toml::from_str(text).map_err(|e| format!("does not parse: {}", e))?;
-    if file.version != GRANTED_RULES_VERSION {
+    if file.version != GRANTED_RULES_VERSION_1 && file.version != GRANTED_RULES_VERSION {
         return Err(format!("unknown version {}", file.version));
+    }
+    // A version 1 file loads as version 2 with `source = "ceremony"`; it may not use a field
+    // that version 1 does not have (an older daemon would refuse it, so this one does too).
+    if file.version == GRANTED_RULES_VERSION_1
+        && let Some(rule) = file.grants.iter().find(|rule| !rule.fits_version_1())
+    {
+        return Err(format!(
+            "version 1 entry for '{}' has no origin or a source other than ceremony",
+            rule.rp_id
+        ));
     }
     if file.profile != profile.as_str() {
         return Err(format!(
@@ -833,6 +1004,15 @@ fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, 
         if rule.kind == GrantKind::Registration && rule.credential_ref.is_none() {
             return Err(format!(
                 "registration grant for '{}' has no credential_ref",
+                rule.rp_id
+            ));
+        }
+        // Only an `authenticate` pre-request has no page: a registration always has an origin.
+        if rule.origin.is_none()
+            && (rule.kind != GrantKind::Escalation || rule.source != RequestSource::PreRequest)
+        {
+            return Err(format!(
+                "grant for '{}' has no origin and is not an authenticate pre-request",
                 rule.rp_id
             ));
         }
@@ -896,7 +1076,7 @@ fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
                     rule.kind.as_str(),
                     rule.granted_at.as_str(),
                     rule.request_id.as_str(),
-                    rule.origin.as_str(),
+                    rule.origin_or_empty(),
                     rule.rule.as_str(),
                     &rule
                         .credential_ref
@@ -906,6 +1086,15 @@ fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
                 ] {
                     hasher.update((field.len() as u64).to_le_bytes());
                     hasher.update(field.as_bytes());
+                }
+                // Version 2 fields (amendment section 7). An entry version 1 can represent adds
+                // nothing, so the digest of a version 1 store is unchanged.
+                if !rule.fits_version_1() {
+                    let origin_present = if rule.origin.is_some() { "1" } else { "0" };
+                    for field in ["v2", rule.source.as_str(), origin_present] {
+                        hasher.update((field.len() as u64).to_le_bytes());
+                        hasher.update(field.as_bytes());
+                    }
                 }
             }
         }
@@ -959,6 +1148,10 @@ mod tests {
 
     fn profile() -> ProfileId {
         ProfileId::new(PROFILE).unwrap()
+    }
+
+    fn exact(rp_id: &str) -> RuleIdentity {
+        RuleIdentity::Exact(rp_id.to_string())
     }
 
     fn config() -> AgentConfig {
@@ -1048,7 +1241,7 @@ rule = "exact"
             reason.contains(needle),
             "reason {reason:?} does not mention {needle:?}"
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1091,10 +1284,10 @@ rule = "exact"
             store.profile(&profile()).unwrap().as_ref()
         );
         assert_eq!(reopened.profile(&profile()).unwrap().rules().len(), 2);
-        assert!(reopened.is_granted(&profile(), "example.com"));
-        assert!(!reopened.is_granted(&profile(), "other.example"));
+        assert!(reopened.is_granted(&profile(), "example.com", &exact("example.com")));
+        assert!(!reopened.is_granted(&profile(), "other.example", &exact("other.example")));
         assert_eq!(
-            reopened.granted_credential_refs(&profile(), "example.com"),
+            reopened.granted_credential_refs(&profile(), "example.com", &exact("example.com")),
             vec![credential]
         );
         assert_eq!(
@@ -1104,6 +1297,91 @@ rule = "exact"
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.starts_with("version = 1\n"), "{content}");
         assert!(content.contains("[[grant]]"), "{content}");
+    }
+
+    fn grant_of(
+        rp_id: &str,
+        kind: GrantKind,
+        rule: PermittingRule,
+        credential: Option<&CredentialRef>,
+    ) -> GrantedRule {
+        GrantedRule::new(
+            rp_id,
+            kind,
+            "req",
+            "https://example.org",
+            rule,
+            credential.cloned(),
+        )
+    }
+
+    /// Review M1: a grant answers only for the rule it was approved through.
+    #[test]
+    fn grants_match_by_the_rule_they_were_approved_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let store = open(tmp.path());
+        let credential = CredentialRef::with_default_domain(&[7; 32]);
+        store
+            .add(
+                &policy,
+                &profile(),
+                grant_of(
+                    "example.org",
+                    GrantKind::Registration,
+                    PermittingRule::Wildcard,
+                    Some(&credential),
+                ),
+                64,
+            )
+            .unwrap();
+        let wildcard = RuleIdentity::Wildcard;
+        let exact_rule = exact("example.org");
+        assert!(store.is_granted(&profile(), "example.org", &wildcard));
+        assert!(!store.is_granted(&profile(), "example.org", &exact_rule));
+        assert!(!store.is_granted(&profile(), "example.org", &RuleIdentity::None));
+        assert_eq!(
+            store.granted_credential_refs(&profile(), "example.org", &wildcard),
+            vec![credential.clone()]
+        );
+        assert!(
+            store
+                .granted_credential_refs(&profile(), "example.org", &exact_rule)
+                .is_empty()
+        );
+        // Registration grants alone are not an escalation grant.
+        assert!(!store.has_escalation_grant(&profile(), "example.org", &wildcard));
+
+        // An approval through the exact rule is its own grant, not swallowed as a duplicate of
+        // the `*` one, and it does not widen the `*` rule.
+        let escalated = grant_of(
+            "example.org",
+            GrantKind::Escalation,
+            PermittingRule::Exact,
+            None,
+        );
+        assert!(matches!(
+            store.add(&policy, &profile(), escalated.clone(), 64),
+            Ok(AddOutcome::Added { .. })
+        ));
+        assert_eq!(
+            store.add(&policy, &profile(), escalated, 64),
+            Ok(AddOutcome::AlreadyGranted)
+        );
+        assert!(store.is_granted(&profile(), "example.org", &exact_rule));
+        assert!(store.has_escalation_grant(&profile(), "example.org", &exact_rule));
+        assert!(!store.has_escalation_grant(&profile(), "example.org", &wildcard));
+        assert!(
+            store
+                .granted_credential_refs(&profile(), "example.org", &exact_rule)
+                .is_empty(),
+            "the exact escalation grant records no credential"
+        );
+        // Both grants survive a reload.
+        let reopened = open(tmp.path());
+        assert_eq!(reopened.profile(&profile()).unwrap().rules().len(), 2);
+        assert!(reopened.is_granted(&profile(), "example.org", &wildcard));
+        assert!(reopened.is_granted(&profile(), "example.org", &exact_rule));
     }
 
     #[test]
@@ -1159,12 +1437,12 @@ rule = "exact"
         fs::write(&leftover, "garbage from a crash").unwrap();
 
         let store = open(tmp.path());
-        assert!(store.is_granted(&profile(), "example.com"));
+        assert!(store.is_granted(&profile(), "example.com", &exact("example.com")));
         store
             .add(&policy(), &profile(), escalation("other.example"), 64)
             .unwrap();
         assert!(!leftover.exists());
-        assert!(open(tmp.path()).is_granted(&profile(), "other.example"));
+        assert!(open(tmp.path()).is_granted(&profile(), "other.example", &exact("other.example")));
     }
 
     #[test]
@@ -1186,10 +1464,10 @@ rule = "exact"
         let tmp = tempfile::tempdir().unwrap();
         seed(
             tmp.path(),
-            &VALID.replace("version = 1", "version = 2"),
+            &VALID.replace("version = 1", "version = 3"),
             0o600,
         );
-        assert_disabled(tmp.path(), "unknown version 2");
+        assert_disabled(tmp.path(), "unknown version 3");
     }
 
     #[test]
@@ -1216,7 +1494,7 @@ rule = "exact"
             .unwrap()
             .to_string();
         assert!(reason.contains("owned by uid"), "{reason}");
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1246,7 +1524,7 @@ rule = "exact"
                 .unwrap()
                 .is_some()
         );
-        assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     /// Review L4: a store directory that is a symlink is refused, for reads and for writes, and
@@ -1267,7 +1545,7 @@ rule = "exact"
 
         assert_disabled(tmp.path(), "symlink");
         let store = open(tmp.path());
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
 
         // Writes refuse as well, and the link target is untouched.
         let err = write_atomically(
@@ -1315,7 +1593,7 @@ rule = "exact"
             .add(&policy(), &profile(), escalation("other.example"), 64)
             .unwrap();
         assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
-        assert!(open(tmp.path()).is_granted(&profile(), "other.example"));
+        assert!(open(tmp.path()).is_granted(&profile(), "other.example", &exact("other.example")));
         assert!(!dir.join(".agent.toml.tmp").exists());
     }
 
@@ -1341,7 +1619,7 @@ rule = "exact"
                 .file_type()
                 .is_symlink()
         );
-        assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1368,7 +1646,7 @@ rule = "exact"
             .unwrap();
         let dir = state.join(GRANTED_RULES_DIR);
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
-        assert!(open(&state).is_granted(&profile(), "example.com"));
+        assert!(open(&state).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1383,7 +1661,7 @@ rule = "exact"
             .add(&policy(), &profile(), escalation("example.com"), 64)
             .unwrap();
         assert!(real.join(GRANTED_RULES_DIR).join("agent.toml").is_file());
-        assert!(open(&link).is_granted(&profile(), "example.com"));
+        assert!(open(&link).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1515,8 +1793,8 @@ rule = "exact"
             live.validity(policy.revocation_epoch(), Instant::now()),
             Err(SessionInvalid::EpochChanged)
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
-        assert!(!open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
+        assert!(!open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
 
         let outcome = store.clear(&policy, &profile()).unwrap();
         assert_eq!(outcome.revoked, 1);
@@ -1556,9 +1834,9 @@ rule = "exact"
         let outcome = store.revoke_request(&policy, &profile(), "esc-1").unwrap();
         assert_eq!(outcome.revoked, 1);
         assert_eq!(policy.revocation_epoch(), revocation_epoch + 1);
-        assert!(!store.is_granted(&profile(), "example.com"));
-        assert!(store.is_granted(&profile(), "other.example"));
-        assert!(!open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
+        assert!(store.is_granted(&profile(), "other.example", &exact("other.example")));
+        assert!(!open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1602,7 +1880,7 @@ rule = "exact"
             store.profile(&profile()).unwrap().disabled_reason(),
             Some("no state dir")
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
         assert!(matches!(
             store.add(&policy(), &profile(), escalation("example.com"), 64),
             Err(GrantStoreError::Unavailable(_))
@@ -1636,7 +1914,7 @@ rule = "exact"
             ),
             Err(GrantStoreError::Revoked)
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
 
         // Another RP's token is unaffected by that revoke.
         let other = store.revoke_token(&profile(), "other.example").unwrap();
@@ -1649,7 +1927,7 @@ rule = "exact"
                 Some(other),
             )
             .unwrap();
-        assert!(store.is_granted(&profile(), "other.example"));
+        assert!(store.is_granted(&profile(), "other.example", &exact("other.example")));
 
         // A fresh token works; a clear makes every token of the profile stale.
         let fresh = store.revoke_token(&profile(), "example.com").unwrap();
@@ -1688,5 +1966,157 @@ rule = "exact"
             rfc3339_utc(SystemTime::UNIX_EPOCH + Duration::from_secs(951_782_400)),
             "2000-02-29T00:00:00Z"
         );
+    }
+
+    /// An `authenticate` pre-request's grant: no origin, `source = "pre_request"`.
+    fn pre_request_grant(rp_id: &str) -> GrantedRule {
+        GrantedRule::from_escalation(
+            rp_id,
+            GrantKind::Escalation,
+            "esc-pre",
+            None,
+            PermittingRule::Wildcard,
+            None,
+            RequestSource::PreRequest,
+        )
+    }
+
+    #[test]
+    fn a_version_1_store_loads_as_version_2_with_ceremony_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), VALID, 0o600);
+        let store = open(tmp.path());
+        let rules = store.profile(&profile()).unwrap().rules().to_vec();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].source, RequestSource::Ceremony);
+        assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn the_writer_keeps_version_1_until_a_pre_request_grant_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let store = open(tmp.path());
+        let file = store.path_for(&profile());
+        store
+            .add(&policy, &profile(), escalation("example.com"), 64)
+            .unwrap();
+        let v1 = fs::read_to_string(&file).unwrap();
+        assert!(v1.starts_with("version = 1\n"), "{v1}");
+        assert!(!v1.contains("source"), "{v1}");
+        let v1_digest = store.grants_digest(&profile());
+
+        store
+            .add(&policy, &profile(), pre_request_grant("other.example"), 64)
+            .unwrap();
+        let v2 = fs::read_to_string(&file).unwrap();
+        assert!(v2.starts_with("version = 2\n"), "{v2}");
+        assert!(v2.contains("source = \"pre_request\""), "{v2}");
+        // The pre-request entry has no origin line; the ceremony entry keeps its own and writes
+        // no source (the default).
+        assert_eq!(v2.matches("origin = ").count(), 1, "{v2}");
+        assert_eq!(v2.matches("source = ").count(), 1, "{v2}");
+
+        // Version 2 round trip.
+        let reopened = open(tmp.path());
+        let rules = reopened.profile(&profile()).unwrap().rules().to_vec();
+        let pre = rules.iter().find(|r| r.rp_id == "other.example").unwrap();
+        assert_eq!(pre.source, RequestSource::PreRequest);
+        assert_eq!(pre.origin, None);
+        assert!(reopened.is_granted(&profile(), "other.example", &RuleIdentity::Wildcard));
+        assert_eq!(
+            reopened.grants_digest(&profile()),
+            store.grants_digest(&profile())
+        );
+        assert_ne!(store.grants_digest(&profile()), v1_digest);
+
+        // Revoking the only pre-request grant writes version 1 again (a downgrade works).
+        store
+            .revoke(
+                &policy,
+                &profile(),
+                "other.example",
+                GrantedAction::Authenticate,
+            )
+            .unwrap();
+        let again = fs::read_to_string(&file).unwrap();
+        assert!(again.starts_with("version = 1\n"), "{again}");
+        assert_eq!(store.grants_digest(&profile()), v1_digest);
+    }
+
+    #[test]
+    fn the_lowest_version_follows_the_entries() {
+        let ceremony = escalation("example.com");
+        assert_eq!(store_version_for(&[]), 1);
+        assert_eq!(store_version_for(std::slice::from_ref(&ceremony)), 1);
+        // A pre-request with an origin (a registration it led to) still needs version 2.
+        let with_origin = GrantedRule::from_escalation(
+            "example.com",
+            GrantKind::Registration,
+            "esc-3",
+            Some("https://example.com"),
+            PermittingRule::Exact,
+            Some(CredentialRef::with_default_domain(b"c")),
+            RequestSource::PreRequest,
+        );
+        assert_eq!(store_version_for(&[ceremony.clone(), with_origin]), 2);
+        assert_eq!(
+            store_version_for(&[ceremony, pre_request_grant("other.example")]),
+            2
+        );
+    }
+
+    #[test]
+    fn a_version_1_file_with_a_version_2_field_disables_the_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!("{VALID}source = \"pre_request\"\n"),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "version 1 entry");
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &VALID.replace("origin = \"https://example.com\"\n", ""),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "version 1 entry");
+    }
+
+    #[test]
+    fn only_an_authenticate_pre_request_may_lack_an_origin() {
+        let base = VALID
+            .replace("version = 1", "version = 2")
+            .replace("origin = \"https://example.com\"\n", "");
+        // An origin-less ceremony grant.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &base, 0o600);
+        assert_disabled(tmp.path(), "no origin");
+        // An origin-less registration grant, even from a pre-request.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!(
+                "{}source = \"pre_request\"\ncredential_ref = \"{}\"\n",
+                base.replace("kind = \"escalation\"", "kind = \"registration\""),
+                CredentialRef::with_default_domain(b"c").to_hex()
+            ),
+            0o600,
+        );
+        assert_disabled(tmp.path(), "no origin");
+        // An authenticate pre-request without an origin loads.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &format!("{base}source = \"pre_request\"\n"),
+            0o600,
+        );
+        let store = open(tmp.path());
+        assert!(store.is_granted(&profile(), "example.com", &exact("example.com")));
+        // An unknown source value disables the profile.
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &format!("{base}source = \"agent\"\n"), 0o600);
+        assert_disabled(tmp.path(), "does not parse");
     }
 }

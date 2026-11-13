@@ -1382,8 +1382,31 @@ fn test_client_set_cred_protect() {
     let other_before = cli_levels(home.path(), "example.com");
     assert_eq!(other_before.len(), 1);
 
-    // Lower every credential of the RP (this is the first command to a daemon that
-    // auto-accepts built-in user verification, so it needs no PIN).
+    // New credentials default to level 2 (soft-fido2 0.18). Raise the RP to level 3 first, as
+    // credentials created by earlier versions are, so lowering below has something to do. This
+    // is the first command to a daemon that auto-accepts built-in user verification, so it
+    // needs no PIN.
+    let (stdout, stderr, ok) = run_client_cli(
+        home.path(),
+        &[
+            "-o",
+            "json",
+            "set-cred-protect",
+            "--rp",
+            "ssh:",
+            "--level",
+            "3",
+            "--yes",
+        ],
+    );
+    assert!(ok, "initial raise failed: {stderr}\n{stdout}");
+    assert!(
+        cli_levels(home.path(), "ssh:")
+            .iter()
+            .all(|(_, level)| *level == Some(3))
+    );
+
+    // Lower every credential of the RP.
     let (stdout, stderr, ok) = run_client_cli(
         home.path(),
         &[

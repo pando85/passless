@@ -12,12 +12,12 @@ use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
-use super::audit_events::{
-    AuditAction, EscalationAuditContext, EscalationDenyCause, PolicyDenyReason,
-};
+use super::audit_events::{AuditAction, EscalationDenyCause, PolicyDenyReason};
 use super::escalation::{
-    EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, WaiterSession,
+    EscalationOutcome, EscalationService, NoPark, ParkHook, PreApprovalConsumer,
+    RegistrationApproval, StoreCounter, WaiterSession,
 };
+use super::granted_rules::{PermittingRule, RequestSource};
 use super::lock_order::{self, LockLevel};
 use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
 use super::policy_engine::PolicyRuntime;
@@ -82,11 +82,60 @@ pub struct RegisterHandler {
     pub audit_deployment: AuditDeployment,
 }
 
-/// A registration approval is bound to the creating ceremony: its profile, RP and session.
-fn approval_matches(approval: &RegistrationApproval, ctx: &RegisterContext, rp_id: &str) -> bool {
+/// Counts the target store's passkeys for an RP for the registration prompt (review L4): the
+/// backend's path index only, under the storage lock for the count alone.
+pub(crate) struct StorageCounter(pub(crate) Arc<Mutex<Box<dyn CredentialStorage>>>);
+
+impl std::fmt::Debug for StorageCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageCounter").finish_non_exhaustive()
+    }
+}
+
+impl StoreCounter for StorageCounter {
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        lock_order::lock(&self.0, LockLevel::Storage).count_for_rp(rp_id)
+    }
+}
+
+/// A registration approval is bound to the creating ceremony: its profile, RP and session. One
+/// that came from a pre-request (adopted, or consumed as a pre-approval) is also bound to its
+/// principal session, which must still own the ceremony's bearer session through its session
+/// grant (ADR 0014 amendment section 2.3).
+fn approval_matches(
+    approval: &RegistrationApproval,
+    ctx: &RegisterContext,
+    rp_id: &str,
+    policy: &PolicyRuntime,
+) -> bool {
     approval.profile() == &ctx.profile_id
         && approval.rp_id() == rp_id
         && approval.session() == WaiterSession::of(&ctx.session)
+        && match (approval.source(), approval.principal()) {
+            (RequestSource::Ceremony, _) => true,
+            (RequestSource::PreRequest, Some(principal)) => {
+                ctx.session.owning_principal_session(policy).as_ref() == Some(principal)
+            }
+            (RequestSource::PreRequest, None) => false,
+        }
+}
+
+/// How the escalated path of a registration gets its approval.
+enum Approval {
+    /// It raises (or adopts) an escalation and waits for the human.
+    Escalate(PreparedEscalation),
+    /// It consumed a pre-approval of its principal session (ADR 0014 amendment section 2.3).
+    PreApproved(RegistrationApproval),
+}
+
+/// What a registration that needs an approval has prepared before its replay key is claimed.
+enum Prepared {
+    /// A usable pre-approval of its principal session exists. It is taken only once the replay
+    /// key is fresh (a duplicate must not spend it); if it is gone by then, the ceremony raises
+    /// its own escalation.
+    PreApprovalAvailable,
+    /// Its own escalation, to raise once the key is fresh.
+    Escalate(Box<PreparedEscalation>),
 }
 
 /// What the escalated path carries into [`RegisterHandler::register_fresh`].
@@ -234,7 +283,7 @@ impl RegisterHandler {
     ///
     /// 1. bearer session (revocation, epoch, TTL, profile, grant principal);
     /// 2. origin and RP validation;
-    /// 3. resolve `register` against the live policy (exact rule only; never the wildcard);
+    /// 3. resolve `register` against the live policy (an exact rule, or the `*` rule's `request`);
     /// 4. options the authenticator cannot honor (`NotSupportedError`): extensions, enterprise
     ///    attestation, no supported algorithm; and malformed fields;
     /// 5. replay key, then budget; for `request`, the replay key only, then this ceremony's own
@@ -325,9 +374,11 @@ impl RegisterHandler {
         }
 
         // 3. Registration authority is policy only (ADR 0014 section 10.3): an exact RP rule with
-        //    `register = "allow"`, resolved against the live policy on every request (plan R16).
-        //    There is no operator-minted enrollment grant. A wildcard rule never permits
-        //    registration (section 6.3): `resolve` never matches the wildcard for `register`.
+        //    `register = "allow"` or `"request"`, or the `*` rule with `register = "request"`
+        //    (amendment section 2.2), resolved against the live policy on every request (plan
+        //    R16). There is no operator-minted enrollment grant. The wildcard never permits a
+        //    registration without a human: a wildcard `allow` resolves to `deny`, and `*` never
+        //    matches `localhost`.
         let matched =
             self.policy_runtime
                 .resolve(&ctx.profile_id, &GrantAction::Register, &normalized_rp);
@@ -427,6 +478,15 @@ impl RegisterHandler {
             req.top_origin.as_deref(),
             &challenge,
         );
+        // The prompt shows how many passkeys the target store already holds for the site
+        // (amendment section 5.2): counted from the backend's path index, never by decrypting.
+        // The count is taken when the prompt is shown (a queued prompt waits behind others), by
+        // the escalation service with no escalation lock held, under the storage lock for the
+        // count alone and never across the wait (LOCKING.md). It goes to the human only.
+        let store_counter: Option<Arc<dyn StoreCounter>> = (matched.action == RuleAction::Request)
+            .then(|| {
+                Arc::new(StorageCounter(self.credential_storage.clone())) as Arc<dyn StoreCounter>
+            });
         let escalation = Escalation {
             service: &self.escalation,
             policy_runtime: &self.policy_runtime,
@@ -437,13 +497,23 @@ impl RegisterHandler {
             origin: &req.origin,
             rule: &matched.rule,
             audit,
+            store_counter,
         };
+        // A pre-approval of the principal session that owns this bearer replaces the ceremony's
+        // own escalation: it is looked for here, after the option checks (an unsupported request
+        // does not spend it), but consumed only below, once the replay key is fresh (a duplicate,
+        // joined or replayed ceremony must not spend it). From there the path is the one of an
+        // approved ceremony-time escalation (ADR 0014 amendment section 2.3).
         let prepared = if matched.action == RuleAction::Request {
-            Some(
-                escalation
-                    .prepare()
-                    .map_err(|refused| self.deny(target, refused))?,
-            )
+            if self.has_pre_approval(ctx, &matched.rule, target, &req.origin, audit) {
+                Some(Prepared::PreApprovalAvailable)
+            } else {
+                Some(Prepared::Escalate(Box::new(
+                    escalation
+                        .prepare()
+                        .map_err(|refused| self.deny(target, refused))?,
+                )))
+            }
         } else {
             None
         };
@@ -465,8 +535,24 @@ impl RegisterHandler {
         match claim {
             Claim::Fresh(mut guard) => {
                 let mut key_used = false;
-                let outcome = if let Some(prepared) = prepared {
-                    self.register_escalated(
+                let prepared = match prepared {
+                    Some(Prepared::PreApprovalAvailable) => {
+                        match self.take_pre_approval(ctx, &matched.rule, target, &req.origin, audit)
+                        {
+                            Some(approval) => Ok(Some(Approval::PreApproved(approval))),
+                            // Spent, dropped or invalid since the look: escalate as usual.
+                            None => escalation
+                                .prepare()
+                                .map(|prepared| Some(Approval::Escalate(prepared)))
+                                .map_err(|refused| self.deny(target, refused)),
+                        }
+                    }
+                    Some(Prepared::Escalate(prepared)) => Ok(Some(Approval::Escalate(*prepared))),
+                    None => Ok(None),
+                };
+                let outcome = match prepared {
+                    Err(denied) => Err(denied),
+                    Ok(Some(prepared)) => self.register_escalated(
                         ctx,
                         req,
                         target,
@@ -480,9 +566,8 @@ impl RegisterHandler {
                         cancelled,
                         park,
                         &mut key_used,
-                    )
-                } else {
-                    self.register_fresh(
+                    ),
+                    Ok(None) => self.register_fresh(
                         ctx,
                         req,
                         target,
@@ -491,7 +576,7 @@ impl RegisterHandler {
                         None,
                         cancelled,
                         &mut key_used,
-                    )
+                    ),
                 };
                 let ceremony = outcome
                     .clone()
@@ -534,25 +619,30 @@ impl RegisterHandler {
         ctx: &RegisterContext,
         req: &RegisterCredentialRequest,
         target: &AuditTarget,
-        (escalation, prepared): (&Escalation<'_>, PreparedEscalation),
+        (escalation, prepared): (&Escalation<'_>, Approval),
         fresh: Fresh<'_>,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
         park: &mut dyn ParkHook,
         key_used: &mut bool,
     ) -> Result<RegisterCredentialResponse, ProtocolError> {
-        let approval = match escalation.wait(prepared, deadline, cancelled, park) {
-            Ok(EscalationOutcome::RegistrationApproved(approval)) => approval,
-            Ok(_) => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Internal,
-                    "a registration escalation ended without a registration approval",
-                    RecommendedAction::Abort,
-                ));
+        let approval = match prepared {
+            Approval::PreApproved(approval) => approval,
+            Approval::Escalate(prepared) => {
+                match escalation.wait(prepared, deadline, cancelled, park) {
+                    Ok(EscalationOutcome::RegistrationApproved(approval)) => approval,
+                    Ok(_) => {
+                        return Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            "a registration escalation ended without a registration approval",
+                            RecommendedAction::Abort,
+                        ));
+                    }
+                    Err(denied) => return Err(self.deny(target, denied)),
+                }
             }
-            Err(denied) => return Err(self.deny(target, denied)),
         };
-        if !approval_matches(&approval, ctx, target.rp_id) {
+        if !approval_matches(&approval, ctx, target.rp_id, &self.policy_runtime) {
             return Err(self.deny(
                 target,
                 (
@@ -584,17 +674,26 @@ impl RegisterHandler {
             key_used,
         )?;
 
-        // The operation and storage locks are released: persist the registration grant.
-        let max_granted_rules = self
+        // The operation and storage locks are released: persist the registration grant. For a
+        // registration through `*` it carries `rule = "*"` and counts against
+        // `max_wildcard_registrations`; the next sign-in at the RP uses this credential only
+        // (amendment section 2.2 items 2 and 3).
+        let (max_granted_rules, max_wildcard_registrations) = self
             .policy_runtime
             .escalation_profile(&ctx.profile_id)
-            .map_or(0, |profile| profile.max_granted_rules);
+            .map_or((0, 0), |profile| {
+                (
+                    profile.max_granted_rules,
+                    profile.max_wildcard_registrations,
+                )
+            });
         match registration_credential_ref(&response.credential_id_b64u) {
             Ok(credential_ref) => {
                 if let Err(e) = self.escalation.record_registration_grant(
                     &approval,
                     credential_ref,
                     max_granted_rules,
+                    max_wildcard_registrations,
                 ) {
                     warn!(
                         "agent register: credential for rp={} kept without a registration grant: {}",
@@ -608,18 +707,11 @@ impl RegisterHandler {
                     "agent register: credential for rp={} kept without a registration grant: {}",
                     target.rp_id, e
                 );
-                let context = EscalationAuditContext {
-                    escalation_id: approval.escalation_id().as_str().to_string(),
-                    profile_id: approval.profile().clone(),
-                    action: AuditAction::Register,
-                    rp_id: approval.rp_id().to_string(),
-                    origin: approval.origin().to_string(),
-                    rule: approval.rule(),
-                };
-                if let Err(audit_error) = self
-                    .audit_gate
-                    .record(context.denied(EscalationDenyCause::GrantWriteFailed))
-                {
+                if let Err(audit_error) = self.audit_gate.record(
+                    approval
+                        .audit_context()
+                        .denied(EscalationDenyCause::GrantWriteFailed),
+                ) {
                     warn!(
                         "agent register: the failed grant write could not be audited: {}",
                         audit_error
@@ -628,6 +720,66 @@ impl RegisterHandler {
             }
         }
         Ok(response)
+    }
+
+    /// Whether this bearer's principal session has a usable pre-approval for the RP: the look
+    /// that [`Self::take_pre_approval`] follows once the replay key is fresh. Consumes nothing.
+    fn has_pre_approval(
+        &self,
+        ctx: &RegisterContext,
+        rule: &RuleIdentity,
+        target: &AuditTarget,
+        origin: &str,
+        audit: &CeremonyAudit,
+    ) -> bool {
+        let rule = match rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => return false,
+        };
+        let Some(principal) = ctx.session.owning_principal_session(&self.policy_runtime) else {
+            return false;
+        };
+        self.escalation.has_pre_approval(&PreApprovalConsumer {
+            profile: &ctx.profile_id,
+            rp_id: target.rp_id,
+            principal: &principal,
+            rule,
+            session: WaiterSession::of(&ctx.session),
+            origin,
+            request_id: audit.request_id(),
+        })
+    }
+
+    /// Consume this bearer's principal session's pre-approval for the RP, if it has one (ADR 0014
+    /// amendment section 2.3). Only a bearer whose session grant is active and bound to it has an
+    /// owner; anything else consumes nothing and escalates as usual.
+    fn take_pre_approval(
+        &self,
+        ctx: &RegisterContext,
+        rule: &RuleIdentity,
+        target: &AuditTarget,
+        origin: &str,
+        audit: &CeremonyAudit,
+    ) -> Option<RegistrationApproval> {
+        let rule = match rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => return None,
+        };
+        let principal = ctx.session.owning_principal_session(&self.policy_runtime)?;
+        let approval = self.escalation.take_pre_approval(PreApprovalConsumer {
+            profile: &ctx.profile_id,
+            rp_id: target.rp_id,
+            principal: &principal,
+            rule,
+            session: WaiterSession::of(&ctx.session),
+            origin,
+            request_id: audit.request_id(),
+        })?;
+        audit.escalation(approval.escalation_id().as_str());
+        audit.approval_source(approval.source());
+        Some(approval)
     }
 
     /// Before a duplicate gets the stored outcome its session must still be valid (review L3);
@@ -667,7 +819,9 @@ impl RegisterHandler {
         // A configured `request` permits key use only with this ceremony's own approval (ADR 0014
         // section 8.3).
         let approved = matched.configured == RuleAction::Request
-            && approval.is_some_and(|approval| approval_matches(approval, ctx, rp_id));
+            && approval.is_some_and(|approval| {
+                approval_matches(approval, ctx, rp_id, &self.policy_runtime)
+            });
         if matched.action != RuleAction::Allow && !approved {
             return Err(self.deny(
                 target,
@@ -1132,6 +1286,18 @@ mod tests {
         fn count_credentials(&self) -> usize {
             self.creds.lock().unwrap().len()
         }
+
+        /// Like the path index of the real backends: counts without reading a credential.
+        fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+            Some(
+                self.creds
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.rp.id == rp_id)
+                    .count(),
+            )
+        }
     }
 
     fn make_test_security_config() -> SecurityConfig {
@@ -1158,6 +1324,9 @@ mod tests {
 
     fn profile_with_rules(rules: Vec<AgentRpRule>) -> AgentProfileConfig {
         AgentProfileConfig {
+            max_wildcard_registrations: None,
+            wildcard_registration_prompts_per_day: None,
+            pre_request_actions: Vec::new(),
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
@@ -1297,7 +1466,8 @@ mod tests {
             profiles,
             audit_path: Some(std::path::PathBuf::from("/tmp/test-audit")),
             acknowledge_global_same_user: vec![profile_id.as_str().to_string()],
-            acknowledge_same_user_registration: vec![],
+            acknowledge_same_user_registration: vec![profile_id.as_str().to_string()],
+            acknowledge_global_registration: vec![profile_id.as_str().to_string()],
         }
     }
 
@@ -2022,13 +2192,35 @@ mod tests {
         config
     }
 
+    /// A same-user profile whose `*` rule requests both actions, with no pins (ADR 0014
+    /// amendment section 3), plus an exact rule for `exact.example` that requests registration.
+    fn wildcard_request_config() -> AgentProfileConfig {
+        let mut config = profile_with_rules(vec![
+            AgentRpRule {
+                rp_id: WILDCARD_RP_ID.to_string(),
+                register: RuleAction::Request,
+                authenticate: RuleAction::Request,
+                credential_selection: None,
+            },
+            AgentRpRule {
+                rp_id: "exact.example".to_string(),
+                register: RuleAction::Request,
+                authenticate: RuleAction::Allow,
+                credential_selection: None,
+            },
+        ]);
+        config.mode = AgentMode::SameUser;
+        config.principal_user = "alice".to_string();
+        config.credential_refs = None;
+        config
+    }
+
     #[test]
-    fn test_register_under_wildcard_is_always_denied() {
-        // `register = "deny"` is the only configuration the wildcard allows (section 6.3) ...
-        // ... but resolution also never lets a wildcard rule that says `allow` or `request`
-        // grant registration, so a validation bug elsewhere can never turn the wildcard into
-        // registration authority.
-        for register in [RuleAction::Deny, RuleAction::Allow, RuleAction::Request] {
+    fn test_wildcard_register_allow_resolves_to_deny() {
+        // `register = "allow"` on `*` is invalid configuration (see the config tests), and
+        // resolution maps it to `deny` as defence in depth (amendment section 4): no prompt, no
+        // credential. A wildcard `deny` is the default deny.
+        for register in [RuleAction::Deny, RuleAction::Allow] {
             let f = make_fixture_with_config(wildcard_register_config(register));
             let err = f
                 .make_handler()
@@ -2040,9 +2232,39 @@ mod tests {
                 vec![("example.com".to_string(), "action_not_allowed".to_string())],
                 "{register}"
             );
+            assert_eq!(f.prompter.shown(), 0);
             let boxed = f.storage.lock().unwrap();
             assert_eq!(boxed.count_credentials(), 0, "no credential may be written");
         }
+    }
+
+    #[test]
+    fn test_wildcard_registration_without_its_acknowledgement_is_refused() {
+        // Validation refuses this configuration at startup (amendment section 3); a policy
+        // compiled without the acknowledgement is refused again at the escalation, without a
+        // prompt (fail closed).
+        let config = wildcard_request_config();
+        let mut unacknowledged = agent_config_for(&ProfileId::new("p").unwrap(), config.clone());
+        unacknowledged.acknowledge_global_registration.clear();
+        let err = unacknowledged.validate(None).unwrap_err().to_string();
+        assert!(err.contains("acknowledge_global_registration"), "{err}");
+
+        let f = make_fixture_with_config(config);
+        f.policy_runtime
+            .reload(&{
+                let mut c = agent_config_for(&f.profile_id, wildcard_request_config());
+                c.acknowledge_global_registration.clear();
+                c
+            })
+            .unwrap();
+        let err = f
+            .make_handler()
+            .register(&f.make_ctx(), &f.make_req())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(deny_reasons(&f).last().unwrap().1, "action_not_allowed");
+        assert_eq!(f.prompter.shown(), 0);
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
     }
 
     #[test]
@@ -2876,5 +3098,584 @@ mod tests {
             f.policy_runtime
                 .resolve(&f.profile_id, &GrantAction::Authenticate, "example.com");
         assert_eq!(auth.action, RuleAction::Request);
+    }
+
+    // --- Registration at unlisted sites (ADR 0014 amendment section 2.2) ---
+
+    fn req_for(
+        f: &RegisterTestFixture,
+        rp_id: &str,
+        challenge: &[u8],
+    ) -> RegisterCredentialRequest {
+        RegisterCredentialRequest {
+            rp_id: rp_id.to_string(),
+            origin: format!("https://www.{rp_id}"),
+            challenge_b64u: b64u_encode(challenge),
+            ..f.make_req()
+        }
+    }
+
+    /// A credential the human already holds at `rp_id`.
+    fn human_credential(f: &RegisterTestFixture, rp_id: &str, id: u8) {
+        let mut boxed = f.storage.lock().unwrap();
+        let generated = SoftwareCredentialKeyProvider.generate(-7).unwrap();
+        let credential = soft_fido2::Credential {
+            id: vec![id; 32],
+            rp: RelyingParty::new(rp_id.into()),
+            user: User::new(vec![id]),
+            sign_count: 0,
+            alg: -7,
+            key: generated.key,
+            created: 0,
+            discoverable: true,
+            backup_state: CredentialBackupState::NotEligible,
+            extensions: soft_fido2::Extensions::default(),
+        };
+        boxed
+            .write(soft_fido2::CredentialRef {
+                id: &credential.id,
+                rp_id: &credential.rp.id,
+                rp_name: None,
+                user_id: &credential.user.id,
+                user_name: None,
+                user_display_name: None,
+                sign_count: &credential.sign_count,
+                alg: &credential.alg,
+                key: &credential.key,
+                created: &credential.created,
+                discoverable: &credential.discoverable,
+                cred_protect: None,
+                cred_random: None,
+                backup_state: &credential.backup_state,
+            })
+            .unwrap();
+    }
+
+    fn wildcard_fixture(tune: impl FnOnce(&mut AgentProfileConfig)) -> RegisterTestFixture {
+        let mut config = wildcard_request_config();
+        tune(&mut config);
+        make_fixture_with_config(config)
+    }
+
+    /// Run one registration through `*` at `rp_id` and approve it.
+    fn approved_wildcard_registration(
+        f: &RegisterTestFixture,
+        rp_id: &str,
+        prompts_before: usize,
+    ) -> RegisterCredentialResponse {
+        let ceremony = register_on_thread(f, &f.make_ctx(), req_for(f, rp_id, rp_id.as_bytes()));
+        f.prompter.approve(prompts_before + 1);
+        ceremony
+            .join()
+            .unwrap()
+            .expect("approved wildcard registration")
+    }
+
+    #[test]
+    fn wildcard_registration_is_prompted_once_and_persists_a_wildcard_grant() {
+        let f = wildcard_fixture(|_| {});
+        human_credential(&f, "example.org", 7);
+        let ctx = f.make_ctx();
+        let ceremony = register_on_thread(&f, &ctx, req_for(&f, "example.org", b"one"));
+        f.prompter.wait_shown(1);
+
+        // The prompt is a registration prompt through `*`, with the store count (amendment 5).
+        let fields = f.prompter.last_fields();
+        assert_eq!(
+            fields.verb,
+            crate::agent::escalation_prompt::PromptVerb::Register
+        );
+        assert_eq!(
+            fields.rule,
+            crate::agent::escalation_prompt::PromptRule::Wildcard
+        );
+        assert_eq!(
+            fields.store_count,
+            Some(1),
+            "the human's passkey is counted"
+        );
+        assert_eq!(fields.mode, "same-user");
+        let (summary, body) = crate::agent::escalation_prompt::render_prompt(&fields).unwrap();
+        assert_eq!(summary, "Passless: CREATE A NEW PASSKEY? (not a sign-in)");
+        assert!(body.contains("Site: example.org (NOT on your list; matched by the * rule)"));
+        assert!(body.contains("which already holds 1 passkey for this site"));
+
+        f.prompter.decide(PromptEvent::Approved);
+        let response = ceremony.join().unwrap().expect("approved");
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 2);
+
+        // The grant: authenticate = allow for exactly that RP, kind registration, rule `*`, the
+        // new credential (item 2).
+        let credential_id = b64u_decode(&response.credential_id_b64u).unwrap();
+        let grants = f.store.profile(&f.profile_id).unwrap();
+        let rules = grants.rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rp_id, "example.org");
+        assert_eq!(rules[0].kind, GrantKind::Registration);
+        assert_eq!(
+            rules[0].rule,
+            crate::agent::granted_rules::PermittingRule::Wildcard
+        );
+        assert_eq!(
+            rules[0].credential_ref,
+            Some(CredentialRef::with_default_domain(&credential_id))
+        );
+        assert_eq!(
+            f.policy_runtime.granted_credential_refs(
+                &f.profile_id,
+                "example.org",
+                &RuleIdentity::Wildcard
+            ),
+            vec![CredentialRef::with_default_domain(&credential_id)]
+        );
+        // The `*` sign-in at that RP is now a granted allow; other unlisted RPs still escalate.
+        let auth =
+            f.policy_runtime
+                .resolve(&f.profile_id, &GrantAction::Authenticate, "example.org");
+        assert!(auth.granted && auth.action == RuleAction::Allow);
+        assert_eq!(auth.rule, RuleIdentity::Wildcard);
+        let other =
+            f.policy_runtime
+                .resolve(&f.profile_id, &GrantAction::Authenticate, "example.net");
+        assert_eq!(other.action, RuleAction::Request);
+        // Registration is never upgraded: the next one at the same RP escalates again.
+        let again = f
+            .policy_runtime
+            .resolve(&f.profile_id, &GrantAction::Register, "example.org");
+        assert_eq!(again.action, RuleAction::Request);
+
+        // Audit: the escalation and the operation name rule `*`; a registration has no
+        // candidate scope.
+        let events = read_audit_events(&f.audit_dir);
+        let requested = events
+            .iter()
+            .find(|e| e["kind"] == "escalation.requested")
+            .unwrap();
+        assert_eq!(requested["rule"], "*");
+        assert_eq!(requested["action"], "register");
+        let reservation = events.iter().find(|e| e["kind"] == "policy.allow").unwrap();
+        assert_eq!(reservation["rule"], "*");
+        assert_eq!(reservation["v"], 5);
+        assert!(reservation["credential_scope"].is_null());
+        assert_eq!(reservation["approval_source"], "ceremony");
+        let added = events
+            .iter()
+            .find(|e| e["kind"] == "granted_rule.add")
+            .unwrap();
+        assert_eq!(added["grant_kind"], "registration");
+        assert_eq!(added["rule"], "*");
+    }
+
+    #[test]
+    fn wildcard_registration_store_count_is_read_without_the_operation_lock() {
+        let f = wildcard_fixture(|_| {});
+        // The human path holds the operation lock for as long as the prompt is up: the count is
+        // read under the storage lock alone, so the prompt still appears.
+        let op = f.operation_lock.lock().unwrap();
+        let ceremony = register_on_thread(&f, &f.make_ctx(), req_for(&f, "example.org", b"x"));
+        f.prompter.wait_shown(1);
+        assert_eq!(f.prompter.last_fields().store_count, Some(0));
+        f.prompter.decide(deny());
+        assert!(ceremony.join().unwrap().is_err());
+        drop(op);
+    }
+
+    #[test]
+    fn wildcard_registration_at_the_cap_is_refused_without_a_prompt() {
+        let f = wildcard_fixture(|config| config.max_wildcard_registrations = Some(1));
+        approved_wildcard_registration(&f, "example.org", 0);
+
+        let err = f
+            .make_handler()
+            .register(&f.make_ctx(), &req_for(&f, "example.net", b"two"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert!(err.message.contains("wildcard_registration_cap"), "{err:?}");
+        assert_eq!(
+            deny_reasons(&f).last().unwrap(),
+            &(
+                "example.net".to_string(),
+                "wildcard_registration_cap".to_string()
+            )
+        );
+        assert_eq!(f.prompter.shown(), 1, "no prompt at the cap");
+
+        // An exact-rule registration is not capped.
+        let exact = register_on_thread(&f, &f.make_ctx(), req_for(&f, "exact.example", b"e"));
+        f.prompter.wait_shown(2);
+        assert_eq!(
+            f.prompter.last_fields().rule,
+            crate::agent::escalation_prompt::PromptRule::Exact
+        );
+        f.prompter.decide(deny());
+        assert!(exact.join().unwrap().is_err());
+
+        // Revoking the wildcard grant frees the slot (the credential stays).
+        f.store
+            .revoke(
+                &f.policy_runtime,
+                &f.profile_id,
+                "example.org",
+                crate::agent::granted_rules::GrantedAction::Authenticate,
+            )
+            .unwrap();
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+        approved_wildcard_registration(&f, "example.net", 2);
+    }
+
+    #[test]
+    fn wildcard_registration_prompts_are_limited_per_day() {
+        let f = wildcard_fixture(|config| config.wildcard_registration_prompts_per_day = Some(2));
+        approved_wildcard_registration(&f, "a.example", 0);
+        approved_wildcard_registration(&f, "b.example", 1);
+        let err = f
+            .make_handler()
+            .register(&f.make_ctx(), &req_for(&f, "c.example", b"c"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(
+            deny_reasons(&f).last().unwrap(),
+            &(
+                "c.example".to_string(),
+                "wildcard_registration_rate".to_string()
+            )
+        );
+        assert_eq!(f.prompter.shown(), 2);
+        // Exact-rule registration prompts neither count nor are limited.
+        let exact = register_on_thread(&f, &f.make_ctx(), req_for(&f, "exact.example", b"e"));
+        f.prompter.approve(3);
+        exact
+            .join()
+            .unwrap()
+            .expect("exact registration still prompts");
+    }
+
+    #[test]
+    fn a_denied_wildcard_registration_cools_down_every_unlisted_site() {
+        let f = wildcard_fixture(|_| {});
+        let first = register_on_thread(&f, &f.make_ctx(), req_for(&f, "a.example", b"a"));
+        f.prompter.wait_shown(1);
+        f.prompter.decide(deny());
+        assert_eq!(
+            first.join().unwrap().unwrap_err().code,
+            ErrorCode::Forbidden
+        );
+
+        // A page or agent that rotates RP IDs gets no fresh prompt.
+        for rp in ["b.example", "c.example"] {
+            let err = f
+                .make_handler()
+                .register(&f.make_ctx(), &req_for(&f, rp, rp.as_bytes()))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(
+                deny_reasons(&f).last().unwrap(),
+                &(rp.to_string(), "wildcard_registration_cooldown".to_string())
+            );
+        }
+        assert_eq!(f.prompter.shown(), 1);
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+        // Exact-rule registrations are unaffected.
+        let exact = register_on_thread(&f, &f.make_ctx(), req_for(&f, "exact.example", b"e"));
+        f.prompter.approve(2);
+        exact
+            .join()
+            .unwrap()
+            .expect("exact registration still prompts");
+    }
+
+    #[test]
+    fn localhost_never_registers_through_the_wildcard() {
+        let f = wildcard_fixture(|_| {});
+        let req = RegisterCredentialRequest {
+            rp_id: "localhost".to_string(),
+            origin: "http://localhost:8080".to_string(),
+            ..f.make_req()
+        };
+        let err = f.make_handler().register(&f.make_ctx(), &req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("localhost".to_string(), "action_not_allowed".to_string())]
+        );
+        assert_eq!(f.prompter.shown(), 0);
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+    }
+
+    #[test]
+    fn every_registration_prompt_says_register_once_with_the_count_exact_rules_too() {
+        let f = wildcard_fixture(|_| {});
+        human_credential(&f, "exact.example", 3);
+        human_credential(&f, "exact.example", 4);
+        let ceremony = register_on_thread(&f, &f.make_ctx(), req_for(&f, "exact.example", b"e"));
+        f.prompter.wait_shown(1);
+        let fields = f.prompter.last_fields();
+        assert_eq!(
+            fields.rule,
+            crate::agent::escalation_prompt::PromptRule::Exact
+        );
+        assert_eq!(fields.store_count, Some(2));
+        let (_, body) = crate::agent::escalation_prompt::render_prompt(&fields).unwrap();
+        assert!(body.contains("Site: exact.example (your rule for this site)"));
+        assert!(body.contains("which already holds 2 passkeys for this site"));
+        f.prompter.decide(PromptEvent::Approved);
+        ceremony.join().unwrap().expect("approved");
+        let grants = f.store.profile(&f.profile_id).unwrap();
+        assert_eq!(
+            grants.rules()[0].rule,
+            crate::agent::granted_rules::PermittingRule::Exact
+        );
+    }
+
+    /// ADR 0014 amendment section 2.3: a `register` pre-request and its pre-approval, end to end
+    /// through the registration ceremony.
+    mod pre_approval {
+        use super::*;
+
+        use passless_core::agent::PrincipalSessionId;
+
+        use crate::agent::escalation::{
+            EscalationRequest, PreRequestParams, PreRequestState, WaiterSession,
+        };
+
+        /// A bearer session owned by `principal` through an active session grant, as the
+        /// browser launch binds it.
+        fn owned_ctx(f: &RegisterTestFixture, principal: &PrincipalSessionId) -> RegisterContext {
+            let ctx = f.make_ctx();
+            let request = f
+                .policy_runtime
+                .admin_request_session_grant(
+                    crate::agent::grant::GrantRequestParams {
+                        profile_id: f.profile_id.clone(),
+                        session_id: principal.clone(),
+                        principal_digest: [0u8; 32],
+                        rp_ids: vec!["example.com".to_string()],
+                        credentials: vec![],
+                        requested_ttl_secs: 60,
+                    },
+                    true,
+                )
+                .unwrap();
+            let grant_id = f
+                .policy_runtime
+                .admin_approve_grant(&request, &crate::agent::identity::admin_authority())
+                .unwrap();
+            ctx.session.bind_grant(grant_id).unwrap();
+            ctx
+        }
+
+        fn pre_register(
+            f: &RegisterTestFixture,
+            principal: &PrincipalSessionId,
+        ) -> PreRequestState {
+            let profile = f.policy_runtime.escalation_profile(&f.profile_id).unwrap();
+            f.escalation.pre_request(PreRequestParams {
+                request: EscalationRequest {
+                    profile: f.profile_id.clone(),
+                    rp_id: "example.com".to_string(),
+                    action: CeremonyAction::Register,
+                    origin: None,
+                    rule: PermittingRule::Exact,
+                    session: WaiterSession::of_principal(principal),
+                    source: RequestSource::PreRequest,
+                    principal: Some(principal.clone()),
+                    agent_note: None,
+                    mode: profile.mode,
+                    principal_user: profile.principal_user,
+                    max_granted_rules: profile.max_granted_rules,
+                    max_wildcard_registrations: profile.max_wildcard_registrations,
+                    wildcard_registration_prompts_per_day: profile
+                        .wildcard_registration_prompts_per_day,
+                    store_counter: None,
+                },
+                pending_for: std::time::Duration::from_secs(600),
+                session_remaining: std::time::Duration::from_secs(3600),
+            })
+        }
+
+        fn pre_approved(f: &RegisterTestFixture, principal: &PrincipalSessionId) {
+            assert_eq!(pre_register(f, principal), PreRequestState::Pending);
+            f.prompter.approve(1);
+            assert!(matches!(
+                pre_register(f, principal),
+                PreRequestState::PreApproved { .. }
+            ));
+        }
+
+        fn kinds(f: &RegisterTestFixture, kind: &str) -> Vec<serde_json::Value> {
+            read_audit_events(&f.audit_dir)
+                .into_iter()
+                .filter(|e| e["kind"] == kind)
+                .collect()
+        }
+
+        #[test]
+        fn the_owning_sessions_registration_consumes_the_pre_approval_without_a_prompt() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            let response = f
+                .make_handler()
+                .register(&ctx, &f.make_req())
+                .expect("the pre-approved registration");
+            assert_eq!(f.prompter.shown(), 1, "no second prompt");
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+            assert_eq!(ctx.session.operations_used(), 1);
+
+            let rules = f.store.profile(&f.profile_id).unwrap().rules().to_vec();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].kind, GrantKind::Registration);
+            assert_eq!(rules[0].source, RequestSource::PreRequest);
+            assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+            let credential_id = b64u_decode(&response.credential_id_b64u).unwrap();
+            assert_eq!(
+                rules[0].credential_ref,
+                Some(CredentialRef::with_default_domain(&credential_id))
+            );
+
+            let reservation = kinds(&f, "policy.allow").pop().unwrap();
+            assert_eq!(reservation["approval_source"], "pre_request");
+            let consumed = kinds(&f, "pre_approval.consumed").pop().unwrap();
+            assert_eq!(consumed["request_id"], reservation["request_id"]);
+            assert_eq!(consumed["escalation_id"], reservation["escalation_id"]);
+
+            // One use: the next registration escalates again.
+            let again = register_on_thread(&f, &ctx, req_with_challenge(&f, b"again"));
+            f.prompter.wait_shown(2);
+            f.prompter.decide(deny());
+            assert!(again.join().unwrap().is_err());
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+        }
+
+        #[test]
+        fn another_sessions_bearer_or_an_unowned_bearer_cannot_use_it() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            // Another principal session's bearer escalates like any ceremony; the human denies.
+            let other = owned_ctx(&f, &PrincipalSessionId::new());
+            let ceremony = register_on_thread(&f, &other, f.make_req());
+            f.prompter.wait_shown(2);
+            f.prompter.decide(deny());
+            assert!(ceremony.join().unwrap().is_err());
+            // A bearer with no session grant has no owner: it is refused (here by the cooldown
+            // that deny started) and consumes nothing either.
+            let unowned = f.make_ctx();
+            assert!(f.make_handler().register(&unowned, &f.make_req()).is_err());
+            assert_eq!(f.prompter.shown(), 2);
+            assert!(kinds(&f, "pre_approval.consumed").is_empty());
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+            // The token is still there for its own session.
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+        }
+
+        #[test]
+        fn an_unsupported_request_does_not_spend_the_pre_approval() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            let unsupported = RegisterCredentialRequest {
+                attestation: Some("enterprise".to_string()),
+                ..f.make_req()
+            };
+            let err = f.make_handler().register(&ctx, &unsupported).unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotSupported);
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+            f.make_handler()
+                .register(&ctx, &f.make_req())
+                .expect("the pre-approval still works");
+        }
+
+        #[test]
+        fn a_revoked_session_grant_cannot_use_the_pre_approval() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            // The principal exits: its grants are revoked and the token dropped.
+            f.policy_runtime.principal_exit(&principal);
+            f.escalation.principal_session_ended(&principal);
+            assert_eq!(
+                kinds(&f, "pre_approval.expired").pop().unwrap()["reason"],
+                "session_end"
+            );
+            let err = f.make_handler().register(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+            assert!(kinds(&f, "pre_approval.consumed").is_empty());
+        }
+
+        #[test]
+        fn a_duplicate_ceremony_does_not_spend_the_pre_approval() {
+            // Review L3: a replayed challenge is answered from the stored outcome; it must not
+            // use up the token (and write a misleading `pre_approval.consumed`).
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            pre_approved(&f, &principal);
+            let ctx = owned_ctx(&f, &principal);
+            let req = f.make_req();
+            let first = f.make_handler().register(&ctx, &req).expect("first");
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+            assert_eq!(kinds(&f, "pre_approval.consumed").len(), 1);
+            // A second pre-approval; the page replays the same challenge.
+            assert_eq!(pre_register(&f, &principal), PreRequestState::Pending);
+            f.prompter.approve(2);
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+            let duplicate = f
+                .make_handler()
+                .register(&ctx, &req)
+                .expect("the duplicate is served the stored outcome");
+            assert_eq!(duplicate.credential_id_b64u, first.credential_id_b64u);
+            assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+            // Only the fresh ceremony consumed a token; the second one is still there.
+            assert_eq!(kinds(&f, "pre_approval.consumed").len(), 1);
+            assert!(matches!(
+                pre_register(&f, &principal),
+                PreRequestState::PreApproved { .. }
+            ));
+            // A new challenge (a fresh ceremony) takes it, and writes the second record.
+            let next = req_with_challenge(&f, b"another challenge, not a replay");
+            f.make_handler()
+                .register(&ctx, &next)
+                .expect("the surviving pre-approval works");
+            assert_eq!(kinds(&f, "pre_approval.consumed").len(), 2);
+            assert_eq!(f.prompter.shown(), 2);
+        }
+
+        #[test]
+        fn a_ceremony_of_the_owning_session_adopts_a_pending_pre_request() {
+            let f = make_fixture_with_config(register_request_config());
+            let principal = PrincipalSessionId::new();
+            assert_eq!(pre_register(&f, &principal), PreRequestState::Pending);
+            f.prompter.wait_shown(1);
+            let ctx = owned_ctx(&f, &principal);
+            let ceremony = register_on_thread(&f, &ctx, f.make_req());
+            // Wait until the ceremony has adopted it, then approve the prompt it waits on.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while pre_register(&f, &principal) != PreRequestState::Adopted {
+                assert!(std::time::Instant::now() < deadline, "never adopted");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            f.prompter.decide(PromptEvent::Approved);
+            ceremony.join().unwrap().expect("the adopted registration");
+            assert_eq!(f.prompter.shown(), 1);
+            assert!(kinds(&f, "pre_approval.issued").is_empty());
+            let rules = f.store.profile(&f.profile_id).unwrap().rules().to_vec();
+            assert_eq!(rules[0].source, RequestSource::PreRequest);
+            assert_eq!(rules[0].origin.as_deref(), Some("https://example.com"));
+            let reservation = kinds(&f, "policy.allow").pop().unwrap();
+            assert_eq!(reservation["approval_source"], "pre_request");
+        }
     }
 }

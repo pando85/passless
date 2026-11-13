@@ -22,7 +22,8 @@ pub trait HumanPrompts: Send {
         timeout_seconds: u32,
     ) -> Result<NotificationResult, String>;
 
-    /// CTAP built-in user verification.
+    /// CTAP built-in user verification. Only `Denied` may count as a failed attempt: closing
+    /// the prompt or letting it time out is `Dismissed`.
     fn user_verification(
         &mut self,
         operation: &str,
@@ -32,7 +33,7 @@ pub trait HumanPrompts: Send {
     ) -> Result<NotificationResult, String>;
 
     /// Consent to lower the protection of stored credentials. `body` is daemon-derived text.
-    /// Closing the prompt or letting it time out is `Denied`.
+    /// Closing the prompt or letting it time out is `Dismissed`, which refuses just like `Denied`.
     fn confirm_credential_protection_lowering(
         &mut self,
         summary: &str,

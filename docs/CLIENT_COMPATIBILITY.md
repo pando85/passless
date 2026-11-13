@@ -245,19 +245,20 @@ To test `credentialsd` integration:
 
 `ssh-keygen -t ed25519-sk` and `-t ecdsa-sk` keys work over CTAP2. Things to know:
 
-- **Keep `always_uv = true` (the default)** to avoid the problem below entirely.
-- **Credentials enrolled with user verification are stored at credProtect level 3**
-  ("user verification required") by soft-fido2 when the client asks for no credProtect level. A
-  plain `ssh-keygen -t ed25519-sk` asks for none, so with `always_uv = true` the key is stored at
-  level 3. Release builds v0.16.0 to v0.21.0 enrolled this way even with `always_uv = false`.
-- **Signing with such a key after setting `always_uv = false`**: OpenSSH asks only for user
+- **New credentials are stored at credProtect level 2** (UV optional with the credential ID
+  list) when UV ran and the client asks for no level, so OpenSSH signs with user presence only.
+  Credentials created by earlier versions keep level 3 ("user verification required"), which
+  includes plain `ssh-keygen -t ed25519-sk` keys enrolled with `always_uv = true`, and every key
+  enrolled by release builds v0.16.0 to v0.21.0 even with `always_uv = false`.
+  `passless client set-cred-protect` can lower them.
+- **Signing with a level-3 key after setting `always_uv = false`**: OpenSSH asks only for user
   presence, so Passless performs user verification itself (the verification notification). With a
   PIN set it asks the client for the PIN instead: `ssh` and `ssh-keygen -Y sign` prompt for it and
   retry. A key loaded in `ssh-agent` prompts through `ssh-askpass`, so signing may still fail
   where no askpass program can run (for example without a graphical session).
 - **Silent requests stay silent by design**: `no-touch-required` keys and OpenSSH's `up=false`
   device probe never trigger a verification prompt, so a level-3 key cannot sign without touch.
-- `-O resident` keys (credProtect level 2) and `-O verify-required` keys are not affected.
+- `-O resident` keys (credProtect level 2), new keys and `-O verify-required` keys are not affected.
 
 ## Diagnostic Procedure
 

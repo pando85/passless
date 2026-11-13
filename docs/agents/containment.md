@@ -104,12 +104,18 @@ root `passless-agent.service`). `passless doctor` and every audit record report 
 
 - **shared-UID**: there is no operating-system boundary between the agent, the browser and the daemon.
   Passless relies on policy, session limits and audit, like `ssh-agent`. An agent can approve its own
-  `request` prompts through your notification server. An `isolated` profile in a shared-UID
+  `request` prompts through your notification server (`dunstctl`, `makoctl`, a replaced server, or
+  input to notify-osd's dialog). That includes the prompt for registering a passkey at a site you have
+  not listed (`register = "request"` on the `*` rule): with a shared UID it is a convenience and an
+  audit point, **not a security boundary**; use a distinct-UID principal where it must be one. An
+  `isolated` profile in a shared-UID
   deployment has separate passkeys, but the agent can read your store as the same user; separation is
   administrative only, and startup warns.
 - **distinct-UID**: the daemon's storage, config and granted rules are protected by Unix permissions,
   and `agents.notify_user` names the human whose session bus receives prompts. It must differ from
-  every `principal_user` and `browser_user`.
+  every `principal_user` and `browser_user`. Here the prompt is a boundary, including the registration
+  prompt (the residual is approval by mistake or fatigue, addressed by its distinct wording, the store
+  count, the daily limit and the cooldown).
 
 See [ADR 0014 §13](../decisions/0014-agent-delegation.md#13-deployment-axes-and-hardening-scope) for the
 hardening scope and the open systemd, namespace and seccomp work.

@@ -63,7 +63,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 
 | Rank | Lock | Declared at | Notes |
 |---|---|---|---|
-| 5 T | `managed_sessions[profile]` slot | `runtime.rs` (`AgentRuntime.managed_sessions`) | Held by `handle_principal` for one whole principal request. It is the outermost runtime lock. |
+| 5 T | `managed_sessions[profile]` slot | `runtime.rs` (`AgentRuntime.managed_sessions`) | Held by `handle_principal` for one whole principal request, except `RequestAccess`, which copies the requester's session ID and deadline and releases it before anything else (it may wait for the human, rule 3). A parked `RequestAccess`, and the check after a pre-request was admitted (the session may have ended since the slot was released), take it alone, with nothing held, to check that its session is still alive. It is the outermost runtime lock. |
 | 10 T | `ProfileRuntime::lifecycle_lock` | `runtime.rs` (`ProfileRuntime`) | Makes browser launch and delegation single-flight per profile. |
 | 20 T | Backend operation lock | `backend.rs` (`CredentialBackendHandle.operation_lock`); the human one in `main.rs` (`ServiceHandler.operation_lock`) | See rule 4. Admin credential handlers take it before storage. |
 | 25 | Human `ServiceHandler.service` | `main.rs` | Human CTAP path only: operation lock, then service, then storage. |
@@ -84,8 +84,9 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 72 T | `ReadinessRegistry::entries` and its condvar | `transport/readiness.rs` | A leaf. The hello path records into it and the launch path reads or waits on it (`status`, `wait_attached`), possibly holding `lifecycle_lock` (10) and `browser_manager` (30). Waiters park on its condvar holding nothing else. The hello path never takes the lifecycle lock or the browser manager. `browser-control` reads a lease's state here (`interception_state`) under the browser manager, which the order allows (30 then 72); the pipe-mode `EnsureBrowser` path takes exactly the locks of the port-mode one, so the pipe-mode principal browser needs no change of the order. |
 | 74 T | Sign transport: `Shared::connections` and each `Connection::in_flight` | `transport/mod.rs` | Leaves; they never nest with each other. Short map sections only: a connection to supersede is cloned out before it is closed. |
 | 76 T | A transport connection's write mutex (`Connection::writer`) | `transport/mod.rs` | A leaf. Held across one frame write, bounded by the 5 s write timeout. `closed` is set under it, so no frame follows a close. |
-| 80 T | `EscalationService::inner` and its condvar `changed` | `escalation.rs` | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters park on its condvar holding nothing else and call their `cancelled`/`still_valid` checks with it released. No audit record, store write, prompt show or withdrawal and no D-Bus call happens under it: state changes are made under it and their effects run after it is released. |
+| 80 T | `EscalationService::inner` and its condvar `changed` | `escalation.rs` | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters park on its condvar holding nothing else and call their `cancelled`/`still_valid` checks with it released. No audit record, store write, prompt show or withdrawal and no D-Bus call happens under it: state changes are made under it and their effects run after it is released. The registration prompt's passkey count (review L4) is one such effect: the `StoreCounter` takes the storage lock (40) just before the prompt is shown, so `run` must be reached with no lock held. A wildcard registration's cap reservation (review L2) is a pair of atomics, not a lock. |
 | 82 T | `NotificationPrompter::drivers` (per-profile driver channels) | `prompt.rs` | A leaf: only a channel send (and, on first use, a thread spawn) happens under it. Called by the escalation service after its mutex is released. A failed driver spawn is reported to the sink only after this lock is dropped, because the sink re-enters the prompter (a withdrawal, the next queued prompt). |
+| — | `PreRequestRefusals::ledgers`, `PreRequestRefusals::parked` | `runtime/pre_request.rs` | Bookkeeping of pre-requests per principal session (refusal ledgers, parked calls). A map or set section only; never held across another lock. A removed ledger is dropped after the guard is released. |
 | 85 T | `RefusalLedger::inner` (per session) | `refusal_ledger.rs` | A leaf (final review M2). `CeremonyAudit::deny` counts a refusal under it and releases it before any record is written; the pending summaries it returns (and `AgentSession::revoke`'s flush, and the ledger's drop) are written after it is released. Ranked above the key-use gates (66, 69) and the policy locks because a refusal can be raised with a key-use gate held; below the audit gate. Only the closure that builds a summary template runs under it, and it takes no lock (atomics). The runtime loop also sweeps the ledgers of tombstoned (revoked) sessions about once a second (`SignContextRegistry::flush_due_revoked_refusals`): it copies the ledger handles out under the tombstone maps (50) and then flushes each, so the audit gate is never reached under a registry lock (review L5). |
 | 90 | `AuditGate`: `append_lock`, then `sequence`, `last_hash`, `writer`, `current_segment(_name)`, `segment_index`, `anchor`, `anchor_inode`, `segment_file_ino` | `audit.rs` | Terminal leaf (rule 5). |
 | — | TPM `Context` mutex | `storage/tpm/portable/provider.rs`, `parent.rs`, `storage/tpm/mod.rs` | A leaf inside the TPM key provider and the TPM storage adapter. It is released before the call returns. A poisoned lock is recovered (`portable::context::lock_context`): the context is reusable after a failed call, the session settings are cleared and any transient objects the unwound call left loaded are flushed. |
@@ -196,6 +197,31 @@ quota is refused alone and the global 4096 is only a backstop. Prompt shows and 
 is released. A reload that changed the policy calls `cancel_profile` after the configuration
 lock (45) and `reload_lock` (68) are released: it takes the escalation mutex (80) and then
 withdraws the prompts (82).
+
+**Pre-requests** (`PrincipalRequest::RequestAccess`, ADR 0014 amendment section 2.3;
+`runtime/pre_request.rs`). The handler releases the `managed_sessions` slot (5) first. It reads
+`agent_config` (45), resolves (policy 70, view 71) and, for `register`, the profile's
+`shared_browsers` bookkeeping (35), one at a time. `EscalationService::pre_request` then follows
+`join_or_create` exactly (view 71 through the grant writer, writer 64 for the revoke token, the
+escalation mutex 80 twice, the audit gate 90 with nothing held) and attaches a detached waiter: no
+thread parks on the escalation. A requester that waits (`wait_pre_request`) parks on the escalation
+condvar holding nothing else, wakes at least every 250 ms, and checks its session with the
+escalation mutex released by taking the `managed_sessions` slot (5) alone. Deadlines and token
+lifetimes are enforced by `sweep_pre_requests` (the runtime loop, about every 50 ms, and every
+pre-request call): escalation mutex, then prompt withdrawals and audit records after it is released.
+After the request is admitted, `pre_request_while` checks the session with no lock held and, if it
+ended meanwhile, runs `principal_session_ended` (escalation mutex, then the audit gate). A token
+is looked for by `has_pre_approval` (escalation mutex alone) before the replay key and consumed by
+`take_pre_approval` once the key is fresh, with no lock held: the escalation mutex, released, then
+the audit gate. `pre_approval.issued` is written by an effect after the mutex is released, and
+the token becomes usable only after it. The bearer's owner is read
+through `AgentSession::owning_principal_session` (policy grants, 70, alone); the pre-key-use
+re-check reads it again under the session and epoch gates (66, 69), which rank below it. A principal
+session's end (`cleanup_browser_for_session`, before its lifecycle lock) and a lease revocation take
+the escalation mutex and then the audit gate. The lease observer runs from
+`SignContextRegistry::revoke_by_lease` after every registry guard is released, possibly under the
+browser manager (30): policy grants (70), then the escalation mutex (80), then the audit gate (90).
+The order is unchanged.
 
 **Reload** (`handle_reload_policy`) takes these locks in this order:
 

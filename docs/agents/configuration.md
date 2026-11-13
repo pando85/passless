@@ -27,9 +27,12 @@ audit_path = "/home/alice/.local/state/passless/agent-audit"
 | `allow_automatic_human_path` | Default `false`. See [Containment](containment.md#automatic-interaction-mode). |
 | `acknowledge_global_same_user` | Profile names allowed to use a `*` rule. |
 | `acknowledge_same_user_registration` | Profile names allowed to register into the human store. |
+| `acknowledge_global_registration` | Profile names whose `*` rule may have `register = "request"`: creating a passkey at a site no exact rule lists ([Rules](rules.md#registration-at-unlisted-sites)). Needed in addition to the two above. |
 
 An acknowledgement names a profile and grants nothing by itself; the rules stay the authority.
-Acknowledging an unknown profile is an error, so stale names cannot survive a rename.
+Acknowledging an unknown profile is an error, so stale names cannot survive a rename. An
+`acknowledge_global_registration` entry whose profile has no `*` rule with `register = "request"` is a
+warning (`passless config check`, `doctor --agents`, `agent-admin profile check`).
 
 `[agents.limits]` sets the concurrency caps of the request server, read at start. A request over a cap
 is answered `busy` (the page sees `NotAllowedError`), never dropped: `max_concurrent_requests`
@@ -53,12 +56,15 @@ credential_selection = "single"
 | `mode` | `same-user` uses your credential store; `isolated` uses the profile's own. |
 | `principal_user` | Unix user the agent runs as. |
 | `rules` | Per-RP rules, see [Rules](rules.md). Missing rules deny. |
-| `credential_refs` | Optional list restricting the credentials the profile may use. |
+| `credential_refs` | Optional list of credential references (`agent-admin credential list`) that pins the sites with an exact rule. It may be combined with a `*` rule and never applies to a site matched through `*`: [Pins and the wildcard](rules.md#pins-and-the-wildcard). |
 | `credential_selection` | `single` (default), `first-matching`, `newest` or `credential:<ref>`. A rule may override it. |
 | `max_session_ttl` | Seconds of authority per session (1 to a year). It caps each principal session and its browser lease. `passless agent mcp playwright` renews an expired session on its next browser tool call, through the admin socket with every check applied again; a revoked session, or one whose profile was disabled, is final. |
 | `max_operations` | Shared budget of allowed ceremonies per session, 1 to 4096 (default 64). Only allowed requests count. |
 | `max_concurrent_sessions` | Live principal sessions per profile: 1 to 64 (default 64). `0` means unlimited and is only valid with `browser_scope = "profile"`. A new session over the limit is refused with `profile '<name>' reached max_concurrent_sessions (<n>)`. Each MCP client process is one session: see [Several clients at once](browser-tools.md#several-clients-at-once). |
 | `max_granted_rules` | Granted rules per profile (default 64, 1 to 256). |
+| `max_wildcard_registrations` | Wildcard registration grants (`kind = registration`, `rule = *`) the profile may hold: 1 to 32, default 4. At the cap a registration at an unlisted site is refused without a prompt. A value below the number already stored is valid; revoke grants to free slots. A warning when the profile's `*` rule does not request registration. |
+| `wildcard_registration_prompts_per_day` | Registration prompts for unlisted sites per profile in a rolling 24 hours: 1 to 24, default 3. Beyond it the request is refused without a prompt. In memory; restarts with the daemon. A warning when the profile's `*` rule does not request registration. |
+| `pre_request_actions` | Actions the agent may ask for before it navigates, with `passless agent request-access` or the `passless_request_access` MCP tool: a list of `"authenticate"` and `"register"` (no duplicates), default `[]` (off). It only lets the agent raise the usual prompt without a page: each action must still resolve to `request` at the site. A warning when no rule has the matching `request` action. See [Asking in advance](rules.md#asking-in-advance). |
 | `browser_scope` | `session` (default; each session owns its browser) or `profile` (sessions share one; it closes when its owner session ends, and the others start their own on their next browser call). |
 | `browser_command` | Browser executable and arguments. Optional: see `browser_path`. |
 | `browser_user` | Unix user for the browser (needs a root daemon). Not allowed for `isolated`. In pipe mode under a root daemon it must differ from `principal_user` and the daemon user and must not be root. A non-root daemon cannot switch users, so there the browser runs as the daemon user (which is also the principal's): pipe mode then mediates and audits CDP but does not separate the browser from the agent. |
@@ -108,10 +114,18 @@ Important fail-closed checks:
 
 - `agents.enabled = true` requires `audit_path`; storage and audit roots must not overlap.
 - `same-user` rejects `storage`; `isolated` requires it.
-- A `*` rule requires `same-user`, the acknowledgement, no `credential_refs`, `register = "deny"` and
-  `single` selection.
-- Same-user registration (`register` other than `deny`) needs an exact RP and the registration
-  acknowledgement. `register = "request"` with `authenticate = "deny"` is invalid.
+- A `*` rule requires `same-user`, the acknowledgement, `authenticate` of `request` or `allow`, and
+  `single` selection. `credential_refs` may be set with it.
+- `*` with `register = "request"` also needs the profile in `acknowledge_global_registration` and
+  `acknowledge_same_user_registration`; `register = "allow"` on `*` is invalid (use `request`). An
+  isolated profile cannot have a `*` rule.
+- Same-user registration (`register` other than `deny`) needs the registration acknowledgement, and an
+  exact RP unless it is `request` on the `*` rule above. `register = "request"` with
+  `authenticate = "deny"` is invalid.
+- `max_wildcard_registrations` and `wildcard_registration_prompts_per_day` outside their ranges are
+  invalid.
+- `pre_request_actions` with an unknown value or a duplicate is invalid; listing an action that no rule
+  sets to `request` is a warning.
 - RP IDs are exact DNS names: partial wildcards, IP addresses, public suffixes, schemes, ports and
   paths are rejected. `localhost` is allowed for exact rules only.
 - A profile may have at most 32 RP rules unless it has a `*` rule.
@@ -129,7 +143,8 @@ passless config check --config-path ./candidate.toml
 
 `config check` loads the file the way the daemon does and runs the same validation (the `[agents]`
 table, every profile rule, the acknowledgements, root overlaps, the backend and the audit directory),
-prints the deprecation warnings and ends with `ok`, or prints the error and exits non-zero. It needs no
+prints the deprecation warnings and the advice about valid but suspect settings (wildcard registration
+keys without effect, a stale `acknowledge_global_registration`) and ends with `ok`, or prints the error and exits non-zero. It needs no
 running daemon, D-Bus or UHID, so run it before `systemctl --user restart passless`: a daemon that
 refuses the file does not start. `passless doctor --agents` reports a rejected configuration as a
 `FAIL` on its `config` check. With `agents.enabled = false` the profiles are not validated, as at
@@ -145,7 +160,8 @@ startup, and `config check` says so.
   or `max_concurrent_sessions`) is rejected the same way.
 - An **unchanged** effective policy changes nothing and live sessions continue.
 - A **changed** policy revokes every session, closes the managed browsers, and cancels pending
-  escalations. Operations in flight fail before key use.
+  escalations and drops registration pre-approvals. Operations in flight fail before key use. Every
+  profile key is part of the policy digest, `pre_request_actions` included.
 
 ## Pre-flight
 

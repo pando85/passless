@@ -8,7 +8,7 @@ pub use config::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRequestLimits, AgentRpRule,
     AgentStorageConfig, BoundedDuration, BrowserScope, CredentialSelection,
     DEFAULT_MAX_GRANTED_RULES, DeviceIdentity, LOCALHOST_RP_ID, LegacyConfigUse, MAX_GRANT_RP_IDS,
-    PolicyAction, RuleAction, validate_rp_id,
+    PolicyAction, PreRequestAction, RuleAction, validate_rp_id,
 };
 pub use ids::{
     BrowserLeaseId, CredentialRef, GrantId, IdError, IntentId, PolicyGenerationId,
@@ -16,18 +16,19 @@ pub use ids::{
 };
 pub use policy::{Policy, PolicyDigest, PolicyError, PolicyParams};
 pub use protocol::{
-    AdminRequest, AdminRequestFrame, AdminResponse, AdminResponseFrame, AuditExportFormat,
-    AuditExportedResponse, AuditStatusResponse, AuditVerifyResponse, BrowserStatusResponse,
-    CAPABILITY_PROOF_BYTES, CURRENT_VERSION, CodecError, CredentialInfo, CredentialList,
-    CredentialSummary, DaemonStatus, DelegationState, DoctorCheck, DoctorResponse, ErrorCode,
-    GrantAction, GrantInfo, GrantList, GrantedRuleInfo, GrantedRuleList, MAX_MESSAGE_SIZE,
-    PeerCred, PolicyInfo, PrincipalCapabilityProof, PrincipalCredentialList,
-    PrincipalCredentialSummary, PrincipalInstructions, PrincipalLaunchedResponse, PrincipalRequest,
-    PrincipalRequestFrame, PrincipalResponse, PrincipalResponseFrame, ProfileDiagnosticReport,
-    ProfileGrantedRules, ProfileInfo, ProfileList, ProfileStatusResponse, ProfileSummary,
-    ProtocolError, ProtocolVersion, RecommendedAction, RegisterCredentialRequest,
-    RegisterCredentialResponse, RequestFrame, ResponseFrame, Role, SeqpacketCodec,
-    SessionEndReason, SessionEndResponse, SessionInfo, SessionList, Validate, ValidationErrors,
+    AccessRequestState, AccessRequestStatus, AdminRequest, AdminRequestFrame, AdminResponse,
+    AdminResponseFrame, AuditExportFormat, AuditExportedResponse, AuditStatusResponse,
+    AuditVerifyResponse, BrowserStatusResponse, CAPABILITY_PROOF_BYTES, CURRENT_VERSION,
+    CodecError, CredentialInfo, CredentialList, CredentialSummary, DaemonStatus, DelegationState,
+    DoctorCheck, DoctorResponse, ErrorCode, GrantAction, GrantInfo, GrantList, GrantedRuleInfo,
+    GrantedRuleList, MAX_MESSAGE_SIZE, PeerCred, PolicyInfo, PrincipalCapabilityProof,
+    PrincipalCredentialList, PrincipalCredentialSummary, PrincipalInstructions,
+    PrincipalLaunchedResponse, PrincipalRequest, PrincipalRequestFrame, PrincipalResponse,
+    PrincipalResponseFrame, ProfileDiagnosticReport, ProfileGrantedRules, ProfileInfo, ProfileList,
+    ProfileStatusResponse, ProfileSummary, ProtocolError, ProtocolVersion, RecommendedAction,
+    RegisterCredentialRequest, RegisterCredentialResponse, RequestFrame, ResponseFrame, Role,
+    SeqpacketCodec, SessionEndReason, SessionEndResponse, SessionInfo, SessionList, Validate,
+    ValidationErrors,
 };
 pub use resolve::{
     GrantSource, MatchedRule, NoGrantedRules, RuleIdentity, resolve_rules, rule_for_host,

@@ -154,6 +154,29 @@ impl PassStorageAdapter {
                 self.inner.count_credentials()
             })
     }
+
+    /// The RP's credential count after the cheap refresh check (Git HEAD and a metadata
+    /// fingerprint): from the inner index when the repository is unchanged, else from a rescan of
+    /// the paths. Neither decrypts anything. `None` when the changed tree cannot be scanned, so
+    /// the prompt omits the count rather than showing a stale one.
+    // Read by the agent registration path only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    fn current_count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        let generation = repository_generation(&self.store_path, &self.path);
+        if generation == self.indexed_generation {
+            return self.inner.count_for_rp(rp_id);
+        }
+        match load_credential_paths(&self.store_path.join(&self.path), "gpg") {
+            Ok(indexes) => Some(indexes.count_for_rp(rp_id)),
+            Err(error) => {
+                warn!(
+                    "Failed to count credentials from changed repository state: {}",
+                    error
+                );
+                None
+            }
+        }
+    }
 }
 
 impl CredentialStorage for PassStorageAdapter {
@@ -234,6 +257,27 @@ impl CredentialStorage for PassStorageAdapter {
 
     fn count_credentials(&self) -> usize {
         self.current_credential_count()
+    }
+
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        self.current_count_for_rp(rp_id)
+    }
+
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        let generation = repository_generation(&self.store_path, &self.path);
+        if generation == self.indexed_generation {
+            return self.inner.indexed_credentials();
+        }
+        match load_credential_paths(&self.store_path.join(&self.path), "gpg") {
+            Ok(indexes) => Some(indexes.credentials()),
+            Err(error) => {
+                warn!(
+                    "Failed to list credentials from changed repository state: {}",
+                    error
+                );
+                None
+            }
+        }
     }
 
     fn disable_user_verification(&self) -> bool {
@@ -360,6 +404,46 @@ mod tests {
 
         assert_ne!(first.head, second.head);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn count_for_rp_refreshes_after_an_external_change_without_gpg() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(".gpg-id"),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        let unreadable = |path: &Path| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"not gpg").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        };
+        unreadable(&temp.path().join("fido2/example.com/aa.gpg"));
+
+        let adapter = PassStorageAdapter::new_with_options_and_git_sync(
+            temp.path().to_path_buf(),
+            PathBuf::from("fido2"),
+            GpgBackend::GnupgBin,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(adapter.count_for_rp("example.com"), Some(1));
+
+        // Another process adds a credential file: the refresh check sees it, still without GPG
+        // (the files cannot even be read).
+        unreadable(&temp.path().join("fido2/example.com/bb.gpg"));
+        unreadable(&temp.path().join("fido2/example.org/cc.gpg"));
+        assert_eq!(adapter.count_for_rp("example.com"), Some(2));
+        assert_eq!(adapter.count_for_rp("example.org"), Some(1));
+        assert_eq!(adapter.count_for_rp("example.net"), Some(0));
+
+        let boxed: Box<dyn CredentialStorage> = Box::new(adapter);
+        assert_eq!(boxed.count_for_rp("example.com"), Some(2));
     }
 
     #[test]

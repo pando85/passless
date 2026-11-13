@@ -36,7 +36,8 @@ passless config check --config-path /path/to/config.toml
 ```
 
 It loads the file the way the daemon does and runs the daemon's own validation, including every agent
-profile rule and the audit directory, then prints `ok` (with deprecation warnings, if any) or the
+profile rule and the audit directory, then prints `ok` (with deprecation warnings and advice such as a
+stale `acknowledge_global_registration`, if any) or the
 error and exits non-zero. `passless doctor --agents` reports the same validation as its `config` check
 (a `FAIL` means the daemon would refuse to start). With a daemon running, `passless agent-admin profile
 check <profile>` checks the live profile.
@@ -48,7 +49,9 @@ check <profile>` checks the live profile.
 | `wildcard RP scope '*' is only supported in same-user mode` | Use exact rules in an isolated profile. |
 | `global same-user authentication requires explicit operator acknowledgement` | Add the profile to `agents.acknowledge_global_same_user`. |
 | `same-user registration ... requires explicit operator acknowledgement` | Add it to `agents.acknowledge_same_user_registration`, or set `register = "deny"`. |
-| `wildcard RP scope '*' must have register = "deny"` | A wildcard never permits or requests registration. |
+| `wildcard RP scope '*' ... register = "allow"` | `register = "allow"` is invalid on `*`; use `"request"` (the agent asks, you approve each registration). |
+| `*` with `register = "request"` names a missing acknowledgement | Add the profile to `agents.acknowledge_global_registration` (and `acknowledge_global_same_user`, `acknowledge_same_user_registration`). |
+| `max_wildcard_registrations` or `wildcard_registration_prompts_per_day` out of range | 1 to 32 and 1 to 24. |
 | `register = "request" with authenticate = "deny"` | Approving a registration stores `authenticate = allow`; use `allow` or `request` for `authenticate`. |
 | `agent roots ... overlap` | Give audit, state and storage separate directories. |
 | invalid RP ID | Use an exact domain such as `github.com`; no scheme, port, path, IP address or public suffix. |
@@ -129,11 +132,26 @@ Common causes:
   to the page's timeout (3 minutes to 20 hours). The agent should wait, not retry.
 - **`request` denied or timed out**: a cooldown (10 minutes by default) denies further requests for
   that RP without a prompt. Wait it out, or change the rule to `allow` and reload the policy.
+- **Registration at an unlisted site refused without a prompt** (`register = "request"` on `*`): the
+  audit reason says why. `wildcard_registration_cap`: the profile already holds
+  `max_wildcard_registrations` wildcard registration grants; revoke one
+  (`agent-admin grants revoke`) or raise the cap. `wildcard_registration_rate`: it already showed
+  `wildcard_registration_prompts_per_day` prompts in the last 24 hours (the count restarts with the
+  daemon). `wildcard_registration_cooldown`: a recent deny, timeout or repeated withdrawal started a
+  profile-wide cooldown (`agents.escalation_cooldown`, 10 minutes by default), so a second site is
+  refused too. A `localhost` registration is never matched through `*`; give it an exact rule.
+- **Sign-in fails at a site where the agent registered a passkey through `*`** (`credential_not_match`):
+  from then on only the credentials registered there are candidates. If you deleted that credential,
+  revoke the registration grant and register again.
+- **Sign-in fails at a pinned site** (`credential_not_match`): `credential_refs` pins the exact rules; a
+  pin that is missing from the store leaves no candidate and never falls through to `*`. Run
+  `agent-admin profile check <profile>` (`pin_health`) to see which pin.
 - **No notification**: `request` is denied at once when no notification server with action support is
   running on the user's bus (`doctor --agents` fails `notification_bus` when a rule uses `request`, and
   only warns otherwise). Run a supported one (dunst, a mako that does not report version `0.0.0`, a
   desktop shell that advertises `actions`; mako 0.0.0 and quickshell are rejected) or use `allow`.
-  notify-osd (Ubuntu) works: it shows the prompt as a dialog with "Allow always" and "Deny" buttons.
+  notify-osd (Ubuntu) works: it shows the prompt as a dialog with "Allow always" and "Deny" buttons
+  ("Register once" and "Deny" for a registration).
   See [which servers are supported](../NOTIFICATIONS.md#supported-notification-servers).
 - **Conditional (autofill) request**: unavailable; the page needs an explicit sign-in button.
 - **Cross-origin iframe**: denied. Sign in on the top-level page.
@@ -141,6 +159,34 @@ Common causes:
   report ready.
 - **Registration from a background tab**: bring the page to the front; the daemon may have created
   the credential anyway (see [Browser tools](browser-tools.md#limits)).
+
+## `passless agent request-access` or `passless_request_access` does not do what I expect
+
+Every answer is a `state` ([Asking in advance](rules.md#asking-in-advance)); the audit has a
+`policy.deny` record with the reason for each refusal:
+
+| `state` | What to check |
+|---|---|
+| `not_enabled` | The profile does not list the action in `pre_request_actions`. Add it, then `agent-admin policy reload <profile>`. The CLI and the tool both need it. |
+| `not_requestable` | The live rules do not resolve the action at that site to `request` (an exact `deny`, no rule, or `allow`, which answers `already_allowed`). `localhost` and invalid sites too. For `register`: another session owns the profile's browser (`browser_scope = "profile"`); ask from the session that launched it, e.g. through `passless agent mcp playwright --with-access-tool`, or the one running `passless agent browser`. |
+| `rate_limited` | This principal session has a request pending (answer it, or wait for it to end) or asked more than 6 times in 10 minutes. |
+| `cooldown` | A recent deny or timeout at that site, from a page or an earlier request. `agents.escalation_cooldown`. |
+| `pending` | You have not answered the notification. Run the same call again; it reports the same request and shows no second prompt. |
+| `unavailable` | No notification server with action support: see "No notification" above. |
+
+- `--register` outside a principal session is an error: the one-use approval is bound to the session
+  that owns the browser. Run it from `passless agent run ...`, or use the MCP tool.
+- Without `--with-access-tool` the MCP tool does not exist: `agent mcp playwright` must be started with
+  the flag (`agent mcp install --with-access-tool` writes it). The CLI works with or without.
+- An `approved` `register` that the browser did not use within 10 minutes, or whose session ended, was
+  dropped (`pre_approval.expired` in the audit); ask again. A second registration needs a second
+  request.
+- A request run outside a principal session starts a session of its own that ends with the command, which
+  withdraws a request still pending: use `--wait` up to 120 seconds, or call it from inside the agent's
+  session.
+- A sign-in is still denied after `approved`? Approval does not sign in. The page must call WebAuthn at
+  that RP; `grants list` should show a `pre_request` grant for it. If the grant was revoked, the policy
+  was reloaded with a change (every session ends) or the browser was restarted, ask again.
 
 ## Authentication stops after some requests
 
@@ -153,7 +199,7 @@ revokes sessions.
 
 See [Rules](rules.md). `passless agent-admin grants list --profile <profile>` shows what was approved;
 a store that is malformed or has the wrong owner or mode disables grants for that profile and is
-reported by `profile check`. A granted rule is inert if the config rule is `deny`, `allow` or gone;
+reported by `profile check`. A granted rule is inert if the config rule is `deny`, `allow` or gone, or if it was approved through `*` and an exact rule now governs the RP;
 `profile check` and `doctor --agents` report those as orphaned grants.
 
 ## A tool cannot connect to CDP

@@ -35,8 +35,9 @@ use passless_core::agent::ProfileId;
 use super::audit_events::EscalationDenyCause;
 use super::escalation::{PromptEvent, PromptSink, PromptTicket, Prompter};
 use super::escalation_prompt::{
-    ACTION_ALLOW_ALWAYS, ACTION_DENY, ChildEvent, ControlMessage, DEFAULT_MIN_REVIEW_DELAY_MS,
-    HIDDEN_ARG, MAX_LINE_BYTES, PromptFields, PromptRequest, render_prompt,
+    ACTION_ALLOW_ALWAYS, ACTION_DENY, ACTION_REGISTER_ONCE, ChildEvent, ControlMessage,
+    DEFAULT_MIN_REVIEW_DELAY_MS, HIDDEN_ARG, MAX_LINE_BYTES, PromptFields, PromptRequest,
+    render_prompt,
 };
 use super::launcher::{
     DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NOFILE, DEFAULT_RLIMIT_NPROC,
@@ -501,7 +502,7 @@ impl Prompter for NotificationPrompter {
             }
         };
         let delay_ms = u64::try_from(self.timing.min_review_delay.as_millis()).unwrap_or(u64::MAX);
-        let request = PromptRequest::new(summary, body, delay_ms);
+        let request = PromptRequest::new(fields.verb, summary, body, delay_ms);
         let profile = ticket.profile.clone();
         // `send` replaces `events` with the driver's sender.
         let (events, _) = mpsc::channel::<DriverMessage>();
@@ -530,6 +531,9 @@ fn report(sink: &Weak<dyn PromptSink>, ticket: &PromptTicket, event: PromptEvent
 /// One child the driver owns.
 struct Slot {
     ticket: PromptTicket,
+    /// The bare action that approves this prompt: `allow_always` for a sign-in prompt,
+    /// `register_once` for a registration prompt. The other one is a deny (amendment 5.4).
+    approve_action: &'static str,
     child: PromptChild,
     sink: Weak<dyn PromptSink>,
     spawned: Instant,
@@ -617,6 +621,14 @@ fn handle(
             events,
         } => {
             let seq = ticket.seq;
+            let Some(approve_action) = request.approve_action() else {
+                report(
+                    &sink,
+                    &ticket,
+                    PromptEvent::Failed("the prompt has no allowed action set".to_string()),
+                );
+                return;
+            };
             let mut child = match spawner.spawn() {
                 Ok(child) => child,
                 Err(e) => {
@@ -662,6 +674,7 @@ fn handle(
                 seq,
                 Slot {
                     ticket,
+                    approve_action,
                     child,
                     sink,
                     spawned: Instant::now(),
@@ -722,7 +735,7 @@ fn handle(
                     return;
                 }
                 ChildEvent::Decision { action } => match action.as_str() {
-                    ACTION_ALLOW_ALWAYS => match slot.shown {
+                    approve if approve == slot.approve_action => match slot.shown {
                         Some(shown) if shown.elapsed() >= timing.min_review_delay => {
                             PromptEvent::Approved
                         }
@@ -734,6 +747,15 @@ fn handle(
                             PromptEvent::Denied(EscalationDenyCause::EarlyApproval)
                         }
                     },
+                    // The approving action of the other kind of prompt: "Register once" never
+                    // approves a sign-in, "Allow always" never a registration.
+                    ACTION_ALLOW_ALWAYS | ACTION_REGISTER_ONCE => {
+                        warn!(
+                            "prompt {}: decision '{}' does not belong to this prompt; denying",
+                            slot.ticket.escalation_id, action
+                        );
+                        PromptEvent::Denied(EscalationDenyCause::User)
+                    }
                     ACTION_DENY => PromptEvent::Denied(EscalationDenyCause::User),
                     other => PromptEvent::Failed(format!("unknown decision '{}'", other)),
                 },
@@ -1053,7 +1075,9 @@ mod dbus_tests {
     use serde_json::Value as Json;
 
     use crate::agent::escalation::EscalationId;
-    use crate::agent::escalation_prompt::{ChildErrorKind, InProcessChild, PromptVerb};
+    use crate::agent::escalation_prompt::{
+        ChildErrorKind, InProcessChild, PromptRule, PromptVerb, REGISTER_SUMMARY,
+    };
 
     const EVENT_WAIT: Duration = Duration::from_secs(10);
 
@@ -1312,6 +1336,7 @@ mod dbus_tests {
             let mut child = InProcessChild::spawn(Some(bus.address.clone())).unwrap();
             let mut stdin = child.stdin.take().unwrap();
             let request = PromptRequest::new(
+                PromptVerb::Authenticate,
                 "Passless: agent sign-in request".to_string(),
                 "body".to_string(),
                 min_review_delay_ms,
@@ -1742,8 +1767,187 @@ mod dbus_tests {
             principal_user: "agent".to_string(),
             verb: PromptVerb::Authenticate,
             rp_id: "bücher.example".to_string(),
-            origin: "https://bücher.example".to_string(),
+            origin: Some("https://bücher.example".to_string()),
+            requested_in_advance: false,
+            rule: PromptRule::Exact,
+            store_count: None,
         }
+    }
+
+    fn registration_fields() -> PromptFields {
+        PromptFields {
+            profile: "coding".to_string(),
+            mode: "same-user".to_string(),
+            principal_user: "alice".to_string(),
+            verb: PromptVerb::Register,
+            rp_id: "example.org".to_string(),
+            origin: Some("https://www.example.org".to_string()),
+            requested_in_advance: false,
+            rule: PromptRule::Wildcard,
+            store_count: Some(1),
+        }
+    }
+
+    fn show_registration(prompter: &NotificationPrompter, seq: u64) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        let weak: Weak<dyn PromptSink> = Arc::downgrade(&sink) as Weak<dyn PromptSink>;
+        prompter.show(ticket(seq), registration_fields(), weak);
+        sink
+    }
+
+    /// The flat `[key, label, ...]` actions of a recorded `Notify`.
+    fn notify_actions(notify: &Json) -> Vec<String> {
+        notify["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn driver_shows_a_registration_prompt_with_register_once_and_approves_it() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "approve:700", &["actions", "body"]);
+        let prompter = prompter(&bus, Duration::from_millis(500));
+        let sink = show_registration(&prompter, 1);
+        assert_eq!(
+            sink.wait_for(2),
+            [PromptEvent::Shown, PromptEvent::Approved]
+        );
+        let notify = double.wait_for("Notify");
+        let (summary, body) = render_prompt(&registration_fields()).unwrap();
+        assert_eq!(notify["summary"], REGISTER_SUMMARY);
+        assert_eq!(notify["summary"], summary.as_str());
+        assert_eq!(notify["body"], body.as_str());
+        assert!(body.contains("NOT on your list; matched by the * rule"));
+        assert!(body.contains("which already holds 1 passkey for this site"));
+        // "Register once" replaces "Allow always"; the keys are nonced like the sign-in ones.
+        let actions = notify_actions(&notify);
+        assert_eq!(actions.len(), 4, "{actions:?}");
+        assert_eq!(
+            [actions[1].as_str(), actions[3].as_str()],
+            ["Register once", "Deny"]
+        );
+        let nonce = actions[0].strip_prefix("register_once:").unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert_eq!(actions[2], format!("deny:{nonce}"));
+        assert!(!actions.iter().any(|a| a.contains("allow_always")));
+    }
+
+    #[test]
+    fn notify_osd_fallback_dialog_shows_both_registration_buttons() {
+        let bus = PrivateBus::start();
+        let double = Double::start_notify_osd(&bus, "approve:700,deny:50");
+        let prompter = prompter(&bus, Duration::from_millis(500));
+        let sink = show_registration(&prompter, 1);
+        assert_eq!(
+            sink.wait_for(2),
+            [PromptEvent::Shown, PromptEvent::Approved]
+        );
+        let notify = double.wait_for("Notify");
+        assert_eq!(notify["id"], 0, "notify-osd's shared fallback-dialog id");
+        let actions = notify_actions(&notify);
+        assert_eq!(
+            [actions[1].as_str(), actions[3].as_str()],
+            ["Register once", "Deny"]
+        );
+        assert!(actions[0].starts_with("register_once:"));
+
+        let sink = show_registration(&prompter, 2);
+        assert_eq!(
+            sink.wait_for(2),
+            [
+                PromptEvent::Shown,
+                PromptEvent::Denied(EscalationDenyCause::User)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_registration_prompt_ignores_a_sign_in_key_even_with_its_own_nonce() {
+        let bus = PrivateBus::start();
+        let double = Double::start_notify_osd(&bus, "ignore");
+        let prompter = prompter(&bus, Duration::ZERO);
+        let sink = show_registration(&prompter, 1);
+        assert_eq!(sink.wait_for(1), [PromptEvent::Shown]);
+        let (register, deny) = double.keys(0);
+        let nonce = register.strip_prefix("register_once:").unwrap();
+        double.emit(
+            "ActionInvoked",
+            (0u32, format!("allow_always:{nonce}").as_str()),
+        );
+        double.emit("ActionInvoked", (0u32, ACTION_ALLOW_ALWAYS));
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(sink.now(), [PromptEvent::Shown], "nothing decided");
+        double.emit("ActionInvoked", (0u32, deny.as_str()));
+        assert_eq!(
+            sink.wait_for(2),
+            [
+                PromptEvent::Shown,
+                PromptEvent::Denied(EscalationDenyCause::User)
+            ]
+        );
+    }
+
+    /// A child that shows its prompt and reports one fixed decision.
+    struct DecidingSpawner {
+        decision: &'static str,
+    }
+
+    impl PromptChildSpawner for DecidingSpawner {
+        fn available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn spawn(&self) -> Result<PromptChild, String> {
+            let lines = format!(
+                "{{\"event\":\"shown\",\"id\":1,\"server\":\"fake\"}}\n\
+                 {{\"event\":\"decision\",\"action\":\"{}\"}}\n",
+                self.decision
+            );
+            Ok(PromptChild {
+                stdin: Some(Box::new(io::sink())),
+                stdout: Some(Box::new(io::Cursor::new(lines.into_bytes()))),
+                process: None,
+            })
+        }
+    }
+
+    #[test]
+    fn the_daemon_accepts_each_approving_decision_only_for_its_own_verb() {
+        let decide = |decision: &'static str, verb: PromptVerb| {
+            let prompter = NotificationPrompter::with_timing(
+                Arc::new(DecidingSpawner { decision }),
+                Timing {
+                    shown_timeout: SHOWN_TIMEOUT,
+                    withdraw_grace: Duration::from_millis(300),
+                    min_review_delay: Duration::ZERO,
+                },
+            );
+            let sink = Arc::new(RecordingSink::default());
+            let weak: Weak<dyn PromptSink> = Arc::downgrade(&sink) as Weak<dyn PromptSink>;
+            let mut fields = registration_fields();
+            fields.verb = verb;
+            prompter.show(ticket(1), fields, weak);
+            sink.wait_for(2)[1].clone()
+        };
+        let user_deny = PromptEvent::Denied(EscalationDenyCause::User);
+        assert_eq!(
+            decide(ACTION_REGISTER_ONCE, PromptVerb::Register),
+            PromptEvent::Approved
+        );
+        assert_eq!(
+            decide(ACTION_ALLOW_ALWAYS, PromptVerb::Authenticate),
+            PromptEvent::Approved
+        );
+        // The other approving key is a deny, never an approval.
+        assert_eq!(decide(ACTION_ALLOW_ALWAYS, PromptVerb::Register), user_deny);
+        assert_eq!(
+            decide(ACTION_REGISTER_ONCE, PromptVerb::Authenticate),
+            user_deny
+        );
+        assert_eq!(decide(ACTION_DENY, PromptVerb::Register), user_deny);
     }
 
     fn ticket(seq: u64) -> PromptTicket {

@@ -528,6 +528,7 @@ pub fn rewrite(
     passless: &str,
     profile: &str,
     env_keys: &[String],
+    with_access_tool: bool,
 ) -> Rewrite {
     let adapter_name = match launch.adapter {
         McpAdapterKind::Playwright => "playwright",
@@ -554,6 +555,10 @@ pub fn rewrite(
     }
     if let Some(npx) = &launch.npx_path {
         argv.extend(["--npx".to_owned(), npx.clone()]);
+    }
+    // Only the Playwright wrapper has the tool (ADR 0014 amendment section 6).
+    if with_access_tool && launch.adapter == McpAdapterKind::Playwright {
+        argv.push("--with-access-tool".to_owned());
     }
     if let Some(package) = &launch.package {
         argv.extend(["--package".to_owned(), package.clone()]);
@@ -925,14 +930,18 @@ fn generic_snippet(
     adapter: McpAdapterKind,
     passless: &str,
     profile: &str,
+    with_access_tool: bool,
 ) -> String {
     let adapter_name = match adapter {
         McpAdapterKind::Playwright => "playwright",
         McpAdapterKind::ChromeDevtools => "chrome-devtools",
     };
-    let argv: Vec<String> = [passless, "agent", "mcp", adapter_name, "--profile", profile]
+    let mut argv: Vec<String> = [passless, "agent", "mcp", adapter_name, "--profile", profile]
         .map(str::to_owned)
         .to_vec();
+    if with_access_tool && adapter == McpAdapterKind::Playwright {
+        argv.push("--with-access-tool".to_owned());
+    }
     entry_snippet(
         client,
         entry,
@@ -963,6 +972,7 @@ pub fn plan(
     text: &str,
     passless: &str,
     profile: &str,
+    with_access_tool: bool,
 ) -> Result<Plan, PlanError> {
     let (root, jsonc) = parse_config(text)?;
     let mut entries = Vec::new();
@@ -977,10 +987,18 @@ pub fn plan(
             Kind::Unsupported { adapter, why } => Outcome::Unsupported {
                 adapter: *adapter,
                 why: why.clone(),
-                snippet: generic_snippet(client, &found.entry, *adapter, passless, profile),
+                snippet: generic_snippet(
+                    client,
+                    &found.entry,
+                    *adapter,
+                    passless,
+                    profile,
+                    with_access_tool,
+                ),
             },
             Kind::Plain(launch) => {
-                let rewritten = rewrite(launch, passless, profile, &found.env_keys);
+                let rewritten =
+                    rewrite(launch, passless, profile, &found.env_keys, with_access_tool);
                 let original = entry_value(&root, &found.entry.path);
                 let snippet = entry_snippet(
                     client,
@@ -1435,6 +1453,7 @@ pub fn plan_add(
     text: Option<&str>,
     passless: &str,
     profile: &str,
+    with_access_tool: bool,
 ) -> Result<AddPlan, PlanError> {
     let launch = PlainLaunch {
         adapter: McpAdapterKind::Playwright,
@@ -1444,7 +1463,7 @@ pub fn plan_add(
         args: Vec::new(),
         runner_notes: Vec::new(),
     };
-    let argv = rewrite(&launch, passless, profile, &[]).argv;
+    let argv = rewrite(&launch, passless, profile, &[], with_access_tool).argv;
     let path = new_entry_path(client);
     let entry = EntryRef {
         name: NEW_ENTRY_NAME.to_owned(),

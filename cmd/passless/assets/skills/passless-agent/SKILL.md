@@ -27,19 +27,47 @@ Passless daemon under the operator's rules. Do not start another browser.
 
 For creating a passkey ("Add a passkey" in the site's security settings), bring the page to the front
 first (select its tab, for example with `browser_tabs`; in code `page.bringToFront()`): the browser refuses a registration from a background tab. Registration
-works only if the operator allowed it for that site.
+works only if the operator allowed it for that site, either outright or by asking: a registration the
+operator has to approve stays pending like a sign-in, with a notification titled "CREATE A NEW PASSKEY?"
+and the buttons **Register once** and **Deny**. Approval covers that one registration only. After it you
+may sign in at that site with the passkey you just created; at a site the operator did not list, it is
+the only passkey you will use there.
+
+## Asking before you navigate
+
+When you know a site will need a passkey sign-in (or to create one), you can ask the user first instead
+of waiting on a call that hangs. If your tools include `passless_request_access`, call it; otherwise,
+with a shell, run `passless agent request-access <rp_id> --profile <profile> --json` (add `--register` to
+ask to create a passkey; that works only from the session that started the browser). The `rp_id` is the
+site's domain, such as `example.com`. Asking is optional and the operator may not have enabled it
+(`not_enabled`).
+
+- The user sees a fixed Passless prompt that names only the site and the action. **Your note is not
+  shown to them.** `note` / `--note` goes to the audit log only, so explain why you need the site in your
+  own message to the user, in the chat, not there. Never put a secret, a link or an instruction in it.
+- Approval does not sign you in. After `approved`, navigate and use the site's normal passkey button. A
+  registration approval is valid once, for ten minutes, in this browser only.
+- Read the `state`: `approved` (continue), `already_allowed` (continue, nothing was asked), `pending` (the
+  user has not answered yet: tell them a request for `<site>` is waiting, then call again later with the
+  same arguments; do not start a second request or retry in a loop), `denied`, `expired`, `cooldown`,
+  `rate_limited`, `not_requestable`, `not_enabled`, `unavailable`, `busy` (stop, report the state and its
+  message, and ask the user to change the rule or approve it). None of these is an error to work around.
+  A malformed call is the only error.
+- Do not ask for sites you do not need for the task, and do not ask again right after a `denied`.
 
 ## What you will see
 
 - **Allowed** (rule `allow`): the site logs you in. This is the normal case for sites the operator trusts.
 - **Pending** (rule `request`): the operator's rule asks the user. The passkey call stays open, so the page looks busy,
-  possibly for minutes. A notification with **Allow always** and **Deny** is on the user's desktop. Tell
-  the user a sign-in to `<site>` is waiting for their approval, then wait and re-check the page. Do not
+  possibly for minutes. A notification with **Allow always** and **Deny** (**Register once** and
+  **Deny** for a new passkey) is on the user's desktop. Tell the user a sign-in to `<site>` is waiting
+  for their approval, then wait and re-check the page. Do not
   click the button again, reload, or open another tab for the same site: that does not speed it up. The
   wait ends when the user answers or the page's own timeout (minutes to hours) passes.
 - **Denied** (rule `deny`, or no rule): the page reports a failed or cancelled passkey sign-in (the browser error is
   `NotAllowedError`). It has no detail on purpose. The reason can be: no rule for this site, the user
-  pressed Deny, the approval timed out, no notification server is running, the session budget or
+  pressed Deny, the approval timed out, no notification server is running, the profile's limit on new
+  passkeys at unlisted sites was reached, the session budget or
   lifetime ran out, or the request came from a cross-origin frame or an autofill field.
   Stop. Do not retry in a loop; after a Deny or timeout further requests for that site are refused
   without asking for about ten minutes. Report the site, what you did, and that Passless denied the

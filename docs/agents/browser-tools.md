@@ -60,6 +60,8 @@ inside the session, as that user, and exits with the daemon or when the session 
   it, or with a tag such as `@latest`, `npx` takes whatever the registry serves at that moment. `--npx <absolute path>` names `npx`; by default it is the first `npx` on `PATH`,
   which must not be writable by group or others.
 - `--url <URL>` opens a page once the extension is attached.
+- `--with-access-tool` adds the `passless_request_access` tool ([below](#asking-before-navigating)).
+  `--print-config` prints it in the entry only when you pass it too.
 - The adapter hands the bootstrap bearer to Playwright MCP through an environment variable, never an
   argument.
 
@@ -125,6 +127,10 @@ passless agent mcp install --client opencode --user --profile coding --yes    # 
   to paste instead and refuses `--yes`.
 - `--skill` installs or refreshes the bundled `passless-agent` skill for the client (a differing copy
   is backed up first).
+- `--with-access-tool` writes `--with-access-tool` into the Playwright entries it rewrites or adds, so
+  the agent can ask before it navigates ([below](#asking-before-navigating)). An entry that already runs
+  through Passless is not changed: add the flag to its `args` by hand. chrome-devtools entries never
+  get it.
 
 Restart the client afterwards. `passless doctor --agents` should now report the entry as running
 through Passless.
@@ -198,6 +204,39 @@ browser, which does not see the other's pages, as long as the profile allows the
 - With `browser_scope = "session"` and more than one session, `browser_cdp_port` must be unset (or 0).
 
 The sessions share the profile's rules and granted rules; each has its own `max_operations` budget. The setting is restart-only ([Configuration](configuration.md#policy-reload)).
+
+### Asking before navigating
+
+A site that needs a passkey sign-in or registration normally raises your prompt only once the page
+calls WebAuthn, and the agent sees a call that hangs. With the opt-in `--with-access-tool`, the
+wrapper adds one tool, `passless_request_access`, with which the agent asks first; the profile must
+list the action in `pre_request_actions` ([Asking in advance](rules.md#asking-in-advance)).
+
+```bash
+passless agent mcp playwright --profile coding --with-access-tool
+passless agent mcp --print-config claude-code --with-access-tool    # the entry, with the flag
+passless agent mcp install --client claude-code --profile coding --with-access-tool --yes
+```
+
+The tool takes `rp_id` (required), `action` (`authenticate`, the default, or `register`), `note`
+(at most 200 characters; recorded in the audit log only, never shown to you) and `wait_seconds` (0 to
+120, default 30). Its result is one text item holding the status object of the CLI's `--json`: `state`
+(`approved`, `pending`, `denied`, `already_allowed`, ...), `rp_id`, `action`, `expires_in_secs`,
+`retry_after_secs` and `message`. Every state is a normal result (`isError` false); `isError` is true
+only for a malformed call (the text is a `ProtocolError`) or a broken link to the daemon. `pending`
+means call again later with the same arguments. Approval does not sign in: the agent navigates and uses
+the site's normal WebAuthn flow afterwards. A `register` approval is valid once, for 10 minutes, in this
+browser only, because the wrapper's own principal session owns the browser.
+
+With the flag the wrapper no longer hands its stdio to Playwright MCP but relays it: newline-delimited
+JSON-RPC passes in both directions unchanged, except that the first page of `tools/list` gets the extra
+tool and a `tools/call` for it is answered by the wrapper. The relay holds no capability or bearer and
+asks the daemon through the same principal session that serves discovery. Without the flag nothing
+changes: the server inherits the stdio, and `tools/list` and every other message are as before.
+chrome-devtools-mcp has no such tool; an agent using it, or any agent with a shell, runs
+`passless agent request-access` instead (this works in [pipe mode](#pipe-mode) too, from inside the
+agent's principal session). While a call waits for you, the wrapper's other requests to the daemon
+(starting or restarting the browser) wait behind it.
 
 ## chrome-devtools-mcp
 
@@ -282,6 +321,10 @@ passless agent run --profile coding -- /bin/sh -c '
   passless agent browser --wait --url https://github.com/login
   passless agent browser-control --request "{\"id\":1,\"method\":\"Target.getTargets\"}"'
 ```
+
+`passless agent request-access` works from the same principal session ([Asking in
+advance](rules.md#asking-in-advance)); a `--register` request needs the session that launched the
+browser, which is the one that runs `passless agent browser`.
 
 Every command is audited and the daemon's filter keeps the agent away from the Passless extension (its
 worker, `chrome-extension:` and `chrome:` URLs): see [Operations](operations.md#driving-a-pipe-mode-browser).

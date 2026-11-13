@@ -1776,6 +1776,7 @@ impl AuditGate {
                         wall_time_ms: row.wall_time_ms,
                         monotonic_ms: row.monotonic_ms,
                         event: &row.event,
+                        agent_supplied: row.event.agent_supplied_fields(),
                     })
                     .map_err(|e| {
                         AuditError::SchemaViolation(format!("serialize JSON row: {}", e))
@@ -1786,19 +1787,22 @@ impl AuditGate {
             }
             ExportFormat::Csv => {
                 let mut lines = Vec::with_capacity(rows.len() + 1);
-                lines.push("sequence,wall_time_ms,monotonic_ms,kind,event".to_string());
+                lines.push(
+                    "sequence,wall_time_ms,monotonic_ms,kind,event,agent_supplied".to_string(),
+                );
                 for row in &rows {
                     let event_json = serde_json::to_string(&row.event).map_err(|e| {
                         AuditError::SchemaViolation(format!("serialize CSV event: {}", e))
                     })?;
                     let escaped_event = csv_escape(&event_json);
                     lines.push(format!(
-                        "{},{},{},{},{}",
+                        "{},{},{},{},{},{}",
                         row.sequence,
                         row.wall_time_ms,
                         row.monotonic_ms,
                         csv_escape(row.event.kind_name()),
-                        escaped_event
+                        escaped_event,
+                        row.event.agent_supplied_fields().join(";")
                     ));
                 }
                 ("csv".to_string(), lines.join("\n") + "\n")
@@ -1875,6 +1879,11 @@ struct ExportJsonRow<'a> {
     wall_time_ms: u64,
     monotonic_ms: u64,
     event: &'a AuditEvent,
+    /// The event fields whose text an agent wrote (ADR 0014 amendment section 2.3), so that a
+    /// reader of the export sees which words are the agent's, not the daemon's. Absent when the
+    /// event has none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agent_supplied: Vec<&'static str>,
 }
 
 fn csv_escape(s: &str) -> String {

@@ -2,8 +2,8 @@
 //! `passless doctor --agents` runs the same check.
 //!
 //! The parsing and the rules are the daemon's own ([`AppConfig::load`], [`AppConfig::check_startup`],
-//! [`AgentConfig::deprecation_warnings`]); this module only adds what the daemon discovers later by
-//! failing (the audit directory) and prints the result.
+//! [`AgentConfig::deprecation_warnings`], [`AgentConfig::advisory_warnings`]); this module only
+//! adds what the daemon discovers later by failing (the audit directory) and prints the result.
 
 use passless_core::{AppConfig, Args, Error, Result};
 
@@ -28,6 +28,7 @@ pub fn check(config: &AppConfig) -> Result<Checked> {
             checked
                 .warnings
                 .extend(config.agents.deprecation_warnings());
+            checked.warnings.extend(config.agents.advisory_warnings());
             // `AuditGate::open` creates only the last component of the path.
             if let Some(audit) = &config.agents.audit_path {
                 crate::agent::audit::AuditGate::check_dir(audit).map_err(|e| {

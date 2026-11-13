@@ -16,15 +16,15 @@ use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
-use super::audit_events::{AuditAction, PolicyDenyReason};
+use super::audit_events::{AuditAction, CredentialScope, PolicyDenyReason};
 use super::escalation::{
     EscalationOutcome, EscalationRefusal, EscalationRequest, EscalationService, NoPark, ParkHook,
-    WaiterSession,
+    StoreCounter, WaiterSession,
 };
-use super::granted_rules::PermittingRule;
+use super::granted_rules::{PermittingRule, RequestSource};
 use super::lock_order::{self, LockLevel, Tracked};
 use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
-use super::policy_engine::PolicyRuntime;
+use super::policy_engine::{PolicyRuntime, ProfilePins};
 use super::register::{RegisterContext, RegisterHandler};
 use super::session::{
     AgentSession, CeremonyAction, CeremonyOutcome, CeremonyResult, ChallengeDigest, Claim,
@@ -287,7 +287,14 @@ pub struct SignContextRegistry {
     created: Instant,
     /// Milliseconds after `created` of the last tombstone sweep.
     last_refusal_sweep_ms: AtomicU64,
+    /// Told the session grants of the sign bearers a lease revocation removed (ADR 0014
+    /// amendment section 2.3: a pre-approval of the grant's principal session is dropped). Called
+    /// with no registry lock held.
+    lease_observer: std::sync::OnceLock<LeaseObserver>,
 }
+
+/// See [`SignContextRegistry::set_lease_observer`].
+pub type LeaseObserver = Box<dyn Fn(&[passless_core::agent::GrantId]) + Send + Sync>;
 
 /// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
 /// revoked with it (ADR 0014 section 9). It shares the sign bearer's session (replay table, budget,
@@ -460,7 +467,15 @@ impl SignContextRegistry {
             revoked_signs: Mutex::new(RevokedSigns::default()),
             created: Instant::now(),
             last_refusal_sweep_ms: AtomicU64::new(0),
+            lease_observer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the observer of lease revocations (once; a second call is ignored). It is called
+    /// by [`Self::revoke_by_lease`] after every registry guard is released, with the session
+    /// grants of the sign bearers it removed.
+    pub fn set_lease_observer(&self, observer: LeaseObserver) {
+        let _ = self.lease_observer.set(observer);
     }
 
     fn lock_entries(&self) -> Tracked<MutexGuard<'_, HashMap<String, LeaseEntry>>> {
@@ -724,6 +739,10 @@ impl SignContextRegistry {
         for (_, entry) in &removed {
             entry.context.session.revoke();
         }
+        let grants: Vec<passless_core::agent::GrantId> = removed
+            .iter()
+            .map(|(_, entry)| entry.context.active_grant_id.clone())
+            .collect();
         self.remember_revoked_signs(removed);
 
         // Registration bearers die with the lease too.
@@ -737,6 +756,11 @@ impl SignContextRegistry {
             if self.revoke_registration(&key) {
                 count += 1;
             }
+        }
+        if !grants.is_empty()
+            && let Some(observer) = self.lease_observer.get()
+        {
+            observer(&grants);
         }
         count
     }
@@ -1129,6 +1153,9 @@ pub(crate) struct Escalation<'a> {
     pub rule: &'a RuleIdentity,
     /// The ceremony's audit: told which escalation the ceremony waits on.
     pub audit: &'a CeremonyAudit,
+    /// Registration only: counts the target store's passkeys for the RP when the prompt is shown
+    /// (prompt text only).
+    pub store_counter: Option<Arc<dyn StoreCounter>>,
 }
 
 /// An escalation request that passed the pre-checks (cooldown, grant cap and store, bus, queue,
@@ -1171,16 +1198,40 @@ impl Escalation<'_> {
                 ));
             }
         };
+        // Registration through `*` (ADR 0014 amendment 2.2): validation admits it only for an
+        // acknowledged same-user profile; check again against the live policy (fail closed).
+        if self.action == CeremonyAction::Register
+            && rule == PermittingRule::Wildcard
+            && (profile.mode != passless_core::agent::AgentMode::SameUser
+                || !profile.wildcard_registration_acknowledged)
+        {
+            return Err((
+                PolicyDenyReason::ActionNotAllowed,
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "registration through the `*` rule is not acknowledged for this profile",
+                    RecommendedAction::FixRequest,
+                ),
+            ));
+        }
         let request = EscalationRequest {
             profile: self.profile_id.clone(),
             rp_id: self.rp_id.to_string(),
             action: self.action,
-            origin: self.origin.to_string(),
+            origin: Some(self.origin.to_string()),
             rule,
             session: WaiterSession::of(self.session),
+            source: RequestSource::Ceremony,
+            // The owner of the bearer session through its session grant: the audit names it, and
+            // a `register` pre-request of that principal session is adoptable by this ceremony.
+            principal: self.session.owning_principal_session(self.policy_runtime),
+            agent_note: None,
             mode: profile.mode,
             principal_user: profile.principal_user.clone(),
             max_granted_rules: profile.max_granted_rules,
+            max_wildcard_registrations: profile.max_wildcard_registrations,
+            wildcard_registration_prompts_per_day: profile.wildcard_registration_prompts_per_day,
+            store_counter: self.store_counter.clone(),
         };
         self.service
             .precheck(&request)
@@ -1232,7 +1283,12 @@ impl Escalation<'_> {
         let outcome = waiter.wait(wait_deadline, cancelled, &still_valid, park);
         debug!("escalation {}: wait ended: {:?}", escalation_id, outcome);
         match outcome {
-            EscalationOutcome::Approved { .. } | EscalationOutcome::RegistrationApproved(_) => {
+            EscalationOutcome::Approved { source, .. } => {
+                self.audit.approval_source(source);
+                Ok(outcome)
+            }
+            EscalationOutcome::RegistrationApproved(ref approval) => {
+                self.audit.approval_source(approval.source());
                 Ok(outcome)
             }
             EscalationOutcome::Denied { reason, .. } => Err((
@@ -1287,6 +1343,98 @@ pub(crate) fn decode_challenge(challenge_b64u: &str) -> Result<Vec<u8>, Protocol
             "invalid challenge_b64u encoding",
             RecommendedAction::FixRequest,
         )),
+    }
+}
+
+/// Where the candidate credentials of one authentication come from (ADR 0014 section 10.1,
+/// first step, as amended by section 2.1 of the amendment):
+///
+/// | matched rule | grant upgrade | profile `credential_refs` | candidates |
+/// |---|---|---|---|
+/// | exact | registration grants only | either | only the credentials those grants recorded |
+/// | exact | none, or an escalation grant | set | the pins plus the registration-granted credentials of this RP |
+/// | exact | none, or an escalation grant | unset | discovery within this RP |
+/// | `*` | any | either | discovery within this RP, unless the RP has registration-granted credentials: then only those |
+///
+/// Grants count only when they were approved through the rule that matches now (resolution
+/// guarantees it for the upgrade; the credential lookups filter on the same identity). The profile
+/// pins never apply to a `*` match, and an RP with an exact rule never resolves through `*`
+/// (resolution order), so a pinned RP never falls through to discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CandidateSource {
+    /// An exact rule with pins configured.
+    Pinned(Vec<CredentialRef>),
+    /// Every credential of the RP.
+    Discovered,
+    /// The agent registered a credential here and the sign-in is permitted by that registration
+    /// (a `*` match, or an exact `request` upgraded by registration grants only): it signs in
+    /// only with credentials it created, never with the human's (amendment section 2.2 item 3).
+    /// Empty when the grant no longer lists a credential: nothing may be used.
+    RegistrationPinned(Vec<CredentialRef>),
+}
+
+/// What the granted-rules store says about the rule that matched, read live next to the match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrantEvidence {
+    /// The effective action is `allow` because a grant upgraded a configured `request`.
+    pub(crate) upgraded: bool,
+    /// The credentials registration grants through this rule recorded for the RP.
+    pub(crate) registration_refs: Vec<CredentialRef>,
+    /// An approved `authenticate` escalation exists through this rule ("Allow always").
+    pub(crate) escalation: bool,
+}
+
+impl CandidateSource {
+    /// The source for a match on `rule`, given the live profile pins (`None`: the profile is
+    /// gone) and the grant evidence for that rule. `None` when no rule matched or the profile is
+    /// unknown: nothing may be used (fail closed).
+    pub(crate) fn choose(
+        rule: &RuleIdentity,
+        pins: Option<&ProfilePins>,
+        evidence: GrantEvidence,
+    ) -> Option<Self> {
+        let pins = pins?;
+        let GrantEvidence {
+            upgraded,
+            registration_refs,
+            escalation,
+        } = evidence;
+        match rule {
+            RuleIdentity::None => None,
+            // The human approved one registration, and the prompt promised that the agent signs
+            // in there only with the new passkey: an upgrade that rests on registration grants
+            // alone never reaches discovery or the profile pins. If the refs are gone the set is
+            // empty and the sign-in fails closed (a revoke between resolution and here).
+            RuleIdentity::Exact(_) if upgraded && !escalation => {
+                Some(Self::RegistrationPinned(registration_refs))
+            }
+            RuleIdentity::Exact(_) => Some(match pins {
+                ProfilePins::Configured(pinned) => {
+                    let mut refs = pinned.clone();
+                    for granted in registration_refs {
+                        if !refs.contains(&granted) {
+                            refs.push(granted);
+                        }
+                    }
+                    Self::Pinned(refs)
+                }
+                ProfilePins::Unset => Self::Discovered,
+            }),
+            RuleIdentity::Wildcard => Some(if registration_refs.is_empty() {
+                Self::Discovered
+            } else {
+                Self::RegistrationPinned(registration_refs)
+            }),
+        }
+    }
+
+    /// The audit's `credential_scope`.
+    pub(crate) fn scope(&self) -> CredentialScope {
+        match self {
+            Self::Pinned(_) => CredentialScope::Pinned,
+            Self::Discovered => CredentialScope::Discovered,
+            Self::RegistrationPinned(_) => CredentialScope::RegistrationPinned,
+        }
     }
 }
 
@@ -1544,8 +1692,10 @@ impl SignHandler {
             ));
         }
 
-        // 3. Session grant and principal binding.
-        let grant = self.check_grant(ctx, target)?;
+        // 3. Session grant and principal binding. The grant's frozen credential list is for
+        //    audit only: the candidate set comes from the matched rule and the live policy
+        //    (`CandidateSource`).
+        self.check_grant(ctx, target)?;
 
         // 4. Resolve against the live policy and granted rules on every request, never against a
         //    copy of the profile configuration frozen into the session (plan R16).
@@ -1621,6 +1771,7 @@ impl SignHandler {
             origin: &req.origin,
             rule: &matched.rule,
             audit,
+            store_counter: None,
         };
         let prepared = if matched.action == RuleAction::Request {
             Some(
@@ -1654,7 +1805,6 @@ impl SignHandler {
                         ctx,
                         req,
                         target,
-                        &grant,
                         (&escalation, prepared),
                         &mut guard,
                         deadline,
@@ -1663,7 +1813,7 @@ impl SignHandler {
                         &mut key_used,
                     )
                 } else {
-                    self.sign_fresh(ctx, req, target, &grant, &matched, cancelled, &mut key_used)
+                    self.sign_fresh(ctx, req, target, &matched, cancelled, &mut key_used)
                 };
                 // The operation lock is released: activate the browser lease now (review H1).
                 // The assertion is released only if activation succeeds.
@@ -1708,7 +1858,6 @@ impl SignHandler {
         ctx: &SignContext,
         req: &SignAssertionRequest,
         target: &AuditTarget,
-        grant: &super::policy_engine::GrantSignSnapshot,
         (escalation, prepared): (&Escalation<'_>, PreparedEscalation),
         guard: &mut ClaimGuard,
         deadline: Instant,
@@ -1752,7 +1901,7 @@ impl SignHandler {
         guard
             .claim_budget(u32::from(max_operations))
             .map_err(|rejection| self.deny(target, claim_rejection_error(rejection)))?;
-        self.sign_fresh(ctx, req, target, grant, &approved, cancelled, key_used)
+        self.sign_fresh(ctx, req, target, &approved, cancelled, key_used)
     }
 
     /// Before a duplicate gets the stored outcome, its session must still be valid (review L3):
@@ -1803,7 +1952,6 @@ impl SignHandler {
         ctx: &SignContext,
         req: &SignAssertionRequest,
         target: &AuditTarget,
-        grant: &super::policy_engine::GrantSignSnapshot,
         matched: &passless_core::agent::MatchedRule,
         cancelled: &dyn Fn() -> bool,
         key_used: &mut bool,
@@ -1811,6 +1959,41 @@ impl SignHandler {
         let normalized_rp = target.rp_id;
         // The rule that permits this key use (after an escalation: the granted rule).
         target.audit.matched(matched);
+
+        // The candidate source follows the matched rule, with the pins read from the live policy
+        // and the registration-granted credentials from the live store, before any backend lock
+        // is taken (ADR 0014 amendment sections 2.1 and 2.2 item 3).
+        let source = CandidateSource::choose(
+            &matched.rule,
+            self.policy_runtime.profile_pins(&ctx.profile_id).as_ref(),
+            GrantEvidence {
+                upgraded: matched.granted,
+                registration_refs: self.policy_runtime.granted_credential_refs(
+                    &ctx.profile_id,
+                    normalized_rp,
+                    &matched.rule,
+                ),
+                escalation: self.policy_runtime.has_escalation_grant(
+                    &ctx.profile_id,
+                    normalized_rp,
+                    &matched.rule,
+                ),
+            },
+        )
+        .ok_or_else(|| {
+            self.deny(
+                target,
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "no rule determines the credentials this operation may use",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            )
+        })?;
+        target.audit.credential_scope(source.scope());
         // `allow` is the only agent evidence: UP and UV come from the validated agent session,
         // never from a rule field or the RP's `userVerification` request (ADR 0014 section 7).
         let up = true;
@@ -1820,42 +2003,33 @@ impl SignHandler {
         let _op_lock = lock_order::lock(&self.operation_lock, LockLevel::Operation);
         let mut storage = lock_order::lock(&self.credential_storage, LockLevel::Storage);
 
-        let credential_scope = if grant.credential_refs.is_empty() {
-            let mut discovered = Vec::new();
-            // Only this RP's credentials are read (review M-f): `ByRp` is how
-            // `resolve_credential_id` looks them up too. The storage indexes are keyed by the RP
-            // ID as stored, which is what the browser sent (a lowercase hostname), and
-            // `normalized_rp` is trimmed and lowercased, so a credential this finds is one
-            // `resolve_credential_id` finds. A whole-store walk would decrypt every credential
-            // under the human locks (a GPG operation or a TPM unseal each).
-            if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::ByRp(
-                normalized_rp.to_string(),
-            )) {
-                loop {
-                    if credential.rp.id.eq_ignore_ascii_case(normalized_rp) {
-                        discovered.push(CredentialRef::with_default_domain(&credential.id));
-                    }
-                    match storage.read_next() {
-                        Ok(next) => credential = next,
-                        Err(_) => break,
+        let credential_scope = match source {
+            CandidateSource::Discovered => {
+                let mut discovered = Vec::new();
+                // Only this RP's credentials are read (review M-f): `ByRp` is how
+                // `resolve_credential_id` looks them up too. The storage indexes are keyed by the
+                // RP ID as stored, which is what the browser sent (a lowercase hostname), and
+                // `normalized_rp` is trimmed and lowercased, so a credential this finds is one
+                // `resolve_credential_id` finds. A whole-store walk would decrypt every credential
+                // under the human locks (a GPG operation or a TPM unseal each).
+                if let Ok(mut credential) = storage.read_first(
+                    crate::storage::CredentialFilter::ByRp(normalized_rp.to_string()),
+                ) {
+                    loop {
+                        if credential.rp.id.eq_ignore_ascii_case(normalized_rp) {
+                            discovered.push(CredentialRef::with_default_domain(&credential.id));
+                        }
+                        match storage.read_next() {
+                            Ok(next) => credential = next,
+                            Err(_) => break,
+                        }
                     }
                 }
+                discovered
             }
-            discovered
-        } else {
-            // Configured pins (a frozen session snapshot) plus the credentials registration
-            // grants pinned for this RP (live; ADR 0014 section 8.3). With no configured pins,
-            // discovery above already finds a registered credential.
-            let mut pinned = grant.credential_refs.clone();
-            for granted in self
-                .policy_runtime
-                .granted_credential_refs(&ctx.profile_id, normalized_rp)
-            {
-                if !pinned.contains(&granted) {
-                    pinned.push(granted);
-                }
-            }
-            pinned
+            // A pinned set never falls back to discovery: a pin whose credential is gone (or
+            // belongs to another RP) leaves fewer candidates, possibly none (fail closed).
+            CandidateSource::Pinned(refs) | CandidateSource::RegistrationPinned(refs) => refs,
         };
 
         let mut candidates = Vec::new();
@@ -2703,6 +2877,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_registry_tells_the_lease_observer_the_revoked_grants() {
+        let registry = SignContextRegistry::new();
+        let seen: Arc<Mutex<Vec<passless_core::agent::GrantId>>> = Arc::default();
+        {
+            let seen = Arc::clone(&seen);
+            registry.set_lease_observer(Box::new(move |grants| {
+                assert!(
+                    lock_order::held_levels().is_empty(),
+                    "the observer runs with no registry lock held"
+                );
+                seen.lock().unwrap().extend_from_slice(grants);
+            }));
+        }
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        let grant = ctx.active_grant_id.clone();
+        let t1 = generate_bearer_token().unwrap();
+        let t2 = generate_bearer_token().unwrap();
+        registry
+            .register_pending(t1.clone(), ctx.clone(), handler.clone())
+            .unwrap();
+        registry.register_pending(t2.clone(), ctx, handler).unwrap();
+        registry.bind_lease(&t1, "lease-x".to_string()).unwrap();
+        registry.bind_lease(&t2, "lease-y".to_string()).unwrap();
+        // A lease with no bearer tells it nothing.
+        registry.revoke_by_lease("lease-none");
+        assert!(seen.lock().unwrap().is_empty());
+        registry.revoke_by_lease("lease-x");
+        assert_eq!(*seen.lock().unwrap(), vec![grant]);
+    }
+
+    #[test]
     fn test_registry_revoke_all() {
         let registry = SignContextRegistry::new();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -3053,7 +3260,12 @@ pub(crate) mod tests {
             }
         }
         impl GrantSource for ToggleGrants {
-            fn is_granted(&self, _profile_id: &ProfileId, _rp_id: &str) -> bool {
+            fn is_granted(
+                &self,
+                _profile_id: &ProfileId,
+                _rp_id: &str,
+                _rule: &RuleIdentity,
+            ) -> bool {
                 self.0.load(Ordering::Acquire)
             }
         }
@@ -3085,6 +3297,9 @@ pub(crate) mod tests {
             selection: CredentialSelection,
         ) -> AgentProfileConfig {
             AgentProfileConfig {
+                max_wildcard_registrations: None,
+                wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3112,6 +3327,7 @@ pub(crate) mod tests {
             let mut profiles = BTreeMap::new();
             profiles.insert("test-profile".to_string(), profile_config);
             AgentConfig {
+                acknowledge_global_registration: vec![],
                 notify_user: None,
                 state_dir: None,
                 escalation_timeout: None,
@@ -3310,25 +3526,28 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn dynamic_grant_discovers_credential_created_after_approval() {
+        fn candidates_follow_the_live_pins_not_the_session_grant() {
+            // ADR 0014 amendment 2.1: the source is chosen by the matched rule and the LIVE
+            // pins, not by whether the session grant's credential list is empty.
             let f = TestFixture::new(true);
             f.storage.lock().unwrap().delete(&[1u8; 32]).unwrap();
 
-            let grant_request = f
-                .policy_runtime
-                .admin_request_dynamic_grant(GrantRequestParams {
-                    profile_id: f.profile_id.clone(),
-                    session_id: passless_core::agent::PrincipalSessionId::new(),
-                    principal_digest: [0u8; 32],
-                    rp_ids: vec!["example.com".to_string()],
-                    credentials: vec![],
-                    requested_ttl_secs: 300,
-                })
-                .unwrap();
-            let dynamic_grant_id = f
-                .policy_runtime
-                .admin_approve_grant(&grant_request, &identity::admin_authority())
-                .unwrap();
+            let dynamic_grant = || {
+                let grant_request = f
+                    .policy_runtime
+                    .admin_request_dynamic_grant(GrantRequestParams {
+                        profile_id: f.profile_id.clone(),
+                        session_id: passless_core::agent::PrincipalSessionId::new(),
+                        principal_digest: [0u8; 32],
+                        rp_ids: vec!["example.com".to_string()],
+                        credentials: vec![],
+                        requested_ttl_secs: 300,
+                    })
+                    .unwrap();
+                f.policy_runtime
+                    .admin_approve_grant(&grant_request, &identity::admin_authority())
+                    .unwrap()
+            };
 
             let new_credential_id = vec![2u8; 32];
             let generated = SoftwareCredentialKeyProvider.generate(-7).unwrap();
@@ -3344,18 +3563,36 @@ pub(crate) mod tests {
                 backup_state: CredentialBackupState::NotEligible,
                 extensions: soft_fido2::Extensions::default(),
             });
-
-            let ctx = SignContext {
-                lease_activation: None,
-                profile_id: f.profile_id.clone(),
-                active_grant_id: dynamic_grant_id,
-                session: test_session(&f.profile_id),
-            };
             let mut req = f.make_req();
             req.allow_credentials = vec![b64u_encode(&new_credential_id)];
 
+            // Pins are configured (the fixture pins credential 1): an unpinned credential of the
+            // RP is never discovered, whatever the session grant holds.
+            let ctx = SignContext {
+                lease_activation: None,
+                profile_id: f.profile_id.clone(),
+                active_grant_id: dynamic_grant(),
+                session: test_session(&f.profile_id),
+            };
+            assert!(f.make_handler().sign(&ctx, &req).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // Without pins, the exact rule discovers the credential created after the session.
+            f.policy_runtime
+                .reload(&test_agent_config(test_profile_config(
+                    vec![allow_rule("example.com")],
+                    None,
+                    CredentialSelection::Single,
+                )))
+                .unwrap();
+            let ctx = SignContext {
+                lease_activation: None,
+                profile_id: f.profile_id.clone(),
+                active_grant_id: dynamic_grant(),
+                session: test_session_at(&f.profile_id, f.policy_runtime.revocation_epoch()),
+            };
             let result = f.make_handler().sign(&ctx, &req);
-            assert!(result.is_ok());
+            assert!(result.is_ok(), "{result:?}");
             assert_eq!(f.key_provider.sign_calls(), 1);
         }
 
@@ -3730,6 +3967,9 @@ pub(crate) mod tests {
             /// (the store is then the policy's grant source); otherwise no prompt can be shown
             /// and `ToggleGrants` is the grant source.
             escalation: bool,
+            /// The profile pins as credential id bytes (`credential:[id; 32]`), overriding the
+            /// default (every stored credential, or none for a dynamic grant).
+            pins: Option<Vec<u8>>,
         }
 
         impl FixtureSpec {
@@ -3741,6 +3981,7 @@ pub(crate) mod tests {
                     credentials: vec![stored(1, "example.com", 0)],
                     dynamic_grant: false,
                     escalation: false,
+                    pins: None,
                 }
             }
         }
@@ -3770,7 +4011,9 @@ pub(crate) mod tests {
             }
 
             fn profile_config(spec: &FixtureSpec) -> AgentProfileConfig {
-                let credential_refs = if spec.dynamic_grant {
+                let credential_refs = if let Some(pins) = &spec.pins {
+                    Some(pins.iter().map(|id| cred_ref_of(&[*id; 32])).collect())
+                } else if spec.dynamic_grant {
                     None
                 } else {
                     Some(
@@ -5786,7 +6029,7 @@ pub(crate) mod tests {
             // The prompt carries only daemon-derived fields.
             let fields = f.prompter.last_fields();
             assert_eq!(fields.rp_id, "example.com");
-            assert_eq!(fields.origin, "https://example.com");
+            assert_eq!(fields.origin.as_deref(), Some("https://example.com"));
             assert_eq!(fields.profile, "test-profile");
             f.prompter.decide(PromptEvent::Approved);
             ceremony.join().unwrap().expect("approved ceremony signs");
@@ -6737,6 +6980,474 @@ pub(crate) mod tests {
                 .list_credentials("example.com", None)
                 .expect("the human path reads storage after an agent panic");
             assert_eq!(listed.len(), 1);
+        }
+
+        // --- ADR 0014 amendment 2.1 and 2.2 item 3: the candidate source per matched rule ---
+
+        fn req_at(f: &AuditTestFixture, rp_id: &str) -> SignAssertionRequest {
+            SignAssertionRequest {
+                rp_id: rp_id.to_string(),
+                origin: format!("https://{rp_id}"),
+                challenge_b64u: b64u_encode(rp_id.as_bytes()),
+                ..f.make_req()
+            }
+        }
+
+        /// The `credential_scope` of the last operation record about `rp_id`.
+        fn last_scope(f: &AuditTestFixture, rp_id: &str) -> serde_json::Value {
+            read_audit_events(&f.audit_dir)
+                .into_iter()
+                .rev()
+                .find(|e| {
+                    e["rp_id"] == rp_id
+                        && e["kind"]
+                            .as_str()
+                            .is_some_and(|k| k.starts_with("policy.") || k == "operation.terminal")
+                })
+                .map(|e| {
+                    assert!(
+                        e.as_object().unwrap().contains_key("credential_scope"),
+                        "{e}"
+                    );
+                    e["credential_scope"].clone()
+                })
+                .expect("an operation record")
+        }
+
+        fn evidence(upgraded: bool, escalation: bool, refs: &[&CredentialRef]) -> GrantEvidence {
+            GrantEvidence {
+                upgraded,
+                registration_refs: refs.iter().map(|r| (*r).clone()).collect(),
+                escalation,
+            }
+        }
+
+        #[test]
+        fn candidate_source_table() {
+            let pinned = cred_ref_of(&[1; 32]);
+            let granted = cred_ref_of(&[2; 32]);
+            let exact = RuleIdentity::Exact("github.com".to_string());
+            let pins = ProfilePins::Configured(vec![pinned.clone()]);
+            let unset = ProfilePins::Unset;
+
+            // exact, pins set, no upgrade: pins plus registration-granted refs.
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&pins), evidence(false, false, &[&granted])),
+                Some(CandidateSource::Pinned(vec![
+                    pinned.clone(),
+                    granted.clone()
+                ]))
+            );
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&pins), evidence(false, false, &[&pinned])),
+                Some(CandidateSource::Pinned(vec![pinned.clone()]))
+            );
+            // An empty pin list pins to nothing but the registration-granted refs.
+            assert_eq!(
+                CandidateSource::choose(
+                    &exact,
+                    Some(&ProfilePins::Configured(vec![])),
+                    GrantEvidence::default()
+                ),
+                Some(CandidateSource::Pinned(vec![]))
+            );
+            // exact, pins unset, no upgrade: discovery, also with registration-granted refs.
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&unset), evidence(false, false, &[&granted])),
+                Some(CandidateSource::Discovered)
+            );
+            // exact, upgraded by registration grants only (review M1): only the credential those
+            // grants recorded, never discovery and never the profile pins.
+            for pins in [&pins, &unset] {
+                assert_eq!(
+                    CandidateSource::choose(&exact, Some(pins), evidence(true, false, &[&granted])),
+                    Some(CandidateSource::RegistrationPinned(vec![granted.clone()]))
+                );
+                // The refs are gone (a revoke between resolution and here): nothing may be used.
+                assert_eq!(
+                    CandidateSource::choose(&exact, Some(pins), evidence(true, false, &[])),
+                    Some(CandidateSource::RegistrationPinned(vec![]))
+                );
+            }
+            // exact, upgraded by an escalation grant ("Allow always"): today's behaviour.
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&unset), evidence(true, true, &[])),
+                Some(CandidateSource::Discovered)
+            );
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&pins), evidence(true, true, &[&granted])),
+                Some(CandidateSource::Pinned(vec![
+                    pinned.clone(),
+                    granted.clone()
+                ]))
+            );
+            // `*`, either: discovery, unless the RP has registration-granted refs; never the pins.
+            for pins in [&pins, &unset] {
+                assert_eq!(
+                    CandidateSource::choose(
+                        &RuleIdentity::Wildcard,
+                        Some(pins),
+                        GrantEvidence::default()
+                    ),
+                    Some(CandidateSource::Discovered)
+                );
+                assert_eq!(
+                    CandidateSource::choose(
+                        &RuleIdentity::Wildcard,
+                        Some(pins),
+                        evidence(true, false, &[&granted])
+                    ),
+                    Some(CandidateSource::RegistrationPinned(vec![granted.clone()]))
+                );
+            }
+            // No rule, or an unknown profile: nothing (fail closed).
+            assert_eq!(
+                CandidateSource::choose(
+                    &RuleIdentity::None,
+                    Some(&unset),
+                    GrantEvidence::default()
+                ),
+                None
+            );
+            assert_eq!(
+                CandidateSource::choose(&exact, None, GrantEvidence::default()),
+                None
+            );
+            assert_eq!(
+                CandidateSource::Pinned(vec![]).scope(),
+                crate::agent::audit_events::CredentialScope::Pinned
+            );
+        }
+
+        /// One profile with pins, an exact rule and `*`: the exact RP signs with its pinned
+        /// credential only, an unlisted RP discovers through `*`.
+        fn pins_with_wildcard() -> AuditTestFixture {
+            let mut spec = FixtureSpec::new(
+                vec![
+                    allow_rule("github.com"),
+                    rule("*", RuleAction::Allow, RuleAction::Deny),
+                ],
+                vec!["*"],
+            );
+            spec.credentials = vec![
+                stored(1, "github.com", 0),
+                stored(2, "github.com", 1),
+                stored(3, "unlisted.example", 0),
+            ];
+            spec.pins = Some(vec![1]);
+            AuditTestFixture::from_spec(spec)
+        }
+
+        #[test]
+        fn pins_constrain_exact_rules_and_the_wildcard_discovers() {
+            let f = pins_with_wildcard();
+            let handler = f.make_handler();
+
+            // github.com holds two credentials; the pin narrows to one, so `single` succeeds.
+            let signed = signed_credential(handler.sign(&f.make_ctx(), &req_at(&f, "github.com")));
+            assert_eq!(signed, vec![1; 32]);
+            assert_eq!(last_scope(&f, "github.com"), "pinned");
+
+            // The unpinned credential of the exact RP is never used, even when the page asks.
+            let mut asked = req_at(&f, "github.com");
+            asked.challenge_b64u = b64u_encode(b"asked");
+            asked.allow_credentials = vec![b64u_encode(&[2; 32])];
+            assert!(handler.sign(&f.make_ctx(), &asked).is_err());
+            assert_eq!(
+                f.policy_records().last().unwrap().1.as_deref(),
+                Some("allow_credentials_mismatch")
+            );
+
+            // The unlisted RP is matched by `*` and discovers its credential: the pins do not
+            // apply to it.
+            let signed =
+                signed_credential(handler.sign(&f.make_ctx(), &req_at(&f, "unlisted.example")));
+            assert_eq!(signed, vec![3; 32]);
+            assert_eq!(last_scope(&f, "unlisted.example"), "discovered");
+        }
+
+        #[test]
+        fn a_stale_pin_at_an_exact_rp_fails_closed_without_falling_through_to_the_wildcard() {
+            let mut spec = FixtureSpec::new(
+                vec![
+                    allow_rule("github.com"),
+                    rule("*", RuleAction::Allow, RuleAction::Deny),
+                ],
+                vec!["*"],
+            );
+            // The pinned credential is gone; the RP still holds another one, which `*` would
+            // discover if the exact RP ever fell through to it.
+            spec.credentials = vec![stored(2, "github.com", 0)];
+            spec.pins = Some(vec![9]);
+            let f = AuditTestFixture::from_spec(spec);
+            let result = f
+                .make_handler()
+                .sign(&f.make_ctx(), &req_at(&f, "github.com"));
+            assert!(result.is_err());
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records().last().unwrap(),
+                &(
+                    "policy.deny".to_string(),
+                    Some("credential_not_match".to_string())
+                )
+            );
+            assert_eq!(last_scope(&f, "github.com"), "pinned");
+            let deny = read_audit_events(&f.audit_dir)
+                .into_iter()
+                .rev()
+                .find(|e| e["kind"] == "policy.deny")
+                .unwrap();
+            assert_eq!(deny["rule"], "exact");
+        }
+
+        #[test]
+        fn pins_are_read_from_the_live_policy() {
+            let mut f = pins_with_wildcard();
+            // A reload that pins credential 2 instead: the next session signs with it.
+            f.spec.pins = Some(vec![2]);
+            let rules = f.spec.rules.clone();
+            f.reload_rules(rules);
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &req_at(&f, "github.com")),
+            );
+            assert_eq!(signed, vec![2; 32]);
+        }
+
+        #[test]
+        fn after_a_wildcard_registration_the_agent_signs_in_there_only_with_its_own_credential() {
+            let mut spec = FixtureSpec::new(
+                vec![rule("*", RuleAction::Request, RuleAction::Request)],
+                vec!["*"],
+            );
+            // The human already holds a passkey at the site; the agent registered another.
+            spec.credentials = vec![stored(1, "example.org", 0), stored(2, "example.org", 1)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let f = AuditTestFixture::from_spec(spec);
+            let agent_credential = cred_ref_of(&[2; 32]);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.org",
+                        crate::agent::granted_rules::GrantKind::Registration,
+                        "esc-registered",
+                        "https://example.org",
+                        PermittingRule::Wildcard,
+                        Some(agent_credential),
+                    ),
+                    64,
+                )
+                .unwrap();
+
+            // The registration grant upgrades `*`'s `request` to allow, and the candidate set is
+            // the agent's own credential: `single` succeeds although discovery would find two.
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &req_at(&f, "example.org")),
+            );
+            assert_eq!(signed, vec![2; 32]);
+            assert_eq!(last_scope(&f, "example.org"), "registration_pinned");
+            assert_eq!(f.prompter.shown(), 0, "no prompt: the grant allows it");
+
+            // Even when the page asks for the human's credential, it is not used.
+            let mut asked = req_at(&f, "example.org");
+            asked.challenge_b64u = b64u_encode(b"human");
+            asked.allow_credentials = vec![b64u_encode(&[1; 32])];
+            assert!(f.make_handler().sign(&f.make_ctx(), &asked).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        fn registration_grant(
+            rp_id: &str,
+            rule: PermittingRule,
+            credential: u8,
+        ) -> crate::agent::granted_rules::GrantedRule {
+            crate::agent::granted_rules::GrantedRule::new(
+                rp_id,
+                crate::agent::granted_rules::GrantKind::Registration,
+                "esc-registered",
+                "https://example.org",
+                rule,
+                Some(cred_ref_of(&[credential; 32])),
+            )
+        }
+
+        /// Review M1: a registration approved through `*` is a grant for the `*` rule only. When
+        /// the operator later lists the site with an exact `authenticate = "request"` rule, the
+        /// old grant must not upgrade it, and above all must not switch candidate selection to
+        /// discovery, which would let a page that names the human's passkey sign without a prompt.
+        #[test]
+        fn a_wildcard_registration_grant_does_not_upgrade_a_later_exact_request() {
+            let mut spec = FixtureSpec::new(
+                vec![rule("*", RuleAction::Request, RuleAction::Request)],
+                vec!["*"],
+            );
+            spec.credentials = vec![stored(1, "example.org", 0), stored(2, "example.org", 1)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let mut f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    registration_grant("example.org", PermittingRule::Wildcard, 2),
+                    64,
+                )
+                .unwrap();
+            // Operator later lists the site with an exact rule that ASKS (request), no pins.
+            f.reload_rules(vec![
+                rule("*", RuleAction::Request, RuleAction::Request),
+                rule("example.org", RuleAction::Request, RuleAction::Deny),
+            ]);
+            let matched =
+                f.policy_runtime
+                    .resolve(&f.profile_id, &GrantAction::Authenticate, "example.org");
+            assert_eq!(matched.action, RuleAction::Request);
+            assert!(!matched.granted, "the `*` grant is not for the exact rule");
+
+            let mut asked = req_at(&f, "example.org");
+            asked.challenge_b64u = b64u_encode(b"human");
+            asked.allow_credentials = vec![b64u_encode(&[1; 32])];
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, asked);
+            f.prompter.wait_shown(1);
+            f.prompter.decide(PromptEvent::Denied(
+                crate::agent::audit_events::EscalationDenyCause::User,
+            ));
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.prompter.shown(), 1, "the human is asked");
+            assert_eq!(f.key_provider.sign_calls(), 0, "nothing was signed");
+        }
+
+        /// The pre-existing sibling of M1: an exact rule with `register = "request"` and
+        /// `authenticate = "request"`. After "Register once" the sign-in is upgraded, but only the
+        /// credential that was registered is usable: the prompt promised no more.
+        #[test]
+        fn an_exact_registration_grant_signs_only_with_the_registered_credential() {
+            let mut spec = FixtureSpec::new(
+                vec![rule(
+                    "example.org",
+                    RuleAction::Request,
+                    RuleAction::Request,
+                )],
+                vec!["example.org"],
+            );
+            // The human already holds a passkey at the site; the agent registered another.
+            spec.credentials = vec![stored(1, "example.org", 0), stored(2, "example.org", 1)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    registration_grant("example.org", PermittingRule::Exact, 2),
+                    64,
+                )
+                .unwrap();
+
+            // Even when the page names the human's credential, it is not used and no prompt is
+            // raised: the upgraded set is the registered credential, which `allowCredentials`
+            // does not name.
+            let mut asked = req_at(&f, "example.org");
+            asked.challenge_b64u = b64u_encode(b"human");
+            asked.allow_credentials = vec![b64u_encode(&[1; 32])];
+            assert!(f.make_handler().sign(&f.make_ctx(), &asked).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(f.prompter.shown(), 0, "the grant allows it, no prompt");
+            assert_eq!(last_scope(&f, "example.org"), "registration_pinned");
+
+            // Without a selection from the page, it signs with the registered credential.
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &req_at(&f, "example.org")),
+            );
+            assert_eq!(signed, vec![2; 32]);
+            assert_eq!(last_scope(&f, "example.org"), "registration_pinned");
+        }
+
+        /// An escalation grant ("Allow always" on a sign-in) keeps discovery for its own rule.
+        #[test]
+        fn an_exact_escalation_grant_keeps_discovery_for_its_rule() {
+            let mut spec = FixtureSpec::new(
+                vec![rule("example.org", RuleAction::Request, RuleAction::Deny)],
+                vec!["example.org"],
+            );
+            spec.credentials = vec![stored(1, "example.org", 0)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.org",
+                        crate::agent::granted_rules::GrantKind::Escalation,
+                        "esc-signin",
+                        "https://example.org",
+                        PermittingRule::Exact,
+                        None,
+                    ),
+                    64,
+                )
+                .unwrap();
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &req_at(&f, "example.org")),
+            );
+            assert_eq!(signed, vec![1; 32]);
+            assert_eq!(last_scope(&f, "example.org"), "discovered");
+            assert_eq!(f.prompter.shown(), 0);
+        }
+
+        #[test]
+        fn a_wildcard_sign_in_grant_without_a_credential_still_discovers() {
+            // An approved `authenticate` escalation through `*` carries no credential: discovery
+            // continues, and `single` refuses to choose between the human's two passkeys.
+            let mut spec = FixtureSpec::new(
+                vec![rule("*", RuleAction::Request, RuleAction::Deny)],
+                vec!["*"],
+            );
+            spec.credentials = vec![stored(1, "example.org", 0), stored(2, "example.org", 1)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.org",
+                        crate::agent::granted_rules::GrantKind::Escalation,
+                        "esc-signin",
+                        "https://example.org",
+                        PermittingRule::Wildcard,
+                        None,
+                    ),
+                    64,
+                )
+                .unwrap();
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &req_at(&f, "example.org"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict);
+            assert_eq!(last_scope(&f, "example.org"), "discovered");
+        }
+
+        #[test]
+        fn credential_scope_is_null_before_the_candidate_set_is_chosen() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "https://evil.example".to_string();
+            assert!(f.make_handler().sign(&f.make_ctx(), &req).is_err());
+            assert!(last_scope(&f, "example.com").is_null());
         }
     }
 

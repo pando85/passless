@@ -51,6 +51,40 @@ entries (`rp_id`, `authenticate`, `register`), and delete `human_verification_pr
 - Conditional mediation no longer "stays native". It is unavailable in the managed browser, and
   cross-origin frames are denied.
 
+## Upgrading to agent pre-requests
+
+Agents can now ask for passkey access before they navigate (`passless agent request-access`, the opt-in
+`passless_request_access` MCP tool; [Asking in advance](rules.md#asking-in-advance)). Nothing changes
+for a profile until you list `pre_request_actions` in it. What changes on upgrade regardless, and what to
+tell your users:
+
+- **The policy digest goes from version 6 to 7.** It now covers `pre_request_actions`, so the first
+  policy compile of the new binary has a new digest for every profile and **revokes sessions once**: a
+  daemon restarted into the new version ends its sessions anyway, and an unchanged `policy reload` after
+  that revokes nothing. Running `agent mcp playwright` wrappers start a new principal session on their
+  next browser tool call.
+- **The granted-rules store moves to version 2 only once a pre-request grant exists.** A grant an agent
+  asked for in advance has no origin and says `source = "pre_request"` (and a registration that used a
+  pre-approval has `source = "pre_request"` with its origin), which version 1 cannot represent. The
+  daemon writes the lowest version that fits its entries: a store with only page-raised grants stays
+  version 1 and downgrades cleanly. **An older daemon that finds a version 2 file disables that
+  profile's grants (fail closed) and `passless doctor` reports it.** Before downgrading, run
+  `agent-admin grants revoke` for each `pre_request` grant, or `grants clear --profile <p> --confirm`; the
+  next write returns the file to version 1. `grants list` shows each grant's `SOURCE` and prints an empty
+  origin as `-`; the JSON has the same `source` and `origin` values.
+- **The agent protocol goes to 1.3** (`PrincipalRequest::RequestAccess`). An older client against the new
+  daemon, or the reverse, negotiates down and simply lacks the command. The MCP wrapper's own link to its
+  principal session is broker protocol 2: a wrapper started by an older `passless` refuses a new broker
+  (and the reverse) with a message that says to restart the MCP server.
+- **The audit schema goes to version 5.** Operation records carry `approval_source`; escalation records
+  carry `source`, `principal_session_id_hash` and `agent_note`, and `origin` may be null; there are new
+  kinds (`pre_approval.issued`, `consumed`, `expired`) and `policy.deny` reasons (`not_requestable`,
+  `pre_request_rate_limited`, `pre_request_not_enabled`). Readers of older records are unaffected: fields
+  added later read as absent. The audit export marks agent-supplied text (`agent_supplied` in the JSON
+  rows, a last `agent_supplied` column in the CSV). See [Audit](audit.md).
+- `passless agent-admin sessions list`, `show` and `revoke` work again (they ended in "unexpected
+  response").
+
 ## From a plain Playwright MCP
 
 Before agent mode, an MCP client started its own browser (`npx @playwright/mcp`, `pnpm dlx

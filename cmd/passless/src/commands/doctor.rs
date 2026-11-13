@@ -5,6 +5,7 @@ use passless_core::agent::protocol::DoctorResponse;
 use passless_core::{AppConfig, Args, Error, OutputFormat, Result};
 
 use crate::agent::doctor_agents;
+use crate::agent::doctor_pins::HumanStore;
 
 use super::config_check;
 
@@ -17,7 +18,13 @@ pub fn dispatch(args: &mut Args, agents: bool, output: OutputFormat) -> Result<(
     }
     let config = AppConfig::load(args)?;
     let mut checks = doctor_agents::config_checks(config_check::check(&config));
-    checks.extend(doctor_agents::run(&config.agents));
+    // Where the human credential store lives, for the pin checks; a configuration the daemon
+    // cannot build a backend from is already a failed `config` check above.
+    let human = config
+        .backend()
+        .ok()
+        .map(|backend| HumanStore::from_backend(&backend));
+    checks.extend(doctor_agents::run(&config.agents, human.as_ref()));
     let report = DoctorResponse {
         healthy: checks.iter().all(|check| check.passed),
         checks,
