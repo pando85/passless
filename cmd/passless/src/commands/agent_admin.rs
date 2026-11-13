@@ -1218,6 +1218,7 @@ mod tests {
             origin: format!("https://{rp_id}"),
             rule: rule.into(),
             credential_ref: credential.map(str::to_string),
+            source: None,
         }
     }
 

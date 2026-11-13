@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use passless_core::agent::protocol::{
     ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, RegisterCredentialResponse,
 };
-use passless_core::agent::{GrantId, ProfileId};
+use passless_core::agent::{GrantId, PrincipalSessionId, ProfileId};
 
 use super::escalation::ParkHook;
 use super::lock_order::{self, LockLevel};
@@ -450,6 +450,23 @@ impl AgentSession {
         hasher.update(b"passless-agent-session-audit-id");
         hasher.update(self.audit_id);
         hex::encode(hasher.finalize())
+    }
+
+    /// The principal session that owns this bearer session, through its session grant (ADR 0014
+    /// amendment section 2.3): the grant must be active, belong to this session's profile and be
+    /// bound to this session's principal digest. `None` for a bearer without a session grant, or
+    /// whose grant is gone, revoked or bound elsewhere (fail closed: nothing session-bound, such
+    /// as a pre-approval, may then be used).
+    pub fn owning_principal_session(
+        &self,
+        policy: &super::policy_engine::PolicyRuntime,
+    ) -> Option<PrincipalSessionId> {
+        let grant = policy.resolve_grant_for_sign(self.profile_id(), self.grant_id()?)?;
+        (grant.state == super::grant::GrantState::Active
+            && !grant.is_revoked
+            && grant.profile_id == *self.profile_id()
+            && grant.principal_digest == *self.principal_digest())
+        .then_some(grant.session_id)
     }
 
     pub fn principal_digest(&self) -> &[u8; 32] {

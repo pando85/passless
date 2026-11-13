@@ -35,6 +35,7 @@ use super::audit_events::{
     PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason, RuleGrantSource,
 };
 use super::deployment::PrincipalRelationship;
+use super::granted_rules::RequestSource;
 use super::policy_engine::PolicyRuntime;
 use super::refusal_ledger::{RefusalKey, RefusalLedger, SummaryTemplate};
 use super::session::AgentSession;
@@ -141,6 +142,8 @@ struct State {
     rule: Option<String>,
     grant_source: Option<RuleGrantSource>,
     escalation_id: Option<String>,
+    /// What approved the operation, when it ran on an escalation approval or a pre-approval.
+    approval_source: Option<RequestSource>,
     credential_ref: Option<CredentialRef>,
     credential_scope: Option<CredentialScope>,
     selection_rule: Option<String>,
@@ -208,9 +211,20 @@ impl CeremonyAudit {
         });
     }
 
+    /// The ceremony's `request_id` (the one its operation records carry).
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Record the escalation the ceremony waited on.
     pub fn escalation(&self, escalation_id: &str) {
         self.state.borrow_mut().escalation_id = Some(escalation_id.to_string());
+    }
+
+    /// Record that the operation runs on an approval raised by `source` (audit schema version
+    /// 5): an approved escalation the ceremony waited on, or a consumed pre-approval.
+    pub fn approval_source(&self, source: RequestSource) {
+        self.state.borrow_mut().approval_source = Some(source);
     }
 
     /// Record the credential the operation selected, how it was selected and the counter before.
@@ -273,6 +287,7 @@ impl CeremonyAudit {
             .matched(state.rule.clone(), state.grant_source)
             .credential(state.credential_ref.clone(), state.selection_rule.clone())
             .credential_scope(state.credential_scope)
+            .approval_source(state.approval_source)
             .counters(state.counter_before, state.counter_after)
     }
 

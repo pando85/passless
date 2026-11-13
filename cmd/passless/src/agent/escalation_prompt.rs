@@ -356,8 +356,12 @@ pub struct PromptFields {
     pub verb: PromptVerb,
     /// The normalized RP ID; rendered in its ASCII (punycode) form.
     pub rp_id: String,
-    /// The validated origin; rendered in its ASCII serialization.
-    pub origin: String,
+    /// The validated origin; rendered in its ASCII serialization. `None` for a pre-request no
+    /// page is behind (ADR 0014 amendment section 2.3): rendered as `none yet`.
+    pub origin: Option<String>,
+    /// The agent asked in advance (`RequestAccess`): the body says that no page is waiting
+    /// (amendment sections 5.1 and 5.3). Nothing the agent supplied is shown.
+    pub requested_in_advance: bool,
     /// The rule that resolved to `request`.
     pub rule: PromptRule,
     /// Registration only: how many passkeys the target store holds for the RP, when the backend
@@ -379,7 +383,7 @@ fn is_bidi_or_zero_width_control(ch: char) -> bool {
 
 /// One bounded visual line: no line breaks, no control, Bidi or zero-width characters, and no
 /// markup characters (servers with `body-markup` would interpret them).
-fn sanitize_line(input: &str, max_bytes: usize) -> String {
+pub(crate) fn sanitize_line(input: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(input.len().min(max_bytes));
     let mut previous_was_space = false;
     for original in input.chars() {
@@ -440,6 +444,19 @@ fn store_count_clause(count: Option<usize>) -> String {
     }
 }
 
+/// What the origin line shows: the validated origin, or `none yet` for a pre-request.
+fn origin_line(origin: Option<&str>) -> Result<String, String> {
+    match origin {
+        Some(origin) => Ok(sanitize_line(&ascii_origin(origin)?, 300)),
+        None => Ok(ORIGIN_NONE_YET.to_string()),
+    }
+}
+
+/// The origin line of a pre-request prompt (ADR 0014 amendment sections 5.1 and 5.3).
+pub const ORIGIN_NONE_YET: &str = "none yet";
+/// Who asked, on a pre-request prompt (amendment sections 5.1 and 5.3).
+pub const REQUESTED_IN_ADVANCE: &str = "the agent in advance (no page is waiting)";
+
 /// The registration prompt (ADR 0014 amendment section 5.1): six lines, each a daemon-derived
 /// fact; the summary says it is not a sign-in.
 fn render_registration(fields: &PromptFields, rp_id: &str, origin: &str) -> (String, String) {
@@ -463,12 +480,17 @@ fn render_registration(fields: &PromptFields, rp_id: &str, origin: &str) -> (Str
          Origin: {}\n\
          Stored in: {}{}\n\
          Approving allows this one registration, then lets the agent sign in here without asking.\n\
-         Requested by: a page now, principal user {}",
+         Requested by: {}, principal user {}",
         sanitize_line(rp_id, 253),
         site,
-        sanitize_line(origin, 300),
+        origin,
         store,
         store_count_clause(fields.store_count),
+        if fields.requested_in_advance {
+            REQUESTED_IN_ADVANCE
+        } else {
+            "a page now"
+        },
         sanitize_line(&fields.principal_user, 64),
     );
     (REGISTER_SUMMARY.to_string(), body)
@@ -477,19 +499,27 @@ fn render_registration(fields: &PromptFields, rp_id: &str, origin: &str) -> (Str
 /// The notification summary and body built from daemon-derived fields only.
 pub fn render_prompt(fields: &PromptFields) -> Result<(String, String), String> {
     let rp_id = ascii_rp_id(&fields.rp_id)?;
-    let origin = ascii_origin(&fields.origin)?;
+    let origin = origin_line(fields.origin.as_deref())?;
     let (summary, action) = match fields.verb {
         PromptVerb::Authenticate => ("Passless: agent sign-in request", "sign in with a passkey"),
         PromptVerb::Register => return Ok(render_registration(fields, &rp_id, &origin)),
     };
+    // A pre-request adds one daemon-derived line (amendment section 5.3): seven in all, which
+    // still fits notify-osd's fallback dialog.
+    let requested_by = if fields.requested_in_advance {
+        format!("Requested by: {REQUESTED_IN_ADVANCE}\n")
+    } else {
+        String::new()
+    };
     let body = format!(
-        "Profile: {} ({})\nPrincipal user: {}\nAction: {}\nSite: {} (any page under this site)\nOrigin: {}\n\"Allow always\" is saved permanently.",
+        "Profile: {} ({})\nPrincipal user: {}\nAction: {}\nSite: {} (any page under this site)\nOrigin: {}\n{}\"Allow always\" is saved permanently.",
         sanitize_line(&fields.profile, 128),
         sanitize_line(&fields.mode, 32),
         sanitize_line(&fields.principal_user, 64),
         action,
         sanitize_line(&rp_id, 253),
-        sanitize_line(&origin, 300),
+        origin,
+        requested_by,
     );
     Ok((summary.to_string(), body))
 }
@@ -1015,7 +1045,8 @@ mod tests {
             principal_user: "agent".to_string(),
             verb: PromptVerb::Authenticate,
             rp_id: "bücher.example".to_string(),
-            origin: "https://login.bücher.example:8443".to_string(),
+            origin: Some("https://login.bücher.example:8443".to_string()),
+            requested_in_advance: false,
             rule: PromptRule::Exact,
             store_count: Some(3),
         }
@@ -1028,7 +1059,8 @@ mod tests {
             principal_user: "alice".to_string(),
             verb: PromptVerb::Register,
             rp_id: "example.org".to_string(),
-            origin: "https://www.example.org".to_string(),
+            origin: Some("https://www.example.org".to_string()),
+            requested_in_advance: false,
             rule,
             store_count,
         }
@@ -1147,9 +1179,50 @@ mod tests {
     }
 
     #[test]
+    fn render_pre_request_sign_in_matches_the_amendment_lines() {
+        let mut pre = fields();
+        pre.origin = None;
+        pre.requested_in_advance = true;
+        let (summary, body) = render_prompt(&pre).unwrap();
+        assert_eq!(summary, "Passless: agent sign-in request");
+        assert_eq!(
+            body,
+            "Profile: work (isolated)\nPrincipal user: agent\nAction: sign in with a passkey\n\
+             Site: xn--bcher-kva.example (any page under this site)\n\
+             Origin: none yet\n\
+             Requested by: the agent in advance (no page is waiting)\n\
+             \"Allow always\" is saved permanently."
+        );
+        assert!(body.lines().count() <= 7);
+    }
+
+    #[test]
+    fn render_pre_request_registration_matches_the_amendment_lines() {
+        let mut pre = registration("same-user", PromptRule::Wildcard, Some(0));
+        pre.origin = None;
+        pre.requested_in_advance = true;
+        let (summary, body) = render_prompt(&pre).unwrap();
+        assert_eq!(summary, REGISTER_SUMMARY);
+        assert_eq!(
+            body,
+            "Action: create a new passkey and register it at this site\n\
+             Site: example.org (NOT on your list; matched by the * rule)\n\
+             Origin: none yet\n\
+             Stored in: YOUR passkey store (same-user profile \"coding\"), which holds no passkey for this site yet\n\
+             Approving allows this one registration, then lets the agent sign in here without asking.\n\
+             Requested by: the agent in advance (no page is waiting), principal user alice"
+        );
+        assert!(body.lines().count() <= 7);
+        // A ceremony that adopted the pre-request before it was shown has a page: its origin.
+        pre.origin = Some("https://www.example.org".to_string());
+        let (_, body) = render_prompt(&pre).unwrap();
+        assert!(body.contains("\nOrigin: https://www.example.org\n"));
+    }
+
+    #[test]
     fn render_rejects_an_opaque_origin() {
         let mut fields = fields();
-        fields.origin = "data:text/html,x".to_string();
+        fields.origin = Some("data:text/html,x".to_string());
         assert!(render_prompt(&fields).is_err());
     }
 

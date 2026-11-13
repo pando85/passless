@@ -12,13 +12,12 @@ use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
-use super::audit_events::{
-    AuditAction, EscalationAuditContext, EscalationDenyCause, PolicyDenyReason,
-};
+use super::audit_events::{AuditAction, EscalationDenyCause, PolicyDenyReason};
 use super::escalation::{
-    EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, StoreCounter,
-    WaiterSession,
+    EscalationOutcome, EscalationService, NoPark, ParkHook, PreApprovalConsumer,
+    RegistrationApproval, StoreCounter, WaiterSession,
 };
+use super::granted_rules::{PermittingRule, RequestSource};
 use super::lock_order::{self, LockLevel};
 use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
 use super::policy_engine::PolicyRuntime;
@@ -85,7 +84,7 @@ pub struct RegisterHandler {
 
 /// Counts the target store's passkeys for an RP for the registration prompt (review L4): the
 /// backend's path index only, under the storage lock for the count alone.
-struct StorageCounter(Arc<Mutex<Box<dyn CredentialStorage>>>);
+pub(crate) struct StorageCounter(pub(crate) Arc<Mutex<Box<dyn CredentialStorage>>>);
 
 impl std::fmt::Debug for StorageCounter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -99,11 +98,34 @@ impl StoreCounter for StorageCounter {
     }
 }
 
-/// A registration approval is bound to the creating ceremony: its profile, RP and session.
-fn approval_matches(approval: &RegistrationApproval, ctx: &RegisterContext, rp_id: &str) -> bool {
+/// A registration approval is bound to the creating ceremony: its profile, RP and session. One
+/// that came from a pre-request (adopted, or consumed as a pre-approval) is also bound to its
+/// principal session, which must still own the ceremony's bearer session through its session
+/// grant (ADR 0014 amendment section 2.3).
+fn approval_matches(
+    approval: &RegistrationApproval,
+    ctx: &RegisterContext,
+    rp_id: &str,
+    policy: &PolicyRuntime,
+) -> bool {
     approval.profile() == &ctx.profile_id
         && approval.rp_id() == rp_id
         && approval.session() == WaiterSession::of(&ctx.session)
+        && match (approval.source(), approval.principal()) {
+            (RequestSource::Ceremony, _) => true,
+            (RequestSource::PreRequest, Some(principal)) => {
+                ctx.session.owning_principal_session(policy).as_ref() == Some(principal)
+            }
+            (RequestSource::PreRequest, None) => false,
+        }
+}
+
+/// How the escalated path of a registration gets its approval.
+enum Approval {
+    /// It raises (or adopts) an escalation and waits for the human.
+    Escalate(PreparedEscalation),
+    /// It consumed a pre-approval of its principal session (ADR 0014 amendment section 2.3).
+    PreApproved(RegistrationApproval),
 }
 
 /// What the escalated path carries into [`RegisterHandler::register_fresh`].
@@ -467,12 +489,19 @@ impl RegisterHandler {
             audit,
             store_counter,
         };
+        // A pre-approval of the principal session that owns this bearer is consumed here, where
+        // the ceremony's own escalation would be raised: after the option checks (an unsupported
+        // request does not spend it) and before the replay key. From here the path is the one
+        // of an approved ceremony-time escalation (ADR 0014 amendment section 2.3).
         let prepared = if matched.action == RuleAction::Request {
-            Some(
-                escalation
-                    .prepare()
-                    .map_err(|refused| self.deny(target, refused))?,
-            )
+            match self.take_pre_approval(ctx, &matched.rule, target, &req.origin, audit) {
+                Some(approval) => Some(Approval::PreApproved(approval)),
+                None => Some(Approval::Escalate(
+                    escalation
+                        .prepare()
+                        .map_err(|refused| self.deny(target, refused))?,
+                )),
+            }
         } else {
             None
         };
@@ -563,25 +592,30 @@ impl RegisterHandler {
         ctx: &RegisterContext,
         req: &RegisterCredentialRequest,
         target: &AuditTarget,
-        (escalation, prepared): (&Escalation<'_>, PreparedEscalation),
+        (escalation, prepared): (&Escalation<'_>, Approval),
         fresh: Fresh<'_>,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
         park: &mut dyn ParkHook,
         key_used: &mut bool,
     ) -> Result<RegisterCredentialResponse, ProtocolError> {
-        let approval = match escalation.wait(prepared, deadline, cancelled, park) {
-            Ok(EscalationOutcome::RegistrationApproved(approval)) => approval,
-            Ok(_) => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Internal,
-                    "a registration escalation ended without a registration approval",
-                    RecommendedAction::Abort,
-                ));
+        let approval = match prepared {
+            Approval::PreApproved(approval) => approval,
+            Approval::Escalate(prepared) => {
+                match escalation.wait(prepared, deadline, cancelled, park) {
+                    Ok(EscalationOutcome::RegistrationApproved(approval)) => approval,
+                    Ok(_) => {
+                        return Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            "a registration escalation ended without a registration approval",
+                            RecommendedAction::Abort,
+                        ));
+                    }
+                    Err(denied) => return Err(self.deny(target, denied)),
+                }
             }
-            Err(denied) => return Err(self.deny(target, denied)),
         };
-        if !approval_matches(&approval, ctx, target.rp_id) {
+        if !approval_matches(&approval, ctx, target.rp_id, &self.policy_runtime) {
             return Err(self.deny(
                 target,
                 (
@@ -646,18 +680,11 @@ impl RegisterHandler {
                     "agent register: credential for rp={} kept without a registration grant: {}",
                     target.rp_id, e
                 );
-                let context = EscalationAuditContext {
-                    escalation_id: approval.escalation_id().as_str().to_string(),
-                    profile_id: approval.profile().clone(),
-                    action: AuditAction::Register,
-                    rp_id: approval.rp_id().to_string(),
-                    origin: approval.origin().to_string(),
-                    rule: approval.rule(),
-                };
-                if let Err(audit_error) = self
-                    .audit_gate
-                    .record(context.denied(EscalationDenyCause::GrantWriteFailed))
-                {
+                if let Err(audit_error) = self.audit_gate.record(
+                    approval
+                        .audit_context()
+                        .denied(EscalationDenyCause::GrantWriteFailed),
+                ) {
                     warn!(
                         "agent register: the failed grant write could not be audited: {}",
                         audit_error
@@ -666,6 +693,37 @@ impl RegisterHandler {
             }
         }
         Ok(response)
+    }
+
+    /// Consume this bearer's principal session's pre-approval for the RP, if it has one (ADR 0014
+    /// amendment section 2.3). Only a bearer whose session grant is active and bound to it has an
+    /// owner; anything else consumes nothing and escalates as usual.
+    fn take_pre_approval(
+        &self,
+        ctx: &RegisterContext,
+        rule: &RuleIdentity,
+        target: &AuditTarget,
+        origin: &str,
+        audit: &CeremonyAudit,
+    ) -> Option<RegistrationApproval> {
+        let rule = match rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => return None,
+        };
+        let principal = ctx.session.owning_principal_session(&self.policy_runtime)?;
+        let approval = self.escalation.take_pre_approval(PreApprovalConsumer {
+            profile: &ctx.profile_id,
+            rp_id: target.rp_id,
+            principal: &principal,
+            rule,
+            session: WaiterSession::of(&ctx.session),
+            origin,
+            request_id: audit.request_id(),
+        })?;
+        audit.escalation(approval.escalation_id().as_str());
+        audit.approval_source(approval.source());
+        Some(approval)
     }
 
     /// Before a duplicate gets the stored outcome its session must still be valid (review L3);
@@ -705,7 +763,9 @@ impl RegisterHandler {
         // A configured `request` permits key use only with this ceremony's own approval (ADR 0014
         // section 8.3).
         let approved = matched.configured == RuleAction::Request
-            && approval.is_some_and(|approval| approval_matches(approval, ctx, rp_id));
+            && approval.is_some_and(|approval| {
+                approval_matches(approval, ctx, rp_id, &self.policy_runtime)
+            });
         if matched.action != RuleAction::Allow && !approved {
             return Err(self.deny(
                 target,
@@ -1210,6 +1270,7 @@ mod tests {
         AgentProfileConfig {
             max_wildcard_registrations: None,
             wildcard_registration_prompts_per_day: None,
+            pre_request_actions: Vec::new(),
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,

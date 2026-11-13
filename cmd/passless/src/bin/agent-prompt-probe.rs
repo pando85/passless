@@ -83,6 +83,11 @@ struct Args {
     /// The registration prompt's store count (omitted from the text when not given).
     #[arg(long)]
     store_count: Option<usize>,
+    /// Render the pre-request form (ADR 0014 amendment sections 5.1 and 5.3): `Origin: none yet`
+    /// and `Requested by: the agent in advance`. There is no way to pass agent text: the prompt
+    /// never shows any.
+    #[arg(long)]
+    pre_request: bool,
 }
 
 fn finish(decision: &str, error_kind: Option<&str>, start: Instant) -> ! {
@@ -119,7 +124,8 @@ fn main() {
         principal_user: "validation".to_string(),
         verb,
         rp_id: args.rp_id.clone(),
-        origin: format!("https://{}", args.rp_id),
+        origin: (!args.pre_request).then(|| format!("https://{}", args.rp_id)),
+        requested_in_advance: args.pre_request,
         rule: if args.wildcard {
             PromptRule::Wildcard
         } else {

@@ -256,6 +256,30 @@ impl fmt::Display for RuleAction {
     }
 }
 
+/// An action the agent may ask for in advance (`pre_request_actions`; ADR 0014 amendment
+/// section 2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreRequestAction {
+    Authenticate,
+    Register,
+}
+
+impl PreRequestAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Authenticate => "authenticate",
+            Self::Register => "register",
+        }
+    }
+}
+
+impl fmt::Display for PreRequestAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The two ceremonies a rule governs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PolicyAction {
@@ -741,6 +765,11 @@ pub struct AgentProfileConfig {
     /// rule that has `register = "request"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wildcard_registration_prompts_per_day: Option<u16>,
+    /// Actions the agent may ask for in advance with `passless agent request-access` or the MCP
+    /// access tool (ADR 0014 amendment section 2.3). Default empty: pre-requests are off. Each
+    /// action must also resolve to `request` at the site for a pre-request to prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_request_actions: Vec<PreRequestAction>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<AgentStorageConfig>,
@@ -798,6 +827,8 @@ struct AgentProfileConfigRepr {
     max_wildcard_registrations: Option<u16>,
     #[serde(default)]
     wildcard_registration_prompts_per_day: Option<u16>,
+    #[serde(default)]
+    pre_request_actions: Vec<PreRequestAction>,
     #[serde(default)]
     storage: Option<AgentStorageConfig>,
     #[serde(default)]
@@ -863,6 +894,7 @@ impl From<AgentProfileConfigRepr> for AgentProfileConfig {
             credential_selection: repr.credential_selection,
             max_wildcard_registrations: repr.max_wildcard_registrations,
             wildcard_registration_prompts_per_day: repr.wildcard_registration_prompts_per_day,
+            pre_request_actions: repr.pre_request_actions,
             storage: repr.storage,
             rules,
             device: repr.device,
@@ -977,6 +1009,11 @@ impl AgentProfileConfig {
             .unwrap_or(DEFAULT_WILDCARD_REGISTRATION_PROMPTS_PER_DAY)
     }
 
+    /// Whether `action` is listed in `pre_request_actions`.
+    pub fn pre_request_allows(&self, action: PreRequestAction) -> bool {
+        self.pre_request_actions.contains(&action)
+    }
+
     /// Advice about a valid configuration that probably does not do what the operator meant:
     /// the wildcard registration keys set on a profile whose `*` rule never requests
     /// registration have no effect. Logged by `validate`, reported by `passless config check`.
@@ -1000,6 +1037,28 @@ impl AgentProfileConfig {
                         profile_id, key
                     ));
                 }
+            }
+        }
+        for (action, has_request_rule) in [
+            (
+                PreRequestAction::Register,
+                self.rules
+                    .iter()
+                    .any(|rule| rule.register == RuleAction::Request),
+            ),
+            (
+                PreRequestAction::Authenticate,
+                self.rules
+                    .iter()
+                    .any(|rule| rule.authenticate == RuleAction::Request),
+            ),
+        ] {
+            if self.pre_request_allows(action) && !has_request_rule {
+                warnings.push(format!(
+                    "agent profile '{}': pre_request_actions lists \"{}\" but no rule has {} = \
+                     \"request\"; it has no effect",
+                    profile_id, action, action
+                ));
             }
         }
         warnings
@@ -1085,6 +1144,15 @@ impl AgentProfileConfig {
                 "agent profile '{}': wildcard_registration_prompts_per_day must be between 1 and {}",
                 profile_id, MAX_WILDCARD_REGISTRATION_PROMPTS_PER_DAY
             )));
+        }
+        let mut seen_pre_requests = std::collections::BTreeSet::new();
+        for action in &self.pre_request_actions {
+            if !seen_pre_requests.insert(*action) {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': pre_request_actions lists '{}' twice",
+                    profile_id, action
+                )));
+            }
         }
         if self.browser_scope == BrowserScope::Session {
             if self.max_concurrent_sessions == 0
@@ -2257,6 +2325,7 @@ mod tests {
         AgentProfileConfig {
             max_wildcard_registrations: None,
             wildcard_registration_prompts_per_day: None,
+            pre_request_actions: Vec::new(),
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
@@ -2581,6 +2650,7 @@ verbose = false
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2637,6 +2707,7 @@ verbose = false
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2757,6 +2828,7 @@ product_id = 2
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -2811,6 +2883,7 @@ product_id = 2
                 AgentProfileConfig {
                     max_wildcard_registrations: None,
                     wildcard_registration_prompts_per_day: None,
+                    pre_request_actions: Vec::new(),
                     max_granted_rules: 64,
                     max_operations: 64,
                     max_concurrent_sessions: 1,
@@ -2940,6 +3013,7 @@ backend_type = "local"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3006,6 +3080,7 @@ backend_type = "local"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3064,6 +3139,7 @@ backend_type = "local"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3419,6 +3495,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3449,6 +3526,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3534,6 +3612,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3564,6 +3643,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -3618,6 +3698,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -4933,15 +5014,93 @@ authenticate = "request"
     }
 
     #[test]
-    fn pre_request_actions_is_not_accepted_in_phase_1() {
-        // Phase 2 (change 3) adds the key; until then it is an unknown field, so in particular
-        // `"register"` can never be configured.
-        for value in ["[\"register\"]", "[\"authenticate\"]", "[]"] {
-            let err = parse_profile(&format!("pre_request_actions = {value}\n"))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("pre_request_actions"), "{value}: {err}");
+    fn pre_request_actions_default_empty_and_parse() {
+        let profile = parse_profile("").unwrap();
+        assert!(profile.pre_request_actions.is_empty());
+        assert!(!profile.pre_request_allows(PreRequestAction::Authenticate));
+        assert!(!profile.pre_request_allows(PreRequestAction::Register));
+
+        let profile =
+            parse_profile("pre_request_actions = [\"authenticate\", \"register\"]\n").unwrap();
+        assert_eq!(
+            profile.pre_request_actions,
+            vec![PreRequestAction::Authenticate, PreRequestAction::Register]
+        );
+        assert!(profile.pre_request_allows(PreRequestAction::Authenticate));
+        assert!(profile.pre_request_allows(PreRequestAction::Register));
+
+        let profile = parse_profile("pre_request_actions = [\"register\"]\n").unwrap();
+        assert!(!profile.pre_request_allows(PreRequestAction::Authenticate));
+        assert!(profile.pre_request_allows(PreRequestAction::Register));
+        assert_eq!(PreRequestAction::Authenticate.as_str(), "authenticate");
+        assert_eq!(PreRequestAction::Register.as_str(), "register");
+    }
+
+    #[test]
+    fn pre_request_actions_rejects_unknown_value() {
+        for value in ["[\"delete\"]", "[\"authenticate\", \"Register\"]", "[1]"] {
+            assert!(
+                parse_profile(&format!("pre_request_actions = {value}\n")).is_err(),
+                "{value}"
+            );
         }
+    }
+
+    #[test]
+    fn pre_request_actions_rejects_duplicates() {
+        let mut profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Request,
+            RuleAction::Deny,
+        )]);
+        profile.pre_request_actions = vec![PreRequestAction::Authenticate];
+        profile.validate(&pid("test")).unwrap();
+        profile.pre_request_actions = vec![
+            PreRequestAction::Authenticate,
+            PreRequestAction::Register,
+            PreRequestAction::Authenticate,
+        ];
+        let err = profile.validate(&pid("test")).unwrap_err().to_string();
+        assert!(
+            err.contains("pre_request_actions lists 'authenticate' twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pre_request_actions_without_a_request_rule_warn() {
+        let mut profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Allow,
+            RuleAction::Deny,
+        )]);
+        assert!(profile.advisory_warnings(&pid("test")).is_empty());
+
+        profile.pre_request_actions =
+            vec![PreRequestAction::Authenticate, PreRequestAction::Register];
+        let warnings = profile.advisory_warnings(&pid("test"));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains(
+            "agent profile 'test': pre_request_actions lists \"register\" but no rule has register = \"request\"; it has no effect"
+        )));
+        assert!(warnings.iter().any(|w| w.contains(
+            "pre_request_actions lists \"authenticate\" but no rule has authenticate = \"request\"; it has no effect"
+        )));
+        // Valid: advice only.
+        profile.validate(&pid("test")).unwrap();
+
+        // A `request` rule for the action silences its warning (exact or `*`).
+        profile.rules = vec![
+            rule("example.com", RuleAction::Allow, RuleAction::Request),
+            rule("*", RuleAction::Request, RuleAction::Deny),
+        ];
+        assert!(profile.advisory_warnings(&pid("test")).is_empty());
+
+        // Only one of the two is satisfied.
+        profile.rules = vec![rule("example.com", RuleAction::Request, RuleAction::Deny)];
+        let warnings = profile.advisory_warnings(&pid("test"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("lists \"register\""));
     }
 
     #[test]

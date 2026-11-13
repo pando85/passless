@@ -21,7 +21,7 @@ use super::escalation::{
     EscalationOutcome, EscalationRefusal, EscalationRequest, EscalationService, NoPark, ParkHook,
     StoreCounter, WaiterSession,
 };
-use super::granted_rules::PermittingRule;
+use super::granted_rules::{PermittingRule, RequestSource};
 use super::lock_order::{self, LockLevel, Tracked};
 use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
 use super::policy_engine::{PolicyRuntime, ProfilePins};
@@ -287,7 +287,14 @@ pub struct SignContextRegistry {
     created: Instant,
     /// Milliseconds after `created` of the last tombstone sweep.
     last_refusal_sweep_ms: AtomicU64,
+    /// Told the session grants of the sign bearers a lease revocation removed (ADR 0014
+    /// amendment section 2.3: a pre-approval of the grant's principal session is dropped). Called
+    /// with no registry lock held.
+    lease_observer: std::sync::OnceLock<LeaseObserver>,
 }
+
+/// See [`SignContextRegistry::set_lease_observer`].
+pub type LeaseObserver = Box<dyn Fn(&[passless_core::agent::GrantId]) + Send + Sync>;
 
 /// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
 /// revoked with it (ADR 0014 section 9). It shares the sign bearer's session (replay table, budget,
@@ -460,7 +467,15 @@ impl SignContextRegistry {
             revoked_signs: Mutex::new(RevokedSigns::default()),
             created: Instant::now(),
             last_refusal_sweep_ms: AtomicU64::new(0),
+            lease_observer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the observer of lease revocations (once; a second call is ignored). It is called
+    /// by [`Self::revoke_by_lease`] after every registry guard is released, with the session
+    /// grants of the sign bearers it removed.
+    pub fn set_lease_observer(&self, observer: LeaseObserver) {
+        let _ = self.lease_observer.set(observer);
     }
 
     fn lock_entries(&self) -> Tracked<MutexGuard<'_, HashMap<String, LeaseEntry>>> {
@@ -724,6 +739,10 @@ impl SignContextRegistry {
         for (_, entry) in &removed {
             entry.context.session.revoke();
         }
+        let grants: Vec<passless_core::agent::GrantId> = removed
+            .iter()
+            .map(|(_, entry)| entry.context.active_grant_id.clone())
+            .collect();
         self.remember_revoked_signs(removed);
 
         // Registration bearers die with the lease too.
@@ -737,6 +756,11 @@ impl SignContextRegistry {
             if self.revoke_registration(&key) {
                 count += 1;
             }
+        }
+        if !grants.is_empty()
+            && let Some(observer) = self.lease_observer.get()
+        {
+            observer(&grants);
         }
         count
     }
@@ -1194,9 +1218,14 @@ impl Escalation<'_> {
             profile: self.profile_id.clone(),
             rp_id: self.rp_id.to_string(),
             action: self.action,
-            origin: self.origin.to_string(),
+            origin: Some(self.origin.to_string()),
             rule,
             session: WaiterSession::of(self.session),
+            source: RequestSource::Ceremony,
+            // The owner of the bearer session through its session grant: the audit names it, and
+            // a `register` pre-request of that principal session is adoptable by this ceremony.
+            principal: self.session.owning_principal_session(self.policy_runtime),
+            agent_note: None,
             mode: profile.mode,
             principal_user: profile.principal_user.clone(),
             max_granted_rules: profile.max_granted_rules,
@@ -1254,7 +1283,12 @@ impl Escalation<'_> {
         let outcome = waiter.wait(wait_deadline, cancelled, &still_valid, park);
         debug!("escalation {}: wait ended: {:?}", escalation_id, outcome);
         match outcome {
-            EscalationOutcome::Approved { .. } | EscalationOutcome::RegistrationApproved(_) => {
+            EscalationOutcome::Approved { source, .. } => {
+                self.audit.approval_source(source);
+                Ok(outcome)
+            }
+            EscalationOutcome::RegistrationApproved(ref approval) => {
+                self.audit.approval_source(approval.source());
                 Ok(outcome)
             }
             EscalationOutcome::Denied { reason, .. } => Err((
@@ -3232,6 +3266,7 @@ pub(crate) mod tests {
             AgentProfileConfig {
                 max_wildcard_registrations: None,
                 wildcard_registration_prompts_per_day: None,
+                pre_request_actions: Vec::new(),
                 max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
@@ -5961,7 +5996,7 @@ pub(crate) mod tests {
             // The prompt carries only daemon-derived fields.
             let fields = f.prompter.last_fields();
             assert_eq!(fields.rp_id, "example.com");
-            assert_eq!(fields.origin, "https://example.com");
+            assert_eq!(fields.origin.as_deref(), Some("https://example.com"));
             assert_eq!(fields.profile, "test-profile");
             f.prompter.decide(PromptEvent::Approved);
             ceremony.join().unwrap().expect("approved ceremony signs");

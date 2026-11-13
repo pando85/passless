@@ -32,6 +32,33 @@
 //!   ([`EscalationRefusal::WildcardRegistrationCooldown`]). Exact-rule registrations are not
 //!   affected by any of them. The window and the cooldown are in memory: a restart resets them.
 //!
+//! - Pre-requests (ADR 0014 amendment section 2.3): a principal may ask before it navigates
+//!   ([`EscalationService::pre_request`]). The request passes exactly the admission of a
+//!   ceremony for the same key and then waits as a *detached* waiter: it holds a waiter slot of
+//!   its principal session but no thread, and its own deadline
+//!   ([`PRE_REQUEST_PENDING_LIMIT`], or `agents.escalation_timeout` if shorter) is enforced by
+//!   [`EscalationService::sweep_pre_requests`], by the requester's own wait and by every later
+//!   call. Its expiry is a timeout of the key (cooldown). Repeating the request from the same
+//!   principal session reports its state instead of raising another. Per principal session at
+//!   most [`MAX_PENDING_PRE_REQUESTS`] is pending and at most [`MAX_PRE_REQUESTS_PER_WINDOW`] are
+//!   raised per [`PRE_REQUEST_WINDOW`].
+//!   - `authenticate`: ceremonies of the key join the pre-request's escalation as usual, and a
+//!     pre-request joins a ceremony's. The approval persists the same grant a ceremony-time
+//!     approval would, with `source = "pre_request"` and no origin.
+//!   - `register`: the escalation is not joinable and is bound to the requesting principal
+//!     session. The first registration ceremony at the RP from a bearer session owned by that
+//!     principal session (through its session grant) *adopts* it while it is queued or shown and
+//!     waits on it as its creator; any other registration of the key gets `escalation_busy`. An
+//!     approval nobody adopted becomes a [`PreApprovalToken`]: one use, in memory, bound to the
+//!     profile, the RP, the principal session, the revocation epoch and the RP's revoke token,
+//!     for [`PRE_APPROVAL_TTL`] at most (and never beyond the principal session). The first
+//!     registration ceremony of that principal session at that RP consumes it
+//!     ([`EscalationService::take_pre_approval`]) and continues as if its own escalation had been
+//!     approved. A token is dropped on its TTL, the end of its principal session, the revocation
+//!     of a browser lease of that session, a revocation-epoch bump, `grants revoke` for its RP
+//!     and `grants clear`; each drop is audited as `pre_approval.expired`. A token holds its
+//!     wildcard cap slot (review L2) until it is consumed and the grant is written, or dropped.
+//!
 //! Locking: one mutex at [`LockLevel::Escalation`], a leaf. No audit, store, prompt or D-Bus call
 //! happens under it: state changes are made under the mutex and their effects (audit records,
 //! prompt show and withdraw) are run after it is released. Waiters park on its condvar holding
@@ -64,17 +91,18 @@ use std::time::{Duration, Instant};
 use log::{debug, info, warn};
 use rand::RngCore;
 
-use passless_core::agent::{AgentMode, CredentialRef, ProfileId};
+use passless_core::agent::{AgentMode, CredentialRef, PrincipalSessionId, ProfileId};
 
 use super::audit::AuditGate;
 use super::audit_events::{
     AuditAction, AuditEvent, EscalationAuditContext, EscalationDenyCause, EscalationExpireReason,
     EscalationRevokeReason, GrantedRuleAddBuilder, GrantedRuleRevokeBuilder, PolicyDenyReason,
+    PreApprovalExpireReason, PreApprovalMeta,
 };
 use super::escalation_prompt::{PromptFields, PromptRule, PromptVerb};
 use super::granted_rules::{
     GrantKind, GrantStoreError, GrantedRule, GrantedRulesStore, PermittingRule, ProfileGrants,
-    RevokeToken, wildcard_registration_count,
+    RequestSource, RevokeToken, wildcard_registration_count,
 };
 use super::identity::{MonotonicClock, MonotonicTime};
 use super::lock_order::{self, LockLevel, Tracked};
@@ -113,6 +141,19 @@ pub const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub const DEADLINE_ABORT_GRACE: Duration = Duration::from_secs(2);
 /// The rolling window of `wildcard_registration_prompts_per_day` (ADR 0014 amendment 2.2 item 5).
 pub const WILDCARD_PROMPT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// Longest a pre-request stays pending (ADR 0014 amendment section 2.3; `agents.escalation_timeout`
+/// shortens it).
+pub const PRE_REQUEST_PENDING_LIMIT: Duration = Duration::from_secs(600);
+/// Longest a pre-approval waits for its registration ceremony (amendment section 2.3; the
+/// principal session's own end shortens it).
+pub const PRE_APPROVAL_TTL: Duration = Duration::from_secs(600);
+/// Pending pre-requests per principal session.
+pub const MAX_PENDING_PRE_REQUESTS: usize = 1;
+/// Pre-requests a principal session may raise per [`PRE_REQUEST_WINDOW`].
+pub const MAX_PRE_REQUESTS_PER_WINDOW: usize = 6;
+/// The window of [`MAX_PRE_REQUESTS_PER_WINDOW`]; also how long an unreported pre-request outcome
+/// is kept for its requester.
+pub const PRE_REQUEST_WINDOW: Duration = Duration::from_secs(600);
 
 /// The ID of one escalation (`request_id` of the granted rule it produces).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -150,19 +191,31 @@ pub struct EscalationKey {
     pub action: CeremonyAction,
 }
 
-/// The bearer session a waiter belongs to (for the per-session waiter cap).
+/// The session a waiter belongs to (for the per-session waiter cap): a ceremony's bearer
+/// session, or the principal session of a pre-request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct WaiterSession(usize);
+pub enum WaiterSession {
+    Bearer(usize),
+    Principal(u64),
+}
 
 impl WaiterSession {
     /// The session behind a bearer.
     pub fn of(session: &Arc<AgentSession>) -> Self {
-        Self(Arc::as_ptr(session) as usize)
+        Self::Bearer(Arc::as_ptr(session) as usize)
+    }
+
+    /// A principal session's tag (a pre-request's waiter slot).
+    pub fn of_principal(session: &PrincipalSessionId) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        session.as_str().hash(&mut hasher);
+        Self::Principal(hasher.finish())
     }
 
     /// A session tag from a raw value (tests and callers without an `AgentSession`).
     pub fn from_raw(raw: usize) -> Self {
-        Self(raw)
+        Self::Bearer(raw)
     }
 }
 
@@ -173,11 +226,21 @@ pub struct EscalationRequest {
     /// The normalized RP ID.
     pub rp_id: String,
     pub action: CeremonyAction,
-    /// The validated origin of the ceremony.
-    pub origin: String,
+    /// The validated origin of the ceremony; `None` for a pre-request (no page yet).
+    pub origin: Option<String>,
     /// The configured rule that resolved to `request`.
     pub rule: PermittingRule,
     pub session: WaiterSession,
+    /// Who asks: a ceremony, or the agent in advance (ADR 0014 amendment section 2.3).
+    pub source: RequestSource,
+    /// The principal session behind the request: the requester of a pre-request, or the owner
+    /// of a ceremony's bearer session through its session grant (`None` when it has none). A
+    /// pre-register escalation is adoptable, and a pre-approval consumable, only by ceremonies
+    /// of this principal session.
+    pub principal: Option<PrincipalSessionId>,
+    /// A pre-request's agent note, already sanitized and bounded: written to
+    /// `escalation.requested` only, never shown in a prompt.
+    pub agent_note: Option<String>,
     pub mode: AgentMode,
     pub principal_user: String,
     /// The profile's live `max_granted_rules`.
@@ -221,6 +284,21 @@ impl EscalationRequest {
         }
     }
 
+    /// The `escalation.*` context of `escalation_id` raised by this request.
+    fn audit_context(&self, escalation_id: &EscalationId) -> EscalationAuditContext {
+        EscalationAuditContext {
+            escalation_id: escalation_id.as_str().to_string(),
+            profile_id: self.profile.clone(),
+            action: self.audit_action(),
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule,
+            source: self.source,
+            principal: self.principal.clone(),
+            agent_note: self.agent_note.clone(),
+        }
+    }
+
     /// The prompt's daemon-derived fields.
     pub fn prompt_fields(&self) -> PromptFields {
         PromptFields {
@@ -233,6 +311,7 @@ impl EscalationRequest {
             },
             rp_id: self.rp_id.clone(),
             origin: self.origin.clone(),
+            requested_in_advance: self.source == RequestSource::PreRequest,
             rule: match self.rule {
                 PermittingRule::Exact => PromptRule::Exact,
                 PermittingRule::Wildcard => PromptRule::Wildcard,
@@ -271,6 +350,9 @@ pub enum EscalationRefusal {
     WildcardRegistrationRate,
     /// A wildcard registration: the profile-wide wildcard registration cooldown is running.
     WildcardRegistrationCooldown,
+    /// A pre-request beyond its principal session's limits (found under the admission mutex,
+    /// when a concurrent pre-request of the same session got there first).
+    PreRequestRateLimited,
 }
 
 impl EscalationRefusal {
@@ -288,6 +370,7 @@ impl EscalationRefusal {
             Self::WildcardRegistrationCap => PolicyDenyReason::WildcardRegistrationCap,
             Self::WildcardRegistrationRate => PolicyDenyReason::WildcardRegistrationRate,
             Self::WildcardRegistrationCooldown => PolicyDenyReason::WildcardRegistrationCooldown,
+            Self::PreRequestRateLimited => PolicyDenyReason::PreRequestRateLimited,
         }
     }
 }
@@ -300,9 +383,15 @@ pub struct RegistrationApproval {
     escalation_id: EscalationId,
     profile: ProfileId,
     rp_id: String,
-    origin: String,
+    /// The origin of the ceremony that registers. `None` only while the approval waits in a
+    /// [`PreApprovalToken`]: consumption sets the consuming ceremony's.
+    origin: Option<String>,
     rule: PermittingRule,
     session: WaiterSession,
+    /// Who raised the approved escalation.
+    source: RequestSource,
+    /// The principal session the approval is bound to, when known (always for a pre-request).
+    principal: Option<PrincipalSessionId>,
     /// The RP's revocation generation when the escalation was raised: the grant is persisted
     /// only if no `grants revoke` or `grants clear` happened since (review M-c).
     revoke_token: Option<RevokeToken>,
@@ -357,8 +446,8 @@ impl RegistrationApproval {
         &self.rp_id
     }
 
-    pub fn origin(&self) -> &str {
-        &self.origin
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 
     pub fn rule(&self) -> PermittingRule {
@@ -368,13 +457,183 @@ impl RegistrationApproval {
     pub fn session(&self) -> WaiterSession {
         self.session
     }
+
+    pub fn source(&self) -> RequestSource {
+        self.source
+    }
+
+    /// The principal session the approval is bound to, when known.
+    pub fn principal(&self) -> Option<&PrincipalSessionId> {
+        self.principal.as_ref()
+    }
+
+    /// The `escalation.*` context of this approval's escalation.
+    pub fn audit_context(&self) -> EscalationAuditContext {
+        EscalationAuditContext {
+            escalation_id: self.escalation_id.as_str().to_string(),
+            profile_id: self.profile.clone(),
+            action: AuditAction::Register,
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule,
+            source: self.source,
+            principal: self.principal.clone(),
+            agent_note: None,
+        }
+    }
+}
+
+/// A registration pre-approval (ADR 0014 amendment section 2.3): the approval of a `register`
+/// pre-request that no ceremony adopted while it was pending. In memory only, never persisted,
+/// deliberately not `Clone`. It is bound to the profile, the normalized RP ID, the principal
+/// session, the revocation epoch at issue and (through the approval) the RP's revoke token, and
+/// it holds the approval's wildcard cap slot until it is consumed or dropped. Only
+/// [`EscalationService::take_pre_approval`] turns it into a ceremony's [`RegistrationApproval`].
+#[derive(Debug)]
+pub struct PreApprovalToken {
+    approval: RegistrationApproval,
+    principal: PrincipalSessionId,
+    /// The revocation epoch when the token was issued: a bump drops it.
+    revocation_epoch: u64,
+    expires_at: MonotonicTime,
+}
+
+impl PreApprovalToken {
+    fn meta(&self) -> PreApprovalMeta {
+        PreApprovalMeta::new(
+            self.approval.escalation_id.as_str(),
+            self.approval.profile.clone(),
+            &self.approval.rp_id,
+            self.approval.rule,
+            &self.principal,
+        )
+    }
+
+    /// Why the token can no longer be used at `now` under `epoch`, if it cannot.
+    fn invalid(&self, now: MonotonicTime, epoch: u64) -> Option<PreApprovalExpireReason> {
+        if epoch != self.revocation_epoch {
+            Some(PreApprovalExpireReason::PolicyReload)
+        } else if now >= self.expires_at {
+            Some(PreApprovalExpireReason::Ttl)
+        } else {
+            None
+        }
+    }
+}
+
+/// The state of a pre-request as its requester sees it (ADR 0014 amendment section 2.3). It never
+/// says whether the user holds a credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreRequestState {
+    /// The human has not decided yet.
+    Pending,
+    /// A registration ceremony of the same principal session took the request over and waits on
+    /// it; the outcome goes to that ceremony.
+    Adopted,
+    /// `authenticate`: approved; the grant is persisted.
+    Approved,
+    /// `register`: approved; a one-use pre-approval waits this long for the principal session's
+    /// next registration at the RP.
+    PreApproved { expires_in: Duration },
+    /// Denied. `reason` is set when the deny was not the human's (a failed prompt, audit or grant
+    /// write).
+    Denied { reason: Option<PolicyDenyReason> },
+    /// Ended without a decision (its deadline, or the notification server went away).
+    Expired,
+    /// Cancelled by a policy reload or a granted-rule revocation.
+    Revoked,
+    /// Not admitted; nothing was prompted.
+    Refused(EscalationRefusal),
+    /// Over the principal session's pre-request limits; nothing was prompted. `retry_after` is
+    /// when the window frees a slot, when that is what limits it.
+    RateLimited { retry_after: Option<Duration> },
+}
+
+/// Who consumes a pre-approval: a registration ceremony at the point where it would raise its
+/// own escalation.
+#[derive(Clone, Copy, Debug)]
+pub struct PreApprovalConsumer<'a> {
+    pub profile: &'a ProfileId,
+    /// The normalized RP ID of the registration.
+    pub rp_id: &'a str,
+    /// The principal session that owns the ceremony's bearer session (through its session
+    /// grant).
+    pub principal: &'a PrincipalSessionId,
+    /// The rule the registration resolved through now (`request`).
+    pub rule: PermittingRule,
+    /// The ceremony's bearer session: the approval is bound to it from here on.
+    pub session: WaiterSession,
+    /// The ceremony's validated origin (the grant records it).
+    pub origin: &'a str,
+    /// The ceremony's `request_id` (`pre_approval.consumed` names it).
+    pub request_id: &'a str,
+}
+
+/// What a pre-request needs besides its [`EscalationRequest`].
+#[derive(Clone, Debug)]
+pub struct PreRequestParams {
+    /// `source = PreRequest`, `origin = None`, `principal = Some(..)`, and the principal
+    /// session's [`WaiterSession::of_principal`].
+    pub request: EscalationRequest,
+    /// How long it may stay pending: [`PRE_REQUEST_PENDING_LIMIT`], or `agents.escalation_timeout`
+    /// if shorter.
+    pub pending_for: Duration,
+    /// What is left of the principal session's lifetime: a pre-approval never outlives it.
+    pub session_remaining: Duration,
+}
+
+/// Where a pre-request is.
+#[derive(Debug)]
+enum PreStatus {
+    /// Its detached waiter is attached to the escalation.
+    Pending,
+    /// A registration ceremony adopted the escalation.
+    Adopted,
+    /// A `register` approval nobody adopted.
+    Token(PreApprovalToken),
+    /// Ended; reported once to the requester, then forgotten.
+    Settled(PreRequestState),
+}
+
+/// One principal session's pre-request for one key.
+#[derive(Debug)]
+struct PreRequestRecord {
+    serial: u64,
+    /// The detached waiter while it is attached.
+    waiter: Option<u64>,
+    /// When it stops waiting (and its key's cooldown starts).
+    deadline: MonotonicTime,
+    /// When its principal session ends: a pre-approval never outlives it.
+    session_ends: MonotonicTime,
+    /// When it settled (unreported outcomes are dropped after [`PRE_REQUEST_WINDOW`]).
+    settled_at: Option<MonotonicTime>,
+    status: PreStatus,
+}
+
+/// A pre-request's key: its principal session and its escalation key.
+type PreRequestKey = (PrincipalSessionId, EscalationKey);
+
+/// The live revocation epoch (ADR 0014 section 6.4), read when a pre-approval is issued and
+/// whenever one is checked.
+pub trait RevocationEpoch: Send + Sync {
+    fn current(&self) -> u64;
+}
+
+impl RevocationEpoch for PolicyRuntime {
+    fn current(&self) -> u64 {
+        self.revocation_epoch()
+    }
 }
 
 /// How a wait ended.
 #[derive(Debug)]
 pub enum EscalationOutcome {
-    /// An `authenticate` escalation was approved and its grant persisted: re-resolve.
-    Approved { escalation_id: EscalationId },
+    /// An `authenticate` escalation was approved and its grant persisted: re-resolve. `source`
+    /// says who raised it (a ceremony, or a pre-request the ceremony joined).
+    Approved {
+        escalation_id: EscalationId,
+        source: RequestSource,
+    },
     /// A registration escalation was approved; the token permits this ceremony's registration.
     RegistrationApproved(RegistrationApproval),
     /// Denied. `reason` is set when the deny was not the human's (a failed prompt, audit or grant
@@ -604,6 +863,8 @@ pub struct EscalationDeps {
     pub clock: Arc<dyn MonotonicClock>,
     /// `agents.escalation_cooldown`; later changes go through [`EscalationService::set_cooldown`].
     pub cooldown: Duration,
+    /// The live revocation epoch, which binds a pre-approval.
+    pub epoch: Arc<dyn RevocationEpoch>,
 }
 
 /// The terminal outcome stored on an entry.
@@ -641,18 +902,28 @@ struct Entry {
     outcome: Option<EntryOutcome>,
     /// The RP's revocation generation captured before the entry was created (review M-c, M-d).
     revoke_token: Option<RevokeToken>,
+    /// A `register` pre-request's escalation: the principal session whose registration ceremony
+    /// may adopt it. Cleared on adoption.
+    adoptable_by: Option<PrincipalSessionId>,
 }
 
 impl Entry {
     fn audit_context(&self) -> EscalationAuditContext {
-        EscalationAuditContext {
-            escalation_id: self.id.as_str().to_string(),
-            profile_id: self.request.profile.clone(),
-            action: self.request.audit_action(),
-            rp_id: self.request.rp_id.clone(),
-            origin: self.request.origin.clone(),
-            rule: self.request.rule,
-        }
+        self.request.audit_context(&self.id)
+    }
+
+    /// Whether a ceremony of `request` may adopt this `register` pre-request: the same principal
+    /// session, a registration ceremony, and the escalation still queued or shown (not being
+    /// decided).
+    fn adoptable(&self, request: &EscalationRequest) -> bool {
+        request.source == RequestSource::Ceremony
+            && request.action == CeremonyAction::Register
+            && self.adoptable_by.is_some()
+            && self.adoptable_by == request.principal
+            && matches!(
+                self.state,
+                EscalationState::Queued | EscalationState::Prompting
+            )
     }
 
     fn ticket(&self) -> Option<PromptTicket> {
@@ -695,6 +966,13 @@ struct Inner {
     wildcard_reserved: HashMap<ProfileId, Arc<AtomicUsize>>,
     /// Counts reservation releases (see [`WildcardReservation`]).
     reservation_epoch: Arc<AtomicU64>,
+    /// Pre-requests by principal session and key (ADR 0014 amendment section 2.3). Bounded: a
+    /// principal session has at most [`MAX_PENDING_PRE_REQUESTS`] pending and raises at most
+    /// [`MAX_PRE_REQUESTS_PER_WINDOW`] per window; settled ones are dropped once reported or after
+    /// the window, and all of a session's go when it ends.
+    pre_requests: HashMap<PreRequestKey, PreRequestRecord>,
+    /// When each principal session raised its recent pre-requests (the rate window).
+    pre_request_history: HashMap<PrincipalSessionId, VecDeque<MonotonicTime>>,
     next_serial: u64,
     next_waiter: u64,
     next_ticket: u64,
@@ -712,6 +990,17 @@ struct StoredWildcards {
 impl StoredWildcards {
     /// Nothing stored, read before any reservation was released.
     const NONE: Self = Self { count: 0, epoch: 0 };
+}
+
+/// What admission decided for a request whose key may have a live entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// Create a new escalation.
+    Create,
+    /// Join the live `authenticate` escalation.
+    Join(u64),
+    /// Adopt the live `register` pre-request of the ceremony's own principal session.
+    Adopt(u64),
 }
 
 /// Deferred side effects, run after the mutex is released.
@@ -1000,17 +1289,31 @@ impl Inner {
         Ok(())
     }
 
-    /// Admission of `request` under the mutex: `Some(serial)` to join, `None` to create.
-    /// `stored` is the profile's stored wildcard registration grants.
+    /// The live `register` pre-request of `request`'s key that `request` may adopt, if any.
+    fn adoptable(&self, request: &EscalationRequest) -> Option<u64> {
+        let serial = *self.by_key.get(&request.key())?;
+        self.entries
+            .get(&serial)
+            .is_some_and(|entry| entry.adoptable(request))
+            .then_some(serial)
+    }
+
+    /// Admission of `request` under the mutex. `stored` is the profile's stored wildcard
+    /// registration grants. An adoption takes over an escalation that was admitted (and counted
+    /// against the wildcard limits) already, so those limits are not counted again for it.
     fn admit(
         &mut self,
         request: &EscalationRequest,
         key: &EscalationKey,
         now: MonotonicTime,
         stored: StoredWildcards,
-    ) -> Result<Option<u64>, EscalationRefusal> {
+    ) -> Result<Admission, EscalationRefusal> {
         if self.in_cooldown(key, now) {
             return Err(EscalationRefusal::Cooldown);
+        }
+        if let Some(serial) = self.adoptable(request) {
+            self.check_waiter_caps(&request.profile, request.session)?;
+            return Ok(Admission::Adopt(serial));
         }
         self.check_wildcard_registration(request, stored, now)?;
         if let Some(&serial) = self.by_key.get(key) {
@@ -1022,7 +1325,7 @@ impl Inner {
                 return Err(EscalationRefusal::Busy);
             }
             self.check_waiter_caps(&request.profile, request.session)?;
-            return Ok(Some(serial));
+            return Ok(Admission::Join(serial));
         }
         // A new escalation may end in a cooldown: refuse it while its profile's share of the table
         // (or the table) is full of live ones rather than evict one (reviews L1, M-e).
@@ -1036,7 +1339,40 @@ impl Inner {
             }
         }
         self.check_waiter_caps(&request.profile, request.session)?;
-        Ok(None)
+        Ok(Admission::Create)
+    }
+
+    /// A registration ceremony of `request` adopts the `register` pre-request `serial` (admission
+    /// checked [`Entry::adoptable`]): it becomes the escalation's creator, with its own session
+    /// and origin, so the approval is bound to it; the pre-request's detached waiter leaves
+    /// without ending the entry (the ceremony's waiter is attached right after).
+    fn adopt(&mut self, serial: u64, request: &EscalationRequest) {
+        let Some(entry) = self.entries.get_mut(&serial) else {
+            return;
+        };
+        entry.adoptable_by = None;
+        entry.request.session = request.session;
+        entry.request.origin = request.origin.clone();
+        info!(
+            "escalation {}: adopted by a registration ceremony of its principal session",
+            entry.id
+        );
+        let detached: Vec<(PreRequestKey, Option<u64>)> = self
+            .pre_requests
+            .iter_mut()
+            .filter(|(_, record)| {
+                record.serial == serial && matches!(record.status, PreStatus::Pending)
+            })
+            .map(|(key, record)| {
+                record.status = PreStatus::Adopted;
+                (key.clone(), record.waiter.take())
+            })
+            .collect();
+        for (_, waiter) in detached {
+            if let Some(waiter) = waiter {
+                self.remove_waiter(serial, waiter);
+            }
+        }
     }
 
     fn add_waiter(&mut self, serial: u64, session: WaiterSession) -> u64 {
@@ -1147,6 +1483,242 @@ impl Inner {
         }
     }
 
+    /// A waiter leaves. When it was the last one of a pending entry, the entry ends: dequeued or
+    /// withdrawn, audited as expired, and counted for V-M2 (an abort) or put in cooldown (a
+    /// timeout).
+    #[allow(clippy::too_many_arguments)]
+    fn depart(
+        &mut self,
+        serial: u64,
+        waiter: u64,
+        departure: Departure,
+        now: MonotonicTime,
+        cooldown: Duration,
+        epoch: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(remaining) = self.remove_waiter(serial, waiter) else {
+            return;
+        };
+        if remaining == 0
+            && let Some(entry) = self.entries.get_mut(&serial)
+            && matches!(
+                entry.state,
+                EscalationState::Queued | EscalationState::Prompting
+            )
+        {
+            let was_prompting = entry.state == EscalationState::Prompting;
+            let reason = match departure {
+                Departure::Timeout => EscalationExpireReason::Timeout,
+                Departure::Aborted => EscalationExpireReason::Aborted,
+            };
+            entry.state = match departure {
+                Departure::Timeout => EscalationState::Expired,
+                Departure::Aborted => EscalationState::Withdrawn,
+            };
+            entry.outcome = Some(EntryOutcome::Expired);
+            if was_prompting && let Some(ticket) = entry.ticket() {
+                effects.push(Effect::Withdraw(ticket));
+            }
+            if entry.announced {
+                effects.push(Effect::Audit(entry.audit_context().expired(reason)));
+            }
+            let request = entry.request.clone();
+            let profile = request.profile.clone();
+            info!(
+                "escalation {}: last waiter left ({:?}); {}",
+                entry.id,
+                departure,
+                if was_prompting {
+                    "withdrawn"
+                } else {
+                    "dequeued"
+                }
+            );
+            self.unlink(serial);
+            match departure {
+                Departure::Timeout => self.start_cooldowns(&request, now, cooldown),
+                Departure::Aborted => self.record_withdrawal_of(&request, now, cooldown),
+            }
+            self.settle_pre_requests(serial, now, epoch, effects);
+            self.pump(&profile, now, effects);
+        }
+        self.collect(serial);
+    }
+
+    /// The pre-requests waiting on `serial` learn its outcome once it is terminal: a detached
+    /// waiter is detached, an adopted pre-request is forgotten (its ceremony has the outcome),
+    /// and a `register` approval nobody adopted becomes a [`PreApprovalToken`] bound to `epoch`.
+    fn settle_pre_requests(
+        &mut self,
+        serial: u64,
+        now: MonotonicTime,
+        epoch: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        if !self
+            .entries
+            .get(&serial)
+            .is_some_and(|entry| entry.state.is_terminal())
+        {
+            return;
+        }
+        let keys: Vec<PreRequestKey> = self
+            .pre_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.serial == serial
+                    && matches!(record.status, PreStatus::Pending | PreStatus::Adopted)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            let Some(mut record) = self.pre_requests.remove(&key) else {
+                continue;
+            };
+            if matches!(record.status, PreStatus::Adopted) {
+                continue;
+            }
+            if let Some(waiter) = record.waiter.take() {
+                self.remove_waiter(serial, waiter);
+            }
+            let Some(entry) = self.entries.get_mut(&serial) else {
+                continue;
+            };
+            let state = match entry.outcome.as_mut() {
+                Some(EntryOutcome::Approved) => PreRequestState::Approved,
+                Some(EntryOutcome::Registration(slot)) => match slot.take() {
+                    Some(approval) => {
+                        let expires_at = later(now, PRE_APPROVAL_TTL).min(record.session_ends);
+                        let token = PreApprovalToken {
+                            approval,
+                            principal: key.0.clone(),
+                            revocation_epoch: epoch,
+                            expires_at,
+                        };
+                        let ttl_secs = expires_at.saturating_duration_since(now) / 1000;
+                        effects.push(Effect::Audit(token.meta().issued(ttl_secs)));
+                        info!(
+                            "escalation {}: registration pre-approved for {}/{} ({} s)",
+                            token.approval.escalation_id, key.1.profile, key.1.rp_id, ttl_secs
+                        );
+                        record.status = PreStatus::Token(token);
+                        record.settled_at = Some(now);
+                        self.pre_requests.insert(key, record);
+                        continue;
+                    }
+                    // Not reachable (a pre-register escalation has no other waiter); fail closed.
+                    None => PreRequestState::Denied {
+                        reason: Some(PolicyDenyReason::EscalationBusy),
+                    },
+                },
+                Some(EntryOutcome::Denied { reason, .. }) => {
+                    PreRequestState::Denied { reason: *reason }
+                }
+                Some(EntryOutcome::Revoked) => PreRequestState::Revoked,
+                Some(EntryOutcome::ServerLost) | Some(EntryOutcome::Expired) | None => {
+                    PreRequestState::Expired
+                }
+            };
+            record.status = PreStatus::Settled(state);
+            record.settled_at = Some(now);
+            self.pre_requests.insert(key, record);
+        }
+    }
+
+    /// Drop the pre-approvals `matches` selects, auditing each as `pre_approval.expired` with
+    /// `reason`.
+    fn drop_tokens(
+        &mut self,
+        matches: impl Fn(&PreRequestKey) -> bool,
+        reason: PreApprovalExpireReason,
+        effects: &mut Vec<Effect>,
+    ) {
+        let keys: Vec<PreRequestKey> = self
+            .pre_requests
+            .iter()
+            .filter(|(key, record)| matches!(record.status, PreStatus::Token(_)) && matches(key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            if let Some(PreRequestRecord {
+                status: PreStatus::Token(token),
+                ..
+            }) = self.pre_requests.remove(&key)
+            {
+                info!(
+                    "escalation {}: pre-approval for {}/{} dropped ({:?})",
+                    token.approval.escalation_id, key.1.profile, key.1.rp_id, reason
+                );
+                effects.push(Effect::Audit(token.meta().expired(reason)));
+            }
+        }
+    }
+
+    /// Whether `principal` may raise another pre-request now: at most
+    /// [`MAX_PENDING_PRE_REQUESTS`] pending and [`MAX_PRE_REQUESTS_PER_WINDOW`] per
+    /// [`PRE_REQUEST_WINDOW`].
+    fn pre_request_limit(
+        &mut self,
+        principal: &PrincipalSessionId,
+        now: MonotonicTime,
+    ) -> Option<PreRequestState> {
+        let pending = self
+            .pre_requests
+            .iter()
+            .filter(|((owner, _), record)| {
+                owner == principal && matches!(record.status, PreStatus::Pending)
+            })
+            .count();
+        if pending >= MAX_PENDING_PRE_REQUESTS {
+            return Some(PreRequestState::RateLimited { retry_after: None });
+        }
+        let window = u64::try_from(PRE_REQUEST_WINDOW.as_millis()).unwrap_or(u64::MAX);
+        let recent = self.pre_request_history.get_mut(principal)?;
+        while recent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= MAX_PRE_REQUESTS_PER_WINDOW {
+            let retry_after = recent.front().map(|oldest| {
+                Duration::from_millis(window.saturating_sub(now.saturating_duration_since(*oldest)))
+            });
+            return Some(PreRequestState::RateLimited { retry_after });
+        }
+        if recent.is_empty() {
+            self.pre_request_history.remove(principal);
+        }
+        None
+    }
+
+    /// The state of `principal`'s pre-request for `key`, if it has one. A settled outcome is
+    /// reported once and then forgotten; a pre-approval stays until it is used or dropped.
+    fn report(
+        &mut self,
+        principal: &PrincipalSessionId,
+        key: &EscalationKey,
+        now: MonotonicTime,
+    ) -> Option<PreRequestState> {
+        let record_key = (principal.clone(), key.clone());
+        let record = self.pre_requests.get(&record_key)?;
+        match &record.status {
+            PreStatus::Pending => Some(PreRequestState::Pending),
+            PreStatus::Adopted => Some(PreRequestState::Adopted),
+            PreStatus::Token(token) => Some(PreRequestState::PreApproved {
+                expires_in: Duration::from_millis(token.expires_at.saturating_duration_since(now)),
+            }),
+            PreStatus::Settled(_) => match self.pre_requests.remove(&record_key) {
+                Some(PreRequestRecord {
+                    status: PreStatus::Settled(state),
+                    ..
+                }) => Some(state),
+                _ => None,
+            },
+        }
+    }
+
     /// The live entry `ticket` names, if it is still prompting with that ticket.
     fn prompting(&self, ticket: &PromptTicket) -> Option<u64> {
         let serial = *self.profiles.get(&ticket.profile)?.active.as_ref()?;
@@ -1173,6 +1745,7 @@ pub struct EscalationService {
     grants: Arc<dyn GrantWriter>,
     prompter: Arc<dyn Prompter>,
     clock: Arc<dyn MonotonicClock>,
+    epoch: Arc<dyn RevocationEpoch>,
     cooldown_ms: AtomicU64,
     self_ref: Weak<EscalationService>,
 }
@@ -1181,6 +1754,25 @@ impl fmt::Debug for EscalationService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EscalationService").finish_non_exhaustive()
     }
+}
+
+/// How a request enters an escalation.
+enum Attach {
+    /// A ceremony: it gets a [`Waiter`] and parks on it.
+    Ceremony,
+    /// A pre-request: a detached waiter and its record.
+    PreRequest {
+        deadline: MonotonicTime,
+        session_ends: MonotonicTime,
+    },
+}
+
+/// What [`EscalationService::enter`] did.
+struct Entered {
+    serial: u64,
+    waiter: u64,
+    escalation_id: EscalationId,
+    joined: bool,
 }
 
 impl EscalationService {
@@ -1193,6 +1785,7 @@ impl EscalationService {
             grants: deps.grants,
             prompter: deps.prompter,
             clock: deps.clock,
+            epoch: deps.epoch,
             cooldown_ms: AtomicU64::new(cooldown_ms),
             self_ref: self_ref.clone(),
         })
@@ -1242,13 +1835,20 @@ impl EscalationService {
     /// The checks made without the mutex (the wildcard ones take it briefly): the wildcard
     /// registration limits first (amendment section 2.3 order), then the grant store and prompt
     /// availability. Returns the profile's stored wildcard registration grants, which admission
-    /// checks again under the mutex.
+    /// checks again under the mutex. The adoption of a `register` pre-request is not a new
+    /// escalation, so the wildcard limits are not counted for it.
     fn check_resources(
         &self,
         request: &EscalationRequest,
     ) -> Result<StoredWildcards, EscalationRefusal> {
         // Before the store is read (see `WildcardReservation`).
-        let epoch = self.lock().reservation_epoch.load(Ordering::SeqCst);
+        let (epoch, adopts) = {
+            let inner = self.lock();
+            (
+                inner.reservation_epoch.load(Ordering::SeqCst),
+                inner.adoptable(request).is_some(),
+            )
+        };
         let capacity = self.grants.capacity(&request.profile);
         let wildcard_persisted = match capacity {
             GrantCapacity::Available {
@@ -1261,7 +1861,7 @@ impl EscalationService {
             count: wildcard_persisted,
             epoch,
         };
-        if request.is_wildcard_registration() {
+        if request.is_wildcard_registration() && !adopts {
             // An unreadable store cannot be counted: refuse rather than assume zero.
             if capacity == GrantCapacity::Unavailable {
                 return Err(EscalationRefusal::GrantsUnavailable);
@@ -1302,12 +1902,33 @@ impl EscalationService {
     }
 
     /// Create the escalation of `request`'s key, or join it when it is a pending `authenticate`
-    /// escalation. The creator writes `escalation.requested` before the entry can be prompted; a
-    /// failed write refuses the escalation (and fails every waiter that joined meanwhile).
+    /// escalation, or adopt it when it is a pending `register` pre-request of the ceremony's own
+    /// principal session. The creator writes `escalation.requested` before the entry can be
+    /// prompted; a failed write refuses the escalation (and fails every waiter that joined
+    /// meanwhile).
     pub fn join_or_create(
         self: &Arc<Self>,
         request: EscalationRequest,
     ) -> Result<Waiter, EscalationRefusal> {
+        let session = request.session;
+        let entered = self.enter(request, Attach::Ceremony)?;
+        Ok(self.waiter(
+            entered.serial,
+            entered.waiter,
+            entered.escalation_id,
+            session,
+            entered.joined,
+        ))
+    }
+
+    /// Admit `request` and attach it: the shared path of a ceremony and a pre-request. For a
+    /// pre-request the per-session limits are checked again under the same mutex hold that
+    /// inserts its record, so they cannot be exceeded by concurrent calls.
+    fn enter(
+        &self,
+        request: EscalationRequest,
+        attach: Attach,
+    ) -> Result<Entered, EscalationRefusal> {
         let key = request.key();
         if self.lock().in_cooldown(&key, self.clock.now()) {
             return Err(EscalationRefusal::Cooldown);
@@ -1318,24 +1939,39 @@ impl EscalationService {
         let revoke_token = self.grants.revoke_token(&request.profile, &request.rp_id);
 
         let now = self.clock.now();
-        let (waiter, announcement) = {
+        let (entered, announcement) = {
             let mut inner = self.lock();
-            match inner.admit(&request, &key, now, stored)? {
-                Some(serial) => {
-                    let id = inner.add_waiter(serial, request.session);
-                    let escalation_id = inner.entries[&serial].id.clone();
-                    (
-                        self.waiter(serial, id, escalation_id, request.session, true),
-                        None,
-                    )
+            let admission = inner.admit(&request, &key, now, stored)?;
+            if let (Attach::PreRequest { .. }, Some(principal)) = (&attach, &request.principal)
+                && (inner
+                    .pre_requests
+                    .contains_key(&(principal.clone(), key.clone()))
+                    || inner.pre_request_limit(principal, now).is_some())
+            {
+                // Raced with another pre-request of the same session; the caller reports it.
+                return Err(EscalationRefusal::PreRequestRateLimited);
+            }
+            let (serial, joined, announcement) = match admission {
+                Admission::Join(serial) => (serial, true, None),
+                Admission::Adopt(serial) => {
+                    inner.adopt(serial, &request);
+                    (serial, true, None)
                 }
-                None => {
+                Admission::Create => {
                     inner.next_serial += 1;
                     let serial = inner.next_serial;
                     let escalation_id = EscalationId::generate();
                     let entry = Entry {
-                        id: escalation_id.clone(),
+                        id: escalation_id,
                         joinable: request.action == CeremonyAction::Authenticate,
+                        adoptable_by: match request.action {
+                            CeremonyAction::Register
+                                if request.source == RequestSource::PreRequest =>
+                            {
+                                request.principal.clone()
+                            }
+                            _ => None,
+                        },
                         request: request.clone(),
                         state: EscalationState::Queued,
                         waiters: Vec::new(),
@@ -1354,28 +1990,67 @@ impl EscalationService {
                         .or_default()
                         .queue
                         .push_back(serial);
-                    let id = inner.add_waiter(serial, request.session);
-                    (
-                        self.waiter(serial, id, escalation_id, request.session, false),
-                        Some(announcement),
-                    )
+                    (serial, false, Some(announcement))
                 }
+            };
+            let waiter = inner.add_waiter(serial, request.session);
+            let escalation_id = inner.entries[&serial].id.clone();
+            if let (
+                Attach::PreRequest {
+                    deadline,
+                    session_ends,
+                },
+                Some(principal),
+            ) = (&attach, &request.principal)
+            {
+                inner.pre_requests.insert(
+                    (principal.clone(), key.clone()),
+                    PreRequestRecord {
+                        serial,
+                        waiter: Some(waiter),
+                        deadline: *deadline,
+                        session_ends: *session_ends,
+                        settled_at: None,
+                        status: PreStatus::Pending,
+                    },
+                );
+                inner
+                    .pre_request_history
+                    .entry(principal.clone())
+                    .or_default()
+                    .push_back(now);
             }
+            (
+                Entered {
+                    serial,
+                    waiter,
+                    escalation_id,
+                    joined,
+                },
+                announcement,
+            )
         };
 
         let Some(announcement) = announcement else {
             debug!(
-                "escalation {}: joined ({}/{})",
-                waiter.escalation_id, key.profile, key.rp_id
+                "escalation {}: {} ({}/{})",
+                entered.escalation_id,
+                if request.source == RequestSource::PreRequest {
+                    "joined by a pre-request"
+                } else {
+                    "joined"
+                },
+                key.profile,
+                key.rp_id
             );
-            return Ok(waiter);
+            return Ok(entered);
         };
 
         let recorded = self.audit.record(announcement);
         let mut effects = Vec::new();
         {
             let mut inner = self.lock();
-            let serial = waiter.serial;
+            let serial = entered.serial;
             match &recorded {
                 Ok(()) => {
                     if let Some(entry) = inner.entries.get_mut(&serial) {
@@ -1386,7 +2061,7 @@ impl EscalationService {
                 Err(e) => {
                     warn!(
                         "escalation {}: escalation.requested could not be audited: {}",
-                        waiter.escalation_id, e
+                        entered.escalation_id, e
                     );
                     if let Some(entry) = inner.entries.get_mut(&serial)
                         && entry.state == EscalationState::Queued
@@ -1398,7 +2073,13 @@ impl EscalationService {
                         });
                     }
                     inner.unlink(serial);
-                    inner.pump(&key.profile, self.clock.now(), &mut effects);
+                    let now = self.clock.now();
+                    inner.settle_pre_requests(serial, now, self.epoch.current(), &mut effects);
+                    if let Some(principal) = &request.principal {
+                        // The refusal is the answer; nothing is left to report.
+                        inner.pre_requests.remove(&(principal.clone(), key.clone()));
+                    }
+                    inner.pump(&key.profile, now, &mut effects);
                     self.changed.notify_all();
                 }
             }
@@ -1407,19 +2088,39 @@ impl EscalationService {
         match recorded {
             Ok(()) => {
                 info!(
-                    "escalation {}: requested ({}/{} {})",
-                    waiter.escalation_id,
+                    "escalation {}: requested ({}/{} {}{})",
+                    entered.escalation_id,
                     key.profile,
                     key.rp_id,
-                    key.action.as_str()
+                    key.action.as_str(),
+                    if request.source == RequestSource::PreRequest {
+                        ", in advance"
+                    } else {
+                        ""
+                    }
                 );
-                Ok(waiter)
+                Ok(entered)
             }
             Err(_) => {
-                drop(waiter);
+                if matches!(attach, Attach::Ceremony) {
+                    // Detach the creator (the entry is already terminal).
+                    drop(self.waiter_of(&entered, request.session));
+                }
                 Err(EscalationRefusal::AuditFailure)
             }
         }
+    }
+
+    /// A [`Waiter`] handle for an attached ceremony waiter (only to detach it).
+    fn waiter_of(&self, entered: &Entered, session: WaiterSession) -> Option<Waiter> {
+        let service = self.self_ref.upgrade()?;
+        Some(service.waiter(
+            entered.serial,
+            entered.waiter,
+            entered.escalation_id.clone(),
+            session,
+            entered.joined,
+        ))
     }
 
     fn waiter(
@@ -1441,61 +2142,24 @@ impl EscalationService {
         }
     }
 
-    /// A waiter leaves. When it was the last one of a pending entry, the entry ends: dequeued or
-    /// withdrawn, audited as expired, and counted for V-M2 (an abort) or put in cooldown (a
-    /// timeout).
+    /// A waiter leaves (see [`Inner::depart`]).
     fn depart(&self, serial: u64, waiter: u64, departure: Departure) {
         let cooldown = self.cooldown();
         let now = self.clock.now();
+        let epoch = self.epoch.current();
         let mut effects = Vec::new();
         {
             let mut inner = self.lock();
-            let Some(remaining) = inner.remove_waiter(serial, waiter) else {
-                return;
-            };
-            if remaining == 0
-                && let Some(entry) = inner.entries.get_mut(&serial)
-                && matches!(
-                    entry.state,
-                    EscalationState::Queued | EscalationState::Prompting
-                )
-            {
-                let was_prompting = entry.state == EscalationState::Prompting;
-                let reason = match departure {
-                    Departure::Timeout => EscalationExpireReason::Timeout,
-                    Departure::Aborted => EscalationExpireReason::Aborted,
-                };
-                entry.state = match departure {
-                    Departure::Timeout => EscalationState::Expired,
-                    Departure::Aborted => EscalationState::Withdrawn,
-                };
-                entry.outcome = Some(EntryOutcome::Expired);
-                if was_prompting && let Some(ticket) = entry.ticket() {
-                    effects.push(Effect::Withdraw(ticket));
-                }
-                if entry.announced {
-                    effects.push(Effect::Audit(entry.audit_context().expired(reason)));
-                }
-                let request = entry.request.clone();
-                let profile = request.profile.clone();
-                info!(
-                    "escalation {}: last waiter left ({:?}); {}",
-                    entry.id,
-                    departure,
-                    if was_prompting {
-                        "withdrawn"
-                    } else {
-                        "dequeued"
-                    }
-                );
-                inner.unlink(serial);
-                match departure {
-                    Departure::Timeout => inner.start_cooldowns(&request, now, cooldown),
-                    Departure::Aborted => inner.record_withdrawal_of(&request, now, cooldown),
-                }
-                inner.pump(&profile, now, &mut effects);
-            }
-            inner.collect(serial);
+            inner.depart(
+                serial,
+                waiter,
+                departure,
+                now,
+                cooldown,
+                epoch,
+                &mut effects,
+            );
+            self.changed.notify_all();
         }
         self.run(effects);
     }
@@ -1561,6 +2225,7 @@ impl EscalationService {
             if withdrawn {
                 inner.record_withdrawal_of(&request, now, cooldown);
             }
+            inner.settle_pre_requests(serial, now, self.epoch.current(), &mut effects);
             inner.pump(&request.profile, now, &mut effects);
             inner.collect(serial);
             self.changed.notify_all();
@@ -1670,6 +2335,8 @@ impl EscalationService {
                     origin: request.origin.clone(),
                     rule: request.rule,
                     session: request.session,
+                    source: request.source,
+                    principal: request.principal.clone(),
                     revoke_token,
                     reservation,
                 })),
@@ -1717,13 +2384,16 @@ impl EscalationService {
 
         guard.cause = EscalationDenyCause::GrantWriteFailed;
         guard.reason = PolicyDenyReason::GrantsUnavailable;
-        let rule = GrantedRule::new(
+        // A pre-request's grant has no origin when no ceremony joined before the prompt
+        // (amendment section 7); every other grant names the ceremony's.
+        let rule = GrantedRule::from_escalation(
             &request.rp_id,
             GrantKind::Escalation,
             escalation_id.as_str(),
-            &request.origin,
+            request.origin.as_deref(),
             request.rule,
             None,
+            request.source,
         );
         match self.grants.add(
             &request.profile,
@@ -1847,6 +2517,7 @@ impl EscalationService {
             entry.outcome = Some(outcome);
             let profile = entry.request.profile.clone();
             inner.unlink(serial);
+            inner.settle_pre_requests(serial, now, self.epoch.current(), &mut effects);
             inner.pump(&profile, now, &mut effects);
             inner.collect(serial);
             self.changed.notify_all();
@@ -1859,28 +2530,52 @@ impl EscalationService {
     /// Cancel every pending escalation of `profile` after a reload changed the policy. Each is
     /// recorded as `escalation.revoked` with `reason = policy_reload`; their waiters see
     /// [`EscalationOutcome::Revoked`].
+    /// The profile's pre-approvals are dropped too (`pre_approval.expired`, `policy_reload`).
     pub fn cancel_profile(&self, profile: &ProfileId) {
-        self.cancel_where(profile, |_| true);
+        self.cancel_where(profile, |_| true, PreApprovalExpireReason::PolicyReload);
+    }
+
+    /// [`Self::cancel_profile`] after `grants clear`: the pre-approvals are dropped with
+    /// `reason = grant_revoked` (ADR 0014 amendment section 2.3).
+    pub fn cancel_profile_grants_cleared(&self, profile: &ProfileId) {
+        self.cancel_where(profile, |_| true, PreApprovalExpireReason::GrantRevoked);
     }
 
     /// Cancel every pending escalation of `profile` for `rp_id` (any action) after `grants revoke`
     /// removed its granted rule, so a late approval cannot persist the grant again (review L2).
     /// Recorded and observed like [`Self::cancel_profile`]; the profile's other escalations stay,
-    /// and a queued one is prompted if the cancelled one held the prompt.
+    /// and a queued one is prompted if the cancelled one held the prompt. The RP's pre-approvals
+    /// are dropped (`grant_revoked`).
     pub fn cancel_rp(&self, profile: &ProfileId, rp_id: &str) {
-        self.cancel_where(profile, |request| request.rp_id == rp_id);
+        self.cancel_where(
+            profile,
+            |candidate| candidate == rp_id,
+            PreApprovalExpireReason::GrantRevoked,
+        );
     }
 
-    fn cancel_where(&self, profile: &ProfileId, matches: impl Fn(&EscalationRequest) -> bool) {
+    fn cancel_where(
+        &self,
+        profile: &ProfileId,
+        matches: impl Fn(&str) -> bool,
+        token_reason: PreApprovalExpireReason,
+    ) {
+        let now = self.clock.now();
+        let epoch = self.epoch.current();
         let mut effects = Vec::new();
         {
             let mut inner = self.lock();
+            inner.drop_tokens(
+                |(_, key)| key.profile == *profile && matches(&key.rp_id),
+                token_reason,
+                &mut effects,
+            );
             let serials: Vec<u64> = inner
                 .entries
                 .iter()
                 .filter(|(_, entry)| {
                     entry.request.profile == *profile
-                        && matches(&entry.request)
+                        && matches(&entry.request.rp_id)
                         && !entry.state.is_terminal()
                 })
                 .map(|(serial, _)| *serial)
@@ -1905,11 +2600,12 @@ impl EscalationService {
                 }
                 info!("escalation {}: revoked by a policy change", entry.id);
                 inner.unlink(serial);
+                inner.settle_pre_requests(serial, now, epoch, &mut effects);
                 inner.collect(serial);
             }
             // The profile's remaining queued escalations (a `cancel_rp` leaves them) get the
             // prompt slot; after a whole-profile cancel the queue is empty and this does nothing.
-            inner.pump(profile, self.clock.now(), &mut effects);
+            inner.pump(profile, now, &mut effects);
             self.changed.notify_all();
         }
         self.run(effects);
@@ -1946,14 +2642,7 @@ impl EscalationService {
         }
         let _slot = ReleaseSlot(approval);
 
-        let context = EscalationAuditContext {
-            escalation_id: approval.escalation_id.as_str().to_string(),
-            profile_id: approval.profile.clone(),
-            action: AuditAction::Register,
-            rp_id: approval.rp_id.clone(),
-            origin: approval.origin.clone(),
-            rule: approval.rule,
-        };
+        let context = approval.audit_context();
         let audit_denial = |cause: EscalationDenyCause| {
             if let Err(audit_error) = self.audit.record(context.denied(cause)) {
                 warn!(
@@ -1961,6 +2650,18 @@ impl EscalationService {
                     approval.escalation_id, audit_error
                 );
             }
+        };
+        // A registration grant always names the origin it was created at; an approval without
+        // one was never consumed by a ceremony (fail closed).
+        let Some(origin) = approval.origin.as_deref() else {
+            warn!(
+                "escalation {}: the registration approval has no origin; no grant is persisted",
+                approval.escalation_id
+            );
+            audit_denial(EscalationDenyCause::GrantWriteFailed);
+            return Err(GrantStoreError::Io(
+                "the registration approval has no origin".to_string(),
+            ));
         };
         // A cap that no longer admits this grant (a reload lowered it, or grants were stored
         // meanwhile) is refused before `granted_rule.add` is audited: that record exists only for
@@ -2008,13 +2709,14 @@ impl EscalationService {
                 "granted_rule.add could not be audited: {e}"
             )));
         }
-        let rule = GrantedRule::new(
+        let rule = GrantedRule::from_escalation(
             &approval.rp_id,
             GrantKind::Registration,
             approval.escalation_id.as_str(),
-            &approval.origin,
+            Some(origin),
             approval.rule,
             Some(credential_ref),
+            approval.source,
         );
         let wildcard_cap =
             (approval.rule == PermittingRule::Wildcard).then_some(max_wildcard_registrations);
@@ -2055,6 +2757,311 @@ impl EscalationService {
             }
         }
         Ok(())
+    }
+
+    /// Raise a pre-request (ADR 0014 amendment section 2.3), or report the state of the one
+    /// `params.request`'s principal session already has for the key. The caller has resolved the
+    /// key to `request` against the live policy, checked `pre_request_actions` and, for
+    /// `register`, that the principal session can run the ceremony. Then, in the ceremony's
+    /// order: the principal session's limits, cooldown, the wildcard registration limits, grant
+    /// cap and store, bus, queue and waiter caps. Nothing here waits for the human; see
+    /// [`Self::wait_pre_request`].
+    pub fn pre_request(&self, params: PreRequestParams) -> PreRequestState {
+        let PreRequestParams {
+            request,
+            pending_for,
+            session_remaining,
+        } = params;
+        let Some(principal) = request.principal.clone() else {
+            // A pre-request always names its principal session; fail closed.
+            return PreRequestState::Refused(EscalationRefusal::Unavailable);
+        };
+        if request.source != RequestSource::PreRequest || request.origin.is_some() {
+            return PreRequestState::Refused(EscalationRefusal::Unavailable);
+        }
+        self.sweep_pre_requests();
+        let key = request.key();
+        let now = self.clock.now();
+        {
+            let mut inner = self.lock();
+            if let Some(state) = inner.report(&principal, &key, now) {
+                return state;
+            }
+            if let Some(limited) = inner.pre_request_limit(&principal, now) {
+                return limited;
+            }
+        }
+        let attach = Attach::PreRequest {
+            deadline: later(now, pending_for.min(PRE_REQUEST_PENDING_LIMIT)),
+            session_ends: later(now, session_remaining),
+        };
+        match self.enter(request, attach) {
+            Ok(entered) => {
+                debug!(
+                    "escalation {}: pre-request by a principal session is pending",
+                    entered.escalation_id
+                );
+                let now = self.clock.now();
+                self.lock()
+                    .report(&principal, &key, now)
+                    .unwrap_or(PreRequestState::Pending)
+            }
+            Err(EscalationRefusal::PreRequestRateLimited) => {
+                let now = self.clock.now();
+                let mut inner = self.lock();
+                inner
+                    .report(&principal, &key, now)
+                    .or_else(|| inner.pre_request_limit(&principal, now))
+                    .unwrap_or(PreRequestState::RateLimited { retry_after: None })
+            }
+            Err(refusal) => PreRequestState::Refused(refusal),
+        }
+    }
+
+    /// Wait until `principal`'s pre-request for `key` leaves `Pending`, `until` passes or
+    /// `still_valid()` turns false (its principal session is gone), and return its state. The
+    /// waiter holds no lock: it parks on the escalation condvar, wakes at least every
+    /// [`WAIT_POLL_INTERVAL`] and calls `still_valid` with the mutex released. Leaving early
+    /// changes nothing: the pre-request stays pending until its own deadline.
+    pub fn wait_pre_request(
+        &self,
+        principal: &PrincipalSessionId,
+        key: &EscalationKey,
+        until: Instant,
+        still_valid: &dyn Fn() -> bool,
+    ) -> PreRequestState {
+        loop {
+            self.sweep_pre_requests();
+            {
+                let now = self.clock.now();
+                let mut inner = self.lock();
+                let state = match inner.report(principal, key, now) {
+                    Some(PreRequestState::Pending) => PreRequestState::Pending,
+                    Some(state) => return state,
+                    // Forgotten: its principal session ended.
+                    None => return PreRequestState::Expired,
+                };
+                let now = Instant::now();
+                if now >= until {
+                    return state;
+                }
+                let pause = WAIT_POLL_INTERVAL.min(until - now);
+                drop(inner.wait_timeout(&self.changed, pause));
+            }
+            if !still_valid() {
+                return PreRequestState::Expired;
+            }
+        }
+    }
+
+    /// Consume the pre-approval of `consumer.principal` for a registration at `consumer.rp_id`
+    /// (ADR 0014 amendment section 2.3), at the point where the ceremony would raise its own
+    /// escalation. One use: the first caller takes it; a racing second one gets `None` and
+    /// escalates as usual. A token that is past its TTL, issued under another revocation epoch,
+    /// or approved through another rule than the one that matches now, is dropped instead
+    /// (`pre_approval.expired`). The consumption is audited (`pre_approval.consumed`) before the
+    /// approval is handed out; if that record cannot be written the token is spent and nothing is
+    /// handed out (fail closed).
+    pub fn take_pre_approval(
+        &self,
+        consumer: PreApprovalConsumer<'_>,
+    ) -> Option<RegistrationApproval> {
+        let now = self.clock.now();
+        let epoch = self.epoch.current();
+        let key = (
+            consumer.principal.clone(),
+            EscalationKey {
+                profile: consumer.profile.clone(),
+                rp_id: consumer.rp_id.to_string(),
+                action: CeremonyAction::Register,
+            },
+        );
+        let token = {
+            let mut inner = self.lock();
+            if !matches!(
+                inner.pre_requests.get(&key).map(|record| &record.status),
+                Some(PreStatus::Token(_))
+            ) {
+                return None;
+            }
+            match inner.pre_requests.remove(&key) {
+                Some(PreRequestRecord {
+                    status: PreStatus::Token(token),
+                    ..
+                }) => token,
+                _ => return None,
+            }
+        };
+        let meta = token.meta();
+        let invalid = token.invalid(now, epoch).or_else(|| {
+            (token.approval.rule != consumer.rule).then_some(PreApprovalExpireReason::PolicyReload)
+        });
+        if let Some(reason) = invalid {
+            info!(
+                "escalation {}: pre-approval for {}/{} dropped at use ({:?})",
+                token.approval.escalation_id, consumer.profile, consumer.rp_id, reason
+            );
+            if let Err(e) = self.audit.record(meta.expired(reason)) {
+                warn!("escalation: failed to audit pre_approval.expired: {}", e);
+            }
+            return None;
+        }
+        if let Err(e) = self.audit.record(meta.consumed(consumer.request_id)) {
+            warn!(
+                "escalation {}: pre_approval.consumed could not be audited; the pre-approval is \
+                 not used: {}",
+                token.approval.escalation_id, e
+            );
+            return None;
+        }
+        let PreApprovalToken {
+            mut approval,
+            principal,
+            ..
+        } = token;
+        approval.session = consumer.session;
+        approval.origin = Some(consumer.origin.to_string());
+        approval.principal = Some(principal);
+        info!(
+            "escalation {}: pre-approval consumed by a registration at {}",
+            approval.escalation_id, consumer.rp_id
+        );
+        Some(approval)
+    }
+
+    /// Enforce the pre-requests' deadlines and the pre-approvals' TTL and epoch binding, and
+    /// forget unreported outcomes older than [`PRE_REQUEST_WINDOW`]. The runtime loop calls it
+    /// about once a second; every pre-request call runs it first as well.
+    pub fn sweep_pre_requests(&self) {
+        let now = self.clock.now();
+        let epoch = self.epoch.current();
+        let cooldown = self.cooldown();
+        let mut effects = Vec::new();
+        {
+            let mut inner = self.lock();
+            if inner.pre_requests.is_empty() {
+                return;
+            }
+            let due: Vec<(PreRequestKey, u64, Option<u64>)> = inner
+                .pre_requests
+                .iter_mut()
+                .filter(|(_, record)| {
+                    matches!(record.status, PreStatus::Pending) && record.deadline <= now
+                })
+                .map(|(key, record)| (key.clone(), record.serial, record.waiter.take()))
+                .collect();
+            for (key, serial, waiter) in due {
+                info!(
+                    "escalation: a pre-request for {}/{} reached its deadline",
+                    key.1.profile, key.1.rp_id
+                );
+                if let Some(waiter) = waiter {
+                    // The last waiter's timeout ends the escalation and starts the key's
+                    // cooldown; with ceremonies still waiting it continues for them.
+                    inner.depart(
+                        serial,
+                        waiter,
+                        Departure::Timeout,
+                        now,
+                        cooldown,
+                        epoch,
+                        &mut effects,
+                    );
+                }
+                if let Some(record) = inner.pre_requests.get_mut(&key)
+                    && matches!(record.status, PreStatus::Pending)
+                {
+                    record.status = PreStatus::Settled(PreRequestState::Expired);
+                    record.settled_at = Some(now);
+                }
+            }
+            let stale: Vec<(PreRequestKey, PreApprovalExpireReason)> = inner
+                .pre_requests
+                .iter()
+                .filter_map(|(key, record)| match &record.status {
+                    PreStatus::Token(token) => token
+                        .invalid(now, epoch)
+                        .map(|reason| (key.clone(), reason)),
+                    _ => None,
+                })
+                .collect();
+            for (key, reason) in stale {
+                inner.drop_tokens(|candidate| *candidate == key, reason, &mut effects);
+            }
+            let window = u64::try_from(PRE_REQUEST_WINDOW.as_millis()).unwrap_or(u64::MAX);
+            inner.pre_requests.retain(|_, record| {
+                !(matches!(record.status, PreStatus::Settled(_))
+                    && record
+                        .settled_at
+                        .is_some_and(|at| now.saturating_duration_since(at) >= window))
+            });
+            self.changed.notify_all();
+        }
+        self.run(effects);
+    }
+
+    /// A principal session ended: its pending pre-requests are withdrawn (their detached waiters
+    /// leave as an abort), its pre-approvals are dropped (`session_end`) and everything it asked
+    /// is forgotten.
+    pub fn principal_session_ended(&self, principal: &PrincipalSessionId) {
+        let now = self.clock.now();
+        let epoch = self.epoch.current();
+        let cooldown = self.cooldown();
+        let mut effects = Vec::new();
+        {
+            let mut inner = self.lock();
+            inner.drop_tokens(
+                |(owner, _)| owner == principal,
+                PreApprovalExpireReason::SessionEnd,
+                &mut effects,
+            );
+            let pending: Vec<(u64, u64)> = inner
+                .pre_requests
+                .iter_mut()
+                .filter(|((owner, _), _)| owner == principal)
+                .filter_map(|(_, record)| record.waiter.take().map(|w| (record.serial, w)))
+                .collect();
+            for (serial, waiter) in pending {
+                inner.depart(
+                    serial,
+                    waiter,
+                    Departure::Aborted,
+                    now,
+                    cooldown,
+                    epoch,
+                    &mut effects,
+                );
+            }
+            inner
+                .pre_requests
+                .retain(|(owner, _), _| owner != principal);
+            inner.pre_request_history.remove(principal);
+            // A `register` pre-request a ceremony has not adopted is no longer adoptable by
+            // anyone (it was withdrawn above unless ceremonies of other keys hold it).
+            for entry in inner.entries.values_mut() {
+                if entry.adoptable_by.as_ref() == Some(principal) {
+                    entry.adoptable_by = None;
+                }
+            }
+            self.changed.notify_all();
+        }
+        self.run(effects);
+    }
+
+    /// A browser lease of `principal` was revoked: its pre-approvals are dropped
+    /// (`lease_revoked`). A pending pre-request stays; its approval binds to the session's next
+    /// lease.
+    pub fn lease_revoked(&self, principal: &PrincipalSessionId) {
+        let mut effects = Vec::new();
+        {
+            let mut inner = self.lock();
+            inner.drop_tokens(
+                |(owner, _)| owner == principal,
+                PreApprovalExpireReason::LeaseRevoked,
+                &mut effects,
+            );
+        }
+        self.run(effects);
     }
 
     /// The state of `key`'s live entry, if any.
@@ -2186,8 +3193,12 @@ impl Waiter {
     fn take_outcome(&mut self, inner: &mut Inner) -> Option<EscalationOutcome> {
         let entry = inner.entries.get_mut(&self.serial)?;
         let escalation_id = entry.id.clone();
+        let source = entry.request.source;
         let outcome = match entry.outcome.as_mut()? {
-            EntryOutcome::Approved => EscalationOutcome::Approved { escalation_id },
+            EntryOutcome::Approved => EscalationOutcome::Approved {
+                escalation_id,
+                source,
+            },
             EntryOutcome::Registration(token) => match token.take() {
                 Some(approval) => EscalationOutcome::RegistrationApproved(approval),
                 // Registration escalations are not joinable; the token was the creator's.
@@ -2409,6 +3420,22 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A revocation epoch the test moves by hand.
+    #[derive(Default)]
+    pub struct FixedEpoch(pub AtomicU64);
+
+    impl FixedEpoch {
+        pub fn bump(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl RevocationEpoch for FixedEpoch {
+        fn current(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
     /// A coordinator that can show no prompt: every escalation is refused with
     /// `escalation_unavailable` (a daemon without a session bus).
     pub fn idle_service(audit: Arc<AuditGate>) -> Arc<EscalationService> {
@@ -2418,6 +3445,7 @@ pub(crate) mod test_support {
             prompter: Arc::new(UnavailablePrompter::new("no session bus in this test")),
             clock: Arc::new(SystemClock::new()),
             cooldown: Duration::from_secs(600),
+            epoch: Arc::new(FixedEpoch::default()),
         })
     }
 
@@ -2432,10 +3460,14 @@ pub(crate) mod test_support {
     ) -> Arc<EscalationService> {
         EscalationService::new(EscalationDeps {
             audit,
-            grants: Arc::new(StoreGrantWriter { store, policy }),
+            grants: Arc::new(StoreGrantWriter {
+                store,
+                policy: policy.clone(),
+            }),
             prompter,
             clock: Arc::new(SystemClock::new()),
             cooldown,
+            epoch: policy,
         })
     }
 }
@@ -2693,6 +3725,7 @@ mod tests {
         grants: Arc<FakeGrants>,
         prompter: Arc<FakePrompter>,
         clock: Arc<ManualClock>,
+        epoch: Arc<test_support::FixedEpoch>,
     }
 
     const COOLDOWN: Duration = Duration::from_secs(600);
@@ -2702,12 +3735,14 @@ mod tests {
         let grants = Arc::new(FakeGrants::default());
         let prompter = Arc::new(FakePrompter::default());
         let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
+        let epoch = Arc::new(test_support::FixedEpoch::default());
         let service = EscalationService::new(EscalationDeps {
             audit: audit.clone(),
             grants: grants.clone(),
             prompter: prompter.clone(),
             clock: clock.clone(),
             cooldown: COOLDOWN,
+            epoch: epoch.clone(),
         });
         Harness {
             service,
@@ -2715,6 +3750,7 @@ mod tests {
             grants,
             prompter,
             clock,
+            epoch,
         }
     }
 
@@ -2727,9 +3763,12 @@ mod tests {
             profile: profile(profile_name),
             rp_id: rp_id.to_string(),
             action: CeremonyAction::Authenticate,
-            origin: format!("https://{rp_id}"),
+            origin: Some(format!("https://{rp_id}")),
             rule: PermittingRule::Exact,
             session: WaiterSession::from_raw(session),
+            source: RequestSource::Ceremony,
+            principal: None,
+            agent_note: None,
             mode: AgentMode::Isolated,
             principal_user: "agent".to_string(),
             max_granted_rules: 64,
@@ -2834,7 +3873,7 @@ mod tests {
         let rule = h.grants.rules.lock().unwrap()[0].clone();
         assert_eq!(rule.rp_id, "a.example");
         assert_eq!(rule.kind, GrantKind::Escalation);
-        assert_eq!(rule.origin, "https://a.example");
+        assert_eq!(rule.origin.as_deref(), Some("https://a.example"));
         assert_eq!(
             h.audit.kinds(),
             [
@@ -3978,7 +5017,7 @@ mod tests {
         let after = at(1_000 + 3_600_000 + MAX_TRACKED_KEYS as u64 + 1);
         assert!(matches!(
             inner.admit(&fresh, &fresh.key(), after, StoredWildcards::NONE),
-            Ok(None)
+            Ok(Admission::Create)
         ));
     }
 
@@ -4027,7 +5066,7 @@ mod tests {
         let other = request("other", "a.example", 2);
         assert!(matches!(
             inner.admit(&other, &other.key(), now, StoredWildcards::NONE),
-            Ok(None)
+            Ok(Admission::Create)
         ));
         assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS_PER_PROFILE);
         assert!(inner.in_cooldown(&profile_key("hostile", 0), now));
@@ -4035,7 +5074,7 @@ mod tests {
         let later = at(1_000 + 3_600_000 + 1);
         assert!(matches!(
             inner.admit(&more, &more.key(), later, StoredWildcards::NONE),
-            Ok(None)
+            Ok(Admission::Create)
         ));
     }
 
@@ -4055,7 +5094,7 @@ mod tests {
         let other = request("other", "new.example", 2);
         assert!(matches!(
             inner.admit(&other, &other.key(), at(1), StoredWildcards::NONE),
-            Ok(None)
+            Ok(Admission::Create)
         ));
     }
 

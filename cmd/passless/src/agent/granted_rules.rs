@@ -32,8 +32,13 @@ use super::lock_order::{self, LockLevel};
 use super::policy_engine::PolicyRuntime;
 use super::safe_fs::Dir;
 
-/// The only store format version.
-pub const GRANTED_RULES_VERSION: u32 = 1;
+/// The newest store format version (ADR 0014 amendment section 7). Version 2 adds `source` and
+/// makes `origin` optional; the writer writes the lowest version that represents its entries
+/// ([`store_version_for`]), so a store without a pre-request grant stays readable by a daemon
+/// that knows version 1 only.
+pub const GRANTED_RULES_VERSION: u32 = 2;
+/// The original store format version: every entry has an origin and came from a ceremony.
+pub const GRANTED_RULES_VERSION_1: u32 = 1;
 /// Largest store file that is loaded; a larger one disables the profile's grants.
 pub const MAX_STORE_FILE_BYTES: u64 = 256 * 1024;
 /// The store's directory under `agents.state_dir`.
@@ -74,6 +79,32 @@ impl GrantKind {
     }
 }
 
+/// Who raised the escalation behind a granted rule (store version 2, audit version 5).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestSource {
+    /// A ceremony (a page's WebAuthn call) that resolved to `request`.
+    #[default]
+    Ceremony,
+    /// The agent asked in advance (`PrincipalRequest::RequestAccess`; ADR 0014 amendment 2.3).
+    PreRequest,
+}
+
+impl RequestSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ceremony => "ceremony",
+            Self::PreRequest => "pre_request",
+        }
+    }
+
+    pub fn is_ceremony(&self) -> bool {
+        *self == Self::Ceremony
+    }
+}
+
 /// The configured rule that permitted the escalation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PermittingRule {
@@ -106,12 +137,17 @@ pub struct GrantedRule {
     pub granted_at: String,
     /// The approving escalation's ID.
     pub request_id: String,
-    /// The origin of the ceremony that requested the escalation.
-    pub origin: String,
+    /// The origin of the ceremony that requested the escalation. Absent only for an
+    /// `authenticate` pre-request, which has no page (store version 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub rule: PermittingRule,
     /// The credential a registration grant pins (ADR 0014 section 8.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<CredentialRef>,
+    /// Who raised the escalation (store version 2); `ceremony` when absent.
+    #[serde(default, skip_serializing_if = "RequestSource::is_ceremony")]
+    pub source: RequestSource,
 }
 
 impl GrantedRule {
@@ -130,10 +166,39 @@ impl GrantedRule {
             kind,
             granted_at: rfc3339_utc(SystemTime::now()),
             request_id: request_id.to_string(),
-            origin: origin.to_string(),
+            origin: Some(origin.to_string()),
             rule,
             credential_ref,
+            source: RequestSource::Ceremony,
         }
+    }
+
+    /// The grant of an escalation raised by `source`, with `origin` when a page was involved
+    /// (ADR 0014 amendment section 7: only an `authenticate` pre-request has none).
+    pub fn from_escalation(
+        rp_id: &str,
+        kind: GrantKind,
+        request_id: &str,
+        origin: Option<&str>,
+        rule: PermittingRule,
+        credential_ref: Option<CredentialRef>,
+        source: RequestSource,
+    ) -> Self {
+        Self {
+            origin: origin.map(str::to_string),
+            source,
+            ..Self::new(rp_id, kind, request_id, "", rule, credential_ref)
+        }
+    }
+
+    /// Whether store version 1 can represent this entry (an origin, from a ceremony).
+    pub fn fits_version_1(&self) -> bool {
+        self.origin.is_some() && self.source == RequestSource::Ceremony
+    }
+
+    /// The origin as shown by the admin listings (empty when the entry has none).
+    pub fn origin_or_empty(&self) -> &str {
+        self.origin.as_deref().unwrap_or("")
     }
 
     /// Two entries with the same key are duplicates. A registration grant per credential may sit
@@ -612,7 +677,7 @@ impl GrantedRulesStore {
     ) -> Result<(), GrantStoreError> {
         rules.sort_by_key(GrantedRule::key);
         let file = StoreFile {
-            version: GRANTED_RULES_VERSION,
+            version: store_version_for(&rules),
             profile: profile.as_str().to_string(),
             grants: rules,
         };
@@ -889,11 +954,32 @@ fn check_dir_handle(handle: &Dir, dir: &Path, owner_uid: u32) -> Result<(), Stri
     Ok(())
 }
 
+/// The lowest store version that represents `rules` (ADR 0014 amendment section 7): version 1
+/// while every entry has an origin and came from a ceremony, version 2 otherwise. A store is
+/// rewritten as version 2 only once a pre-request grant exists, so a downgrade works until then.
+pub fn store_version_for(rules: &[GrantedRule]) -> u32 {
+    if rules.iter().all(GrantedRule::fits_version_1) {
+        GRANTED_RULES_VERSION_1
+    } else {
+        GRANTED_RULES_VERSION
+    }
+}
+
 fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, String> {
     let text = std::str::from_utf8(content).map_err(|_| "not UTF-8".to_string())?;
     let file: StoreFile = toml::from_str(text).map_err(|e| format!("does not parse: {}", e))?;
-    if file.version != GRANTED_RULES_VERSION {
+    if file.version != GRANTED_RULES_VERSION_1 && file.version != GRANTED_RULES_VERSION {
         return Err(format!("unknown version {}", file.version));
+    }
+    // A version 1 file loads as version 2 with `source = "ceremony"`; it may not use a field
+    // that version 1 does not have (an older daemon would refuse it, so this one does too).
+    if file.version == GRANTED_RULES_VERSION_1
+        && let Some(rule) = file.grants.iter().find(|rule| !rule.fits_version_1())
+    {
+        return Err(format!(
+            "version 1 entry for '{}' has no origin or a source other than ceremony",
+            rule.rp_id
+        ));
     }
     if file.profile != profile.as_str() {
         return Err(format!(
@@ -918,6 +1004,15 @@ fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, 
         if rule.kind == GrantKind::Registration && rule.credential_ref.is_none() {
             return Err(format!(
                 "registration grant for '{}' has no credential_ref",
+                rule.rp_id
+            ));
+        }
+        // Only an `authenticate` pre-request has no page: a registration always has an origin.
+        if rule.origin.is_none()
+            && (rule.kind != GrantKind::Escalation || rule.source != RequestSource::PreRequest)
+        {
+            return Err(format!(
+                "grant for '{}' has no origin and is not an authenticate pre-request",
                 rule.rp_id
             ));
         }
@@ -981,7 +1076,7 @@ fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
                     rule.kind.as_str(),
                     rule.granted_at.as_str(),
                     rule.request_id.as_str(),
-                    rule.origin.as_str(),
+                    rule.origin_or_empty(),
                     rule.rule.as_str(),
                     &rule
                         .credential_ref
@@ -991,6 +1086,15 @@ fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
                 ] {
                     hasher.update((field.len() as u64).to_le_bytes());
                     hasher.update(field.as_bytes());
+                }
+                // Version 2 fields (amendment section 7). An entry version 1 can represent adds
+                // nothing, so the digest of a version 1 store is unchanged.
+                if !rule.fits_version_1() {
+                    let origin_present = if rule.origin.is_some() { "1" } else { "0" };
+                    for field in ["v2", rule.source.as_str(), origin_present] {
+                        hasher.update((field.len() as u64).to_le_bytes());
+                        hasher.update(field.as_bytes());
+                    }
                 }
             }
         }

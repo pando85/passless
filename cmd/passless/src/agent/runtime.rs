@@ -50,6 +50,7 @@ use crate::storage::CredentialStorage;
 mod browser_ensure;
 mod gates;
 mod interception;
+mod pre_request;
 
 const MAX_WORKERS: usize = 16;
 const MAX_COMPLETED_SESSIONS: usize = 256;
@@ -135,11 +136,12 @@ fn build_escalation_service(
         audit: audit_gate,
         grants: Arc::new(StoreGrantWriter {
             store: granted_rules,
-            policy: policy_runtime,
+            policy: policy_runtime.clone(),
         }),
         prompter,
         clock: Arc::new(super::identity::SystemClock::new()),
         cooldown: agent_config.escalation_cooldown(),
+        epoch: policy_runtime,
     })
 }
 
@@ -184,7 +186,7 @@ pub(crate) fn clear_granted_rules(
     let outcome = store
         .clear(policy_runtime, profile_id)
         .map_err(granted_rules_error)?;
-    escalation.cancel_profile(profile_id);
+    escalation.cancel_profile_grants_cleared(profile_id);
     if outcome.revoked > 0 {
         let event = super::audit_events::GrantedRuleRevokeBuilder::new(
             profile_id.clone(),
@@ -951,6 +953,8 @@ pub struct AgentRuntime {
     escalation: Arc<EscalationService>,
     /// `PASSLESS_INTERACTION_MODE=automatic` was in force at start; reloads keep R19.
     human_path_automatic: bool,
+    /// The refusal ledgers of principal sessions' pre-requests (ADR 0014 amendment 2.3).
+    pre_request_refusals: pre_request::PreRequestRefusals,
 }
 
 impl AgentRuntime {
@@ -1306,6 +1310,20 @@ impl AgentRuntime {
         })?;
 
         let sign_registry = Arc::new(SignContextRegistry::new());
+        {
+            // A revoked lease drops the pre-approvals of the principal session its grant belongs
+            // to (ADR 0014 amendment section 2.3). Called with no registry lock held: policy
+            // grants (70), then the escalation mutex (80) and the audit gate (90).
+            let policy_runtime = policy_runtime.clone();
+            let escalation = escalation.clone();
+            sign_registry.set_lease_observer(Box::new(move |grants| {
+                for grant_id in grants {
+                    if let Some(principal) = policy_runtime.grant_principal_session(grant_id) {
+                        escalation.lease_revoked(&principal);
+                    }
+                }
+            }));
+        }
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));
         let sign_socket_base = daemon_runtime_base()?;
         let sign_socket_path = sign_socket_base.join("agent").join("sign").join("sock");
@@ -1471,6 +1489,7 @@ impl AgentRuntime {
             granted_rules,
             escalation,
             human_path_automatic,
+            pre_request_refusals: pre_request::PreRequestRefusals::default(),
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -1509,6 +1528,8 @@ impl AgentRuntime {
 
             self.worker_tracker.reap_finished();
             self.reap_expired_sessions();
+            // Pre-request deadlines and pre-approval TTLs (ADR 0014 amendment section 2.3).
+            self.escalation.sweep_pre_requests();
             self.prune_completed_sessions();
             // Write the late-use refusal counts of revoked bearers whose window has ended.
             self.sign_registry.flush_due_revoked_refusals();
@@ -1680,6 +1701,11 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
         session_id: &PrincipalSessionId,
     ) {
+        // Every way a principal session ends comes through here: its pending pre-requests are
+        // withdrawn and its pre-approvals dropped (ADR 0014 amendment section 2.3), before its
+        // browser is closed. Escalation mutex and audit only; no lock above rank 5 is held.
+        self.escalation.principal_session_ended(session_id);
+        self.pre_request_refusals.session_ended(session_id);
         let _lifecycle = super::lock_order::lock(
             &profile.lifecycle_lock,
             super::lock_order::LockLevel::ProfileLifecycle,
@@ -3342,9 +3368,10 @@ impl AgentRuntime {
                             kind: rule.kind.as_str().to_string(),
                             granted_at: rule.granted_at.clone(),
                             request_id: rule.request_id.clone(),
-                            origin: rule.origin.clone(),
+                            origin: rule.origin_or_empty().to_string(),
                             rule: rule.rule.as_str().to_string(),
                             credential_ref: rule.credential_ref.as_ref().map(|r| r.to_hex()),
+                            source: Some(rule.source.as_str().to_string()),
                         })
                         .collect(),
                 },
@@ -4606,6 +4633,8 @@ impl PrincipalHandler for AgentRuntime {
         let session = &managed.session;
 
         let proc_root = &session.proc_root;
+        // Everything else answers under the slot; a pre-request may wait for the human, so it
+        // copies what it needs and releases the slot first (LOCKING.md rule 3).
         let peer_pid = cred.pid;
 
         if identity.uid != session.identity.uid {
@@ -4705,6 +4734,29 @@ impl PrincipalHandler for AgentRuntime {
                 *timeout_ms,
                 profile,
             ),
+            PrincipalRequest::RequestAccess {
+                rp_id,
+                action,
+                note,
+                wait_ms,
+            } => {
+                let requester = pre_request::Requester {
+                    session_id: managed.session_id.clone(),
+                    deadline: managed.deadline,
+                };
+                drop(sessions);
+                self.handle_request_access(
+                    &profile_id,
+                    profile,
+                    requester,
+                    pre_request::AccessRequest {
+                        rp_id,
+                        action,
+                        note: note.as_deref(),
+                        wait_ms: *wait_ms,
+                    },
+                )
+            }
         }
     }
 }
