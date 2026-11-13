@@ -3199,8 +3199,9 @@ mod tests {
         assert_eq!(requested["action"], "register");
         let reservation = events.iter().find(|e| e["kind"] == "policy.allow").unwrap();
         assert_eq!(reservation["rule"], "*");
-        assert_eq!(reservation["v"], 4);
+        assert_eq!(reservation["v"], 5);
         assert!(reservation["credential_scope"].is_null());
+        assert_eq!(reservation["approval_source"], "ceremony");
         let added = events
             .iter()
             .find(|e| e["kind"] == "granted_rule.add")

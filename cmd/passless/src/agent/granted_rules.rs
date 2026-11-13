@@ -1464,10 +1464,10 @@ rule = "exact"
         let tmp = tempfile::tempdir().unwrap();
         seed(
             tmp.path(),
-            &VALID.replace("version = 1", "version = 2"),
+            &VALID.replace("version = 1", "version = 3"),
             0o600,
         );
-        assert_disabled(tmp.path(), "unknown version 2");
+        assert_disabled(tmp.path(), "unknown version 3");
     }
 
     #[test]

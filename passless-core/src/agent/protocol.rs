@@ -1997,7 +1997,7 @@ mod tests {
     fn version_negotiate_higher_minor_clamped() {
         let offer = ProtocolVersion::new(1, 5);
         let negotiated = ProtocolVersion::negotiate(offer).unwrap();
-        assert_eq!(negotiated, ProtocolVersion::new(1, 2));
+        assert_eq!(negotiated, ProtocolVersion::new(1, 3));
     }
 
     #[test]

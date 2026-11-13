@@ -4227,12 +4227,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 62);
+        assert_eq!(events.len(), 65);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 62, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 65, "duplicate kind names detected");
     }
 
     #[test]
@@ -4474,6 +4474,9 @@ mod tests {
             "prompt.deny",
             "prompt.timeout",
             "prompt.error",
+            "pre_approval.issued",
+            "pre_approval.consumed",
+            "pre_approval.expired",
         ];
         let events = all_test_events();
         let mut actual_kinds: Vec<&str> = events.iter().map(|e| e.kind_name()).collect();
