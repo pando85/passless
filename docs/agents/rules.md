@@ -84,7 +84,7 @@ sign-in) or `registration` (a credential the agent created, shown in `CREDENTIAL
 configured rule that permitted it: `exact`, or `*` for a grant under the wildcard rule, and `SOURCE`
 says who raised the escalation: `ceremony` (a page did) or `pre_request` (the agent asked in advance,
 see [Asking in advance](#asking-in-advance)). A grant that no page was behind has no origin, shown as
-`-`; the JSON output has the same `source` and `origin` values. Wildcard registration grants count
+`-` in the table and as `null` in the JSON output, which has the same `source` values. Wildcard registration grants count
 against `max_wildcard_registrations`; revoking one frees a slot (the credential stays until
 `agent-admin credential delete`).
 

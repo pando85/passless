@@ -71,7 +71,7 @@ tell your users:
   profile's grants (fail closed) and `passless doctor` reports it.** Before downgrading, run
   `agent-admin grants revoke` for each `pre_request` grant, or `grants clear --profile <p> --confirm`; the
   next write returns the file to version 1. `grants list` shows each grant's `SOURCE` and prints an empty
-  origin as `-`; the JSON has the same `source` and `origin` values.
+  origin as `-`; the JSON has the same `source` value and `null` for an absent `origin`.
 - **The agent protocol goes to 1.3** (`PrincipalRequest::RequestAccess`). An older client against the new
   daemon, or the reverse, negotiates down and simply lacks the command. The MCP wrapper's own link to its
   principal session is broker protocol 2: a wrapper started by an older `passless` refuses a new broker
