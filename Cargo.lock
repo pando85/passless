@@ -476,7 +476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
 dependencies = [
  "dispatch2",
- "nix",
+ "nix 0.31.3",
  "windows-sys",
 ]
 
@@ -1365,6 +1365,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "notify-double"
 version = "0.1.0"
 dependencies = [
@@ -1533,7 +1545,7 @@ dependencies = [
  "hex",
  "libc",
  "log",
- "nix",
+ "nix 0.32.0",
  "passless-config-doc",
  "psl",
  "rand 0.8.8",
@@ -1567,7 +1579,7 @@ dependencies = [
  "hmac",
  "libc",
  "log",
- "nix",
+ "nix 0.32.0",
  "notify-double",
  "notify-rust",
  "p256",
@@ -1785,7 +1797,7 @@ dependencies = [
  "anyhow",
  "git-state",
  "lazy_static",
- "nix",
+ "nix 0.31.3",
  "procfs",
  "regex",
  "secstr",
@@ -2276,7 +2288,7 @@ dependencies = [
  "hex",
  "hidapi",
  "lazy_static",
- "nix",
+ "nix 0.31.3",
  "smallvec",
 ]
 
