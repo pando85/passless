@@ -13,8 +13,15 @@ use crate::notification::NotificationResult;
 use crate::pin_storage::{PinStorage, lock_pin_storage};
 use crate::storage::{CredentialFilter, CredentialStorage, lock_shared_storage};
 use crate::util::bytes_to_hex;
+use crate::uv::{
+    CommandProvider, FprintdProvider, NotificationProvider, UserVerificationManager,
+    UserVerificationProvider, VerificationContext, VerificationResult,
+};
 
-use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
+#[cfg(feature = "face")]
+use crate::uv::FaceIdProvider;
+
+use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig, UvConfig, UvProviderType};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions,
@@ -329,7 +336,13 @@ pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     pin_storage: Option<Arc<Mutex<P>>>,
     security_config: SecurityConfig,
     pin_config: PinConfig,
+    uv_manager: UserVerificationManager,
+    uv_timeout_seconds: u32,
     prompts: PromptHandle,
+    #[cfg(feature = "agent")]
+    interaction_manager: Option<Arc<AgentInteractionManager>>,
+    #[cfg(feature = "agent")]
+    isolated_mode: bool,
 }
 
 impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
@@ -341,14 +354,24 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Self {
-        Self::with_prompts(
+        let uv_manager = build_uv_manager(&uv_config);
+        let prompts = desktop_prompts();
+
+        Self {
             storage,
             pin_storage,
             security_config,
             pin_config,
-            desktop_prompts(),
-        )
+            uv_manager,
+            uv_timeout_seconds: uv_config.timeout_seconds,
+            prompts,
+            #[cfg(feature = "agent")]
+            interaction_manager: None,
+            #[cfg(feature = "agent")]
+            isolated_mode: false,
+        }
     }
 
     /// Like [`Self::new`], asking the user through `prompts`.
@@ -357,16 +380,165 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
         prompts: PromptHandle,
     ) -> Self {
+        let uv_manager = build_uv_manager(&uv_config);
         Self {
             storage,
             pin_storage,
             security_config,
             pin_config,
+            uv_manager,
+            uv_timeout_seconds: uv_config.timeout_seconds,
             prompts,
+            #[cfg(feature = "agent")]
+            interaction_manager: None,
+            #[cfg(feature = "agent")]
+            isolated_mode: false,
         }
     }
+
+    #[cfg(feature = "agent")]
+    pub fn with_interaction_manager(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        prompts: PromptHandle,
+        interaction_manager: Arc<AgentInteractionManager>,
+        isolated_mode: bool,
+    ) -> Self {
+        let uv_manager = build_uv_manager(&uv_config);
+        Self {
+            storage,
+            pin_storage,
+            security_config,
+            pin_config,
+            uv_manager,
+            uv_timeout_seconds: uv_config.timeout_seconds,
+            prompts,
+            interaction_manager: Some(interaction_manager),
+            isolated_mode,
+        }
+    }
+
+    fn do_user_verification(
+        &self,
+        operation: &str,
+        user: Option<&str>,
+        rp: &str,
+        require_strong_uv: bool,
+    ) -> Result<VerificationResult> {
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").as_deref() == Ok("1") {
+                info!("E2E test mode: Auto-accepting user verification");
+                return Ok(VerificationResult::Accepted);
+            }
+        }
+
+        let is_registration = operation.to_lowercase().contains("registration")
+            && !operation.to_lowercase().contains("credential excluded");
+
+        let should_verify = if is_registration {
+            self.security_config.user_verification_registration
+        } else {
+            self.security_config.user_verification_authentication
+        };
+
+        let storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock during user verification request");
+                return Err(soft_fido2::Error::Other);
+            }
+        };
+
+        if storage.disable_user_verification()
+            && !is_registration
+            && !should_verify
+            && !require_strong_uv
+        {
+            debug!(
+                "User verification handled by backend (e.g., GPG): {}",
+                operation
+            );
+            return Ok(VerificationResult::Accepted);
+        }
+
+        if !should_verify && !require_strong_uv {
+            debug!(
+                "User verification disabled for {}: {}",
+                if is_registration {
+                    "registration"
+                } else {
+                    "authentication"
+                },
+                operation
+            );
+            return Ok(VerificationResult::Accepted);
+        }
+
+        drop(storage);
+        let context = VerificationContext::new(operation)
+            .with_relying_party(rp)
+            .with_user(user.unwrap_or(""))
+            .with_timeout(self.uv_timeout_seconds);
+        let context = if require_strong_uv {
+            context.require_strong_uv()
+        } else {
+            context
+        };
+
+        self.uv_manager.verify(&context).map_err(|e| {
+            warn!("User verification failed: {}", e);
+            soft_fido2::Error::Other
+        })
+    }
+}
+
+fn build_uv_manager(config: &UvConfig) -> UserVerificationManager {
+    let mut providers: Vec<Box<dyn UserVerificationProvider>> = Vec::new();
+
+    match config.provider {
+        UvProviderType::Auto => {
+            providers.extend(FprintdProvider::from_config(config.fprintd.enabled));
+            #[cfg(feature = "face")]
+            providers.extend(FaceIdProvider::from_config(
+                config.face.enabled,
+                config.face.camera_index,
+                config.face.threshold,
+            ));
+            providers.push(NotificationProvider::from_config(config.timeout_seconds));
+        }
+        UvProviderType::Fprintd => {
+            providers.extend(FprintdProvider::from_config(config.fprintd.enabled));
+        }
+        UvProviderType::Face => {
+            #[cfg(feature = "face")]
+            providers.extend(FaceIdProvider::from_config(
+                config.face.enabled,
+                config.face.camera_index,
+                config.face.threshold,
+            ));
+            #[cfg(not(feature = "face"))]
+            log::warn!("Face provider requested but 'face' feature not enabled");
+        }
+        UvProviderType::Notification => {
+            providers.push(NotificationProvider::from_config(config.timeout_seconds));
+        }
+        UvProviderType::Command => {
+            providers.extend(CommandProvider::from_config(
+                config.command.enabled,
+                config.command.command.clone(),
+                config.timeout_seconds,
+            ));
+        }
+    }
+
+    UserVerificationManager::new(providers)
 }
 
 /// Thread-local stand-in for the desktop prompts, so unit tests can drive full CTAP ceremonies
@@ -450,6 +622,33 @@ pub(crate) mod test_prompts {
 
 impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
     fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
+        #[cfg(feature = "agent")]
+        {
+            if let Some(ref manager) = self.interaction_manager {
+                let action = action_from_info(info);
+                let generation = 0;
+                match manager.try_consume_up(rp, action, generation) {
+                    Some(result) => {
+                        debug!("Agent interaction override for UP: {:?}", result);
+                        return Ok(result);
+                    }
+                    None => {
+                        if manager.has_active_token() {
+                            debug!(
+                                "Agent interaction token active, auto-approving UP for rp={}",
+                                rp
+                            );
+                            return Ok(UpResult::Accepted);
+                        }
+                    }
+                }
+                if self.isolated_mode {
+                    debug!("Isolated mode: auto-approving UP for rp={}", rp);
+                    return Ok(UpResult::Accepted);
+                }
+            }
+        }
+
         #[cfg(test)]
         if let Some(result) = test_prompts::up_result() {
             return result;
@@ -519,7 +718,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         #[cfg(debug_assertions)]
         {
-            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").as_deref() == Ok("1") {
                 info!("E2E test mode: Auto-accepting user verification");
                 return Ok(UvResult::Accepted);
             }
@@ -578,43 +777,62 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                         return Ok(UvResult::Unavailable);
                     }
                     info!(
-                        "PIN is set, always_uv=false, enforcement=optional, using notification fallback"
+                        "PIN is set, always_uv=false, enforcement=optional, using biometric/notification fallback"
                     );
                 }
                 PinEnforcement::Never => {
-                    info!("PIN is set but enforcement=never, using notification fallback");
+                    info!(
+                        "PIN is set but enforcement=never, using biometric/notification fallback"
+                    );
                 }
             }
         }
 
-        let answer = lock_prompts(&self.prompts).user_verification(
-            info,
-            Some(rp),
-            user,
-            self.security_config.notification_timeout,
-        );
-        match answer {
-            Ok(NotificationResult::Accepted) => {
-                info!("User verification via notification: accepted");
+        match self.do_user_verification(info, user, rp, true) {
+            Ok(VerificationResult::Accepted) => {
+                info!("User verification accepted");
                 Ok(UvResult::AcceptedWithUp)
             }
-            Ok(NotificationResult::Denied) => {
-                warn!("User verification via notification: denied");
+            Ok(VerificationResult::Denied) => {
+                warn!("User verification denied");
                 Ok(UvResult::Denied)
             }
-            // Nobody refused: the prompt was dismissed or timed out. soft-fido2 consumes a UV
-            // retry on `Denied` only, and answers CTAP2_ERR_USER_ACTION_TIMEOUT here. The
-            // operation still fails closed.
-            Ok(NotificationResult::Dismissed) => {
-                warn!(
-                    "User verification via notification: closed or timed out \
-                     (no UV retry consumed)"
-                );
+            Ok(VerificationResult::Timeout) => {
+                warn!("User verification timed out");
                 Ok(UvResult::Timeout)
             }
-            Err(e) => {
-                error!("Failed to show notification: {}", e);
-                Err(soft_fido2::Error::Other)
+            Err(_) => {
+                // Fall back to prompts-based UV (used in tests)
+                let answer = lock_prompts(&self.prompts).user_verification(
+                    info,
+                    Some(rp),
+                    user,
+                    self.security_config.notification_timeout,
+                );
+                match answer {
+                    Ok(NotificationResult::Accepted) => {
+                        info!("User verification via notification: accepted");
+                        Ok(UvResult::AcceptedWithUp)
+                    }
+                    Ok(NotificationResult::Denied) => {
+                        warn!("User verification via notification: denied");
+                        Ok(UvResult::Denied)
+                    }
+                    // Nobody refused: the prompt was dismissed or timed out. soft-fido2 consumes a UV
+                    // retry on `Denied` only, and answers CTAP2_ERR_USER_ACTION_TIMEOUT here. The
+                    // operation still fails closed.
+                    Ok(NotificationResult::Dismissed) => {
+                        warn!(
+                            "User verification via notification: closed or timed out \
+                             (no UV retry consumed)"
+                        );
+                        Ok(UvResult::Timeout)
+                    }
+                    Err(e) => {
+                        error!("Failed to show notification: {}", e);
+                        Err(soft_fido2::Error::Other)
+                    }
+                }
             }
         }
     }
@@ -795,12 +1013,18 @@ pub struct AuthenticatorService<
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, (), SoftwareCredentialKeyProvider> {
     /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
-    pub fn new(storage: S, security_config: SecurityConfig, pin_config: PinConfig) -> Result<Self> {
+    pub fn new(
+        storage: S,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+    ) -> Result<Self> {
         Self::with_shared_storage(
             Arc::new(Mutex::new(storage)),
             None,
             security_config,
             pin_config,
+            uv_config,
         )
     }
 }
@@ -813,21 +1037,158 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
         prompts: PromptHandle,
     ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
-        let options = AuthenticatorOptions {
-            rk: true,
-            up: true,
-            uv: Some(true),
-            plat: false,
-            client_pin: Some(true),
-            pin_uv_auth_token: Some(true),
-            cred_mgmt: Some(true),
-            bio_enroll: None,
-            large_blobs: None,
-            ep: None,
-            always_uv: Some(security_config.always_uv),
-            make_cred_uv_not_required: Some(true),
+        #[cfg(feature = "agent")]
+        {
+            Self::build_authenticator_with_interaction(
+                storage,
+                pin_storage,
+                security_config,
+                pin_config,
+                uv_config,
+                prompts,
+                None,
+            )
+        }
+        #[cfg(not(feature = "agent"))]
+        {
+            let options = AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: false,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            };
+
+            let config = AuthenticatorConfig::builder()
+                .aaguid([
+                    0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73,
+                    0x2E, 0x72, 0x73,
+                ])
+                .options(options)
+                .commands(vec![
+                    CtapCommand::MakeCredential,
+                    CtapCommand::GetAssertion,
+                    CtapCommand::GetInfo,
+                    CtapCommand::ClientPin,
+                    CtapCommand::GetNextAssertion,
+                    CtapCommand::Selection,
+                ])
+                .max_credentials(100)
+                .extensions(vec!["credProtect".to_string()])
+                .firmware_version(*VERSION)
+                .constant_sign_count(security_config.constant_signature_counter)
+                .default_credential_backup_state(if security_config.enable_credential_backup {
+                    CredentialBackupState::Eligible
+                } else {
+                    CredentialBackupState::NotEligible
+                })
+                .algorithms(vec![-7])
+                .max_pin_retries(pin_config.max_retries)
+                .auto_lock_timeout(pin_config.auto_lock_timeout)
+                .build();
+
+            let callbacks = PasslessCallbacks::with_prompts(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                uv_config,
+                prompts,
+            );
+
+            let authenticator = if let Some(ps) = pin_storage {
+                Authenticator::with_config_and_pin_storage(
+                    callbacks,
+                    config,
+                    PinStorageWrapper {
+                        storage: ps,
+                        max_uv_retries: pin_config.max_uv_retries,
+                        last_uv_retries: Mutex::new(None),
+                    },
+                )
+            } else {
+                Authenticator::with_config(callbacks, config)
+            }?;
+
+            Ok(authenticator)
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    fn build_authenticator_with_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        prompts: PromptHandle,
+        interaction_manager: Option<Arc<AgentInteractionManager>>,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
+        Self::build_authenticator_with_interaction_and_options(
+            storage,
+            pin_storage,
+            security_config,
+            pin_config,
+            uv_config,
+            prompts,
+            interaction_manager,
+            true,
+        )
+    }
+
+    #[cfg(feature = "agent")]
+    fn build_authenticator_with_interaction_and_options(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        prompts: PromptHandle,
+        interaction_manager: Option<Arc<AgentInteractionManager>>,
+        use_agent_options: bool,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
+        let is_agent = use_agent_options;
+
+        let options = if is_agent {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(false),
+                plat: false,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(true),
+                make_cred_uv_not_required: Some(false),
+            }
+        } else {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: false,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            }
         };
 
         let config = AuthenticatorConfig::builder()
@@ -858,13 +1219,26 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
-        let callbacks = PasslessCallbacks::with_prompts(
-            storage,
-            pin_storage.clone(),
-            security_config,
-            pin_config.clone(),
-            prompts,
-        );
+        let callbacks = match interaction_manager {
+            Some(ref mgr) => PasslessCallbacks::with_interaction_manager(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                uv_config,
+                prompts,
+                mgr.clone(),
+                use_agent_options,
+            ),
+            None => PasslessCallbacks::with_prompts(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                uv_config,
+                prompts,
+            ),
+        };
 
         let authenticator = if let Some(ps) = pin_storage {
             Authenticator::with_config_and_pin_storage(
@@ -889,9 +1263,10 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Result<Self> {
         let storage = Arc::new(Mutex::new(storage));
-        Self::with_shared_storage(storage, pin_storage, security_config, pin_config)
+        Self::with_shared_storage(storage, pin_storage, security_config, pin_config, uv_config)
     }
 
     /// Create a new authenticator service with shared (Arc-wrapped) storage
@@ -905,6 +1280,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Result<Self> {
         let prompts = desktop_prompts();
         let authenticator = Self::build_authenticator(
@@ -912,6 +1288,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             pin_storage.clone(),
             security_config.clone(),
             pin_config.clone(),
+            uv_config,
             prompts.clone(),
         )?;
 
@@ -929,6 +1306,47 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         service.refresh_built_in_uv_state()?;
         Ok(service)
     }
+
+    /// Create a new authenticator service with shared storage and an agent interaction manager
+    ///
+    /// The interaction manager allows agent ceremony code to install a one-shot token
+    /// that overrides UP/UV prompts. When a matching token is present, callbacks consume
+    /// it once and return the pre-decided result. Without a token, the human notification
+    /// path is used. Token bytes are never serialized or logged.
+    #[cfg(feature = "agent")]
+    #[allow(dead_code)]
+    pub fn with_shared_storage_and_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Result<Self> {
+        let prompts = desktop_prompts();
+        let authenticator = Self::build_authenticator_with_interaction(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            uv_config,
+            prompts.clone(),
+            Some(interaction_manager),
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
+            max_uv_retries: pin_config.max_uv_retries,
+            always_uv: security_config.always_uv,
+            credential_backup_enabled: security_config.enable_credential_backup,
+            credential_backup_supported: true,
+            pending_backups: HashMap::new(),
+            pin_storage,
+            prompts,
+            notification_timeout: security_config.notification_timeout,
+        })
+    }
 }
 
 impl<
@@ -943,22 +1361,139 @@ impl<
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
         key_provider: K,
         prompts: PromptHandle,
     ) -> Result<Authenticator<PasslessCallbacks<S, P>, K>> {
-        let options = AuthenticatorOptions {
-            rk: true,
-            up: true,
-            uv: Some(true),
-            plat: false,
-            client_pin: Some(true),
-            pin_uv_auth_token: Some(true),
-            cred_mgmt: Some(true),
-            bio_enroll: None,
-            large_blobs: None,
-            ep: None,
-            always_uv: Some(security_config.always_uv),
-            make_cred_uv_not_required: Some(true),
+        #[cfg(feature = "agent")]
+        {
+            Self::build_authenticator_with_interaction_and_key_provider(
+                storage,
+                pin_storage,
+                security_config,
+                pin_config,
+                uv_config,
+                prompts,
+                None,
+                key_provider,
+            )
+        }
+        #[cfg(not(feature = "agent"))]
+        {
+            let options = AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: false,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            };
+
+            let config = AuthenticatorConfig::builder()
+                .aaguid([
+                    0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73,
+                    0x2E, 0x72, 0x73,
+                ])
+                .options(options)
+                .commands(vec![
+                    CtapCommand::MakeCredential,
+                    CtapCommand::GetAssertion,
+                    CtapCommand::GetInfo,
+                    CtapCommand::ClientPin,
+                    CtapCommand::GetNextAssertion,
+                    CtapCommand::Selection,
+                ])
+                .max_credentials(100)
+                .extensions(vec!["credProtect".to_string()])
+                .firmware_version(*VERSION)
+                .constant_sign_count(security_config.constant_signature_counter)
+                .default_credential_backup_state(if security_config.enable_credential_backup {
+                    CredentialBackupState::Eligible
+                } else {
+                    CredentialBackupState::NotEligible
+                })
+                .algorithms(vec![-7])
+                .max_pin_retries(pin_config.max_retries)
+                .auto_lock_timeout(pin_config.auto_lock_timeout)
+                .build();
+
+            let callbacks = PasslessCallbacks::with_prompts(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                uv_config,
+                prompts,
+            );
+
+            let authenticator = if let Some(ps) = pin_storage {
+                Authenticator::with_config_and_pin_storage_and_key_provider(
+                    callbacks,
+                    config,
+                    PinStorageWrapper {
+                        storage: ps,
+                        max_uv_retries: pin_config.max_uv_retries,
+                        last_uv_retries: Mutex::new(None),
+                    },
+                    key_provider,
+                )
+            } else {
+                Authenticator::with_config_and_key_provider(callbacks, config, key_provider)
+            }?;
+
+            Ok(authenticator)
+        }
+    }
+
+    #[cfg(all(feature = "tpm", feature = "agent"))]
+    fn build_authenticator_with_interaction_and_key_provider(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        prompts: PromptHandle,
+        interaction_manager: Option<Arc<AgentInteractionManager>>,
+        key_provider: K,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>, K>> {
+        let is_agent = interaction_manager.is_some();
+
+        let options = if is_agent {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(false),
+                plat: false,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(true),
+                make_cred_uv_not_required: Some(false),
+            }
+        } else {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: false,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            }
         };
 
         let config = AuthenticatorConfig::builder()
@@ -989,13 +1524,26 @@ impl<
             .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
-        let callbacks = PasslessCallbacks::with_prompts(
-            storage,
-            pin_storage.clone(),
-            security_config,
-            pin_config.clone(),
-            prompts,
-        );
+        let callbacks = match interaction_manager {
+            Some(ref mgr) => PasslessCallbacks::with_interaction_manager(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                uv_config,
+                prompts,
+                mgr.clone(),
+                is_agent,
+            ),
+            None => PasslessCallbacks::with_prompts(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                uv_config,
+                prompts,
+            ),
+        };
 
         let authenticator = if let Some(ps) = pin_storage {
             Authenticator::with_config_and_pin_storage_and_key_provider(
@@ -1023,6 +1571,7 @@ impl<
         key_provider: K,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Result<Self> {
         let storage = Arc::new(Mutex::new(storage));
         Self::with_shared_storage_and_key_provider(
@@ -1031,6 +1580,7 @@ impl<
             key_provider,
             security_config,
             pin_config,
+            uv_config,
         )
     }
 
@@ -1042,6 +1592,7 @@ impl<
         key_provider: K,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Result<Self> {
         let prompts = desktop_prompts();
         let authenticator = Self::build_authenticator_with_key_provider(
@@ -1049,6 +1600,7 @@ impl<
             pin_storage.clone(),
             security_config.clone(),
             pin_config.clone(),
+            uv_config,
             key_provider,
             prompts.clone(),
         )?;
@@ -1066,6 +1618,42 @@ impl<
         };
         service.refresh_built_in_uv_state()?;
         Ok(service)
+    }
+
+    #[cfg(all(feature = "tpm", feature = "agent"))]
+    pub fn with_shared_storage_and_key_provider_and_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        key_provider: K,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Result<Self> {
+        let prompts = desktop_prompts();
+        let authenticator = Self::build_authenticator_with_interaction_and_key_provider(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            uv_config,
+            prompts.clone(),
+            Some(interaction_manager),
+            key_provider,
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
+            max_uv_retries: pin_config.max_uv_retries,
+            always_uv: security_config.always_uv,
+            credential_backup_enabled: false,
+            credential_backup_supported: false,
+            pending_backups: HashMap::new(),
+            pin_storage,
+            prompts,
+            notification_timeout: security_config.notification_timeout,
+        })
     }
 
     fn refresh_built_in_uv_state(&mut self) -> Result<()> {
@@ -1929,6 +2517,7 @@ mod tests {
             Some(pin_storage.clone()),
             security_config,
             pin_config,
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -2013,6 +2602,7 @@ mod tests {
             None,
             security_config,
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("the human path constructs its authenticator");
 
@@ -2040,6 +2630,36 @@ mod tests {
     }
 
     #[test]
+    fn test_notification_only_cannot_satisfy_ctap_uv_even_when_up_prompts_disabled() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let credential_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&credential_dir).expect("create credential dir");
+        let storage = LocalStorageAdapter::new(credential_dir).expect("create credential storage");
+        let security = SecurityConfig {
+            user_verification_authentication: false,
+            user_verification_registration: false,
+            ..Default::default()
+        };
+        let uv = UvConfig {
+            provider: UvProviderType::Notification,
+            ..Default::default()
+        };
+        let callbacks = PasslessCallbacks::<LocalStorageAdapter, ()>::new(
+            Arc::new(Mutex::new(storage)),
+            None,
+            security,
+            PinConfig::default(),
+            uv,
+        );
+
+        assert!(matches!(
+            callbacks.request_up("authentication", None, "example.com"),
+            Ok(UpResult::Accepted)
+        ));
+        assert!(callbacks.request_uv("authentication", None, "example.com").is_err());
+    }
+
+    #[test]
     fn test_service_creation() {
         let temp_dir = std::env::temp_dir().join("test_passless");
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
@@ -2062,11 +2682,83 @@ mod tests {
         };
 
         let pin_config = PinConfig::default();
+        let uv_config = UvConfig::default();
 
-        let service = AuthenticatorService::new(storage, security_config, pin_config);
+        let service = AuthenticatorService::new(storage, security_config, pin_config, uv_config);
         assert!(service.is_ok(), "Service creation should succeed");
 
-        // Cleanup
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_service_with_custom_uv_config() {
+        let temp_dir = std::env::temp_dir().join("test_passless_uv");
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create temp directory: {}", e);
+        }
+        let storage = match LocalStorageAdapter::new(temp_dir.clone()) {
+            Ok(s) => s,
+            Err(e) => panic!("Failed to create local storage: {}", e),
+        };
+
+        let security_config = SecurityConfig {
+            check_mlock: false,
+            disable_core_dumps: false,
+            constant_signature_counter: false,
+            always_uv: false,
+            user_verification_registration: false,
+            user_verification_authentication: false,
+            notification_timeout: 30,
+            enable_credential_backup: false,
+        };
+
+        let pin_config = PinConfig::default();
+        let uv_config = UvConfig {
+            provider: passless_core::config::UvProviderType::Notification,
+            timeout_seconds: 60,
+            ..Default::default()
+        };
+
+        let service = AuthenticatorService::new(storage, security_config, pin_config, uv_config);
+        assert!(
+            service.is_ok(),
+            "Service creation with custom UV config should succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_service_with_uv_disabled() {
+        let temp_dir = std::env::temp_dir().join("test_passless_no_uv");
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create temp directory: {}", e);
+        }
+        let storage = match LocalStorageAdapter::new(temp_dir.clone()) {
+            Ok(s) => s,
+            Err(e) => panic!("Failed to create local storage: {}", e),
+        };
+
+        let security_config = SecurityConfig {
+            check_mlock: false,
+            disable_core_dumps: false,
+            constant_signature_counter: false,
+            always_uv: false,
+            user_verification_registration: false,
+            user_verification_authentication: false,
+            notification_timeout: 30,
+            enable_credential_backup: false,
+        };
+
+        let pin_config = PinConfig::default();
+        let uv_config = UvConfig::default();
+
+        let service = AuthenticatorService::new(storage, security_config, pin_config, uv_config);
+        assert!(
+            service.is_ok(),
+            "Service creation with UV disabled should succeed"
+        );
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -2087,6 +2779,7 @@ mod tests {
             Some(pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -2199,6 +2892,7 @@ mod tests {
             Some(pin_storage),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -2246,6 +2940,7 @@ mod tests {
                 Some(pin_storage.clone()),
                 SecurityConfig::default(),
                 PinConfig::default(),
+                UvConfig::default(),
             )
             .expect("create authenticator service");
 
@@ -2300,6 +2995,7 @@ mod tests {
             Some(pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -2380,6 +3076,7 @@ mod tests {
             Some(pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -2419,6 +3116,7 @@ mod tests {
             None::<Arc<Mutex<()>>>,
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -2449,6 +3147,7 @@ mod tests {
             None::<Arc<Mutex<()>>>,
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("Service creation should succeed");
 
@@ -2658,6 +3357,51 @@ mod tests {
             let last = wrapper.last_uv_retries.lock().unwrap();
             assert!(last.is_some());
         }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_delegated_pin_storage_arc_identity() {
+        use crate::pin_storage::local::LocalPinStorage;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_delegated_pin_identity");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let cred_temp = temp_dir.join("creds");
+        std::fs::create_dir_all(&cred_temp).unwrap();
+        let cred_storage: Arc<Mutex<Box<dyn CredentialStorage>>> = Arc::new(Mutex::new(Box::new(
+            LocalStorageAdapter::new(cred_temp).unwrap(),
+        )));
+
+        let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
+            Arc::new(Mutex::new(Box::new(LocalPinStorage::new(temp_dir.clone()))));
+
+        let human_pin_storage_clone = pin_storage.clone();
+
+        let security_config = SecurityConfig::default();
+        let pin_config = PinConfig::default();
+        let interaction_manager =
+            Arc::new(crate::agent::interaction::AgentInteractionManager::new());
+
+        let service = AuthenticatorService::with_shared_storage_and_interaction(
+            cred_storage,
+            Some(pin_storage.clone()),
+            security_config,
+            pin_config,
+            UvConfig::default(),
+            interaction_manager,
+        )
+        .expect("Service creation should succeed");
+
+        let _ = &service.authenticator;
+
+        assert!(
+            Arc::ptr_eq(&pin_storage, &human_pin_storage_clone),
+            "delegated service must share the same Arc<Mutex<PinStorage>> as human"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -2999,6 +3743,7 @@ mod tests {
             Some(Arc::new(Mutex::new(TestPinStorage::new(state)))),
             security_config,
             pin_config,
+            UvConfig::default(),
         )
         .expect("create authenticator service");
         (service, temp_dir)
@@ -3992,6 +4737,7 @@ mod tests {
                         max_uv_retries: MAX_RETRIES,
                         ..Default::default()
                     },
+                    UvConfig::default(),
                 )
                 .expect("create authenticator service");
                 let verifications = Arc::new(Mutex::new(0));
@@ -4329,6 +5075,7 @@ mod protected_credential_tests {
             None,
             security_config(always_uv),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create human authenticator service")
     }
@@ -4344,6 +5091,7 @@ mod protected_credential_tests {
             Some(Arc::new(Mutex::new(FixedPinStorage(pin_state)))),
             security_config(always_uv),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("create human authenticator service")
     }

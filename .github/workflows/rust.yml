@@ -47,6 +47,32 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --all-features -- --deny warnings
 
+  face-tests:
+    name: Face feature (headless, no webcam)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libtss2-dev libv4l-dev
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+
+      - name: Check locked dependencies
+        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+
+      - name: Build face feature
+        run: cargo check --locked -p passless-rs --features face
+
+      - name: Run headless face tests
+        run: cargo test --locked -p passless-rs --features face --bin passless
+
   agent-validation:
     name: Agent validation (deterministic)
     runs-on: ubuntu-26.04
@@ -189,8 +215,8 @@ jobs:
       - name: Update apt
         run: sudo apt update
 
-      - name: Install udev and tss2
-        run: sudo apt-get install -y libudev-dev libtss2-dev
+      - name: Install udev, tss2 and software TPM
+        run: sudo apt-get install -y libudev-dev libtss2-dev swtpm
 
       - name: Install Rust toolchain
         shell: bash
@@ -201,11 +227,11 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cargo build --verbose
+        run: cargo build --verbose --features tpm
 
       - name: Run tests
         shell: bash
-        run: cargo test --verbose
+        run: cargo test --verbose --features tpm
 
       - name: Extract crate information
         shell: bash
@@ -237,8 +263,8 @@ jobs:
       - name: Update apt
         run: sudo apt update
 
-      - name: Install udev and tss2
-        run: sudo apt-get install -y libudev-dev libtss2-dev
+      - name: Install udev, tss2 and software TPM
+        run: sudo apt-get install -y libudev-dev libtss2-dev swtpm
 
       - name: Install Rust toolchain
         shell: bash

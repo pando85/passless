@@ -20,7 +20,7 @@ use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, BrowserScope, DaemonStatus,
     GrantId, PrincipalSessionId, ProfileId,
 };
-use passless_core::config::SecurityConfig;
+use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
 use super::audit::AuditGate;
 use super::audit_events::{
@@ -67,6 +67,8 @@ pub struct RuntimeStartParams<'a> {
     pub human_backend_kind: BackendKind,
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
+    pub pin_config: PinConfig,
+    pub uv_config: UvConfig,
     pub shutdown: Arc<AtomicBool>,
     /// Where a policy reload re-reads the configuration from. `None` disables reload.
     pub config_source: Option<AgentConfigSource>,
@@ -92,6 +94,27 @@ impl AgentConfigSource {
             .map_err(|e| e.format_cli())?;
         Ok(config)
     }
+}
+
+#[derive(Clone)]
+pub struct EndpointSpec {
+    pub profile_name: String,
+    pub profile_id: ProfileId,
+    pub mode: AgentMode,
+    pub profile_config: AgentProfileConfig,
+    pub security_config: SecurityConfig,
+    pub pin_config: PinConfig,
+    pub uv_config: UvConfig,
+    pub interaction_manager: Arc<AgentInteractionManager>,
+    pub preparation_slot: Arc<CeremonyPreparationSlot>,
+    pub operation_lock: Arc<Mutex<()>>,
+    pub policy_runtime: Arc<PolicyRuntime>,
+    pub audit_gate: Arc<AuditGate>,
+    pub event_tx: EndpointEventSender,
+    pub endpoint_factory: Option<EndpointFactory>,
+    #[cfg(test)]
+    pub test_transport_factory: Option<TestTransportFactory>,
+    pub isolated_deps: Option<IsolatedEndpointDeps>,
 }
 
 /// Open the granted-rules store under the effective `agents.state_dir`. Without a state directory
@@ -967,6 +990,8 @@ impl AgentRuntime {
         human_backend_kind: BackendKind,
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
         shutdown: Arc<AtomicBool>,
         config_source: Option<AgentConfigSource>,
         human_path_automatic: bool,
@@ -979,6 +1004,8 @@ impl AgentRuntime {
             human_backend_kind,
             agent_config,
             security_config,
+            pin_config,
+            uv_config,
             shutdown,
             config_source,
             human_path_automatic,
@@ -994,6 +1021,8 @@ impl AgentRuntime {
             human_backend_kind,
             agent_config,
             security_config,
+            pin_config,
+            uv_config,
             shutdown,
             config_source,
             human_path_automatic,
@@ -1383,8 +1412,37 @@ impl AgentRuntime {
                 RuntimeError::Audit(format!("profile '{}' create audit: {}", name, e))
             })?;
 
-            let backend_result: Result<CredentialBackendHandle, RuntimeError> = match profile.mode {
-                AgentMode::SameUser => Ok(human_backend.clone()),
+            let preparation_slot = Arc::new(CeremonyPreparationSlot::new());
+            let interaction_manager = Arc::new(AgentInteractionManager::new());
+
+            let spec_result: Result<
+                (EndpointSpec, CeremonyScope, CredentialBackendHandle),
+                RuntimeError,
+            > = match profile.mode {
+                AgentMode::SameUser => {
+                    let ceremony_scope = CeremonyScope::new();
+                    let backend = human_backend.clone();
+                    let spec = EndpointSpec {
+                        profile_name: name.clone(),
+                        profile_id: profile_id.clone(),
+                        mode: AgentMode::SameUser,
+                        profile_config: profile.clone(),
+                        security_config: security_config.clone(),
+                        pin_config: pin_config.clone(),
+                        uv_config: uv_config.clone(),
+                        interaction_manager: interaction_manager.clone(),
+                        preparation_slot: preparation_slot.clone(),
+                        operation_lock: backend.operation_lock.clone(),
+                        policy_runtime: policy_runtime.clone(),
+                        audit_gate: audit_gate.clone(),
+                        event_tx: event_tx.clone(),
+                        endpoint_factory: endpoint_factory.clone(),
+                        #[cfg(test)]
+                        test_transport_factory: None,
+                        isolated_deps: None,
+                    };
+                    Ok((spec, ceremony_scope, backend))
+                }
                 AgentMode::Isolated => {
                     let storage_config = profile.storage.as_ref().ok_or_else(|| {
                         RuntimeError::Config(format!(
@@ -1411,52 +1469,129 @@ impl AgentRuntime {
                         bundle.credential_storage.clone(),
                         bundle.pin_storage.clone(),
                         key_provider,
-                        Arc::new(Mutex::new(())),
-                    ))
+                        operation_lock.clone(),
+                    );
+                    let ceremony_scope = CeremonyScope::new();
+
+                    let effective_pin_config = if profile.requires_human_uv() {
+                        let mut cfg = pin_config.clone();
+                        cfg.enforcement = passless_core::config::PinEnforcement::Required;
+                        cfg
+                    } else {
+                        pin_config.clone()
+                    };
+
+                    let spec = EndpointSpec {
+                        profile_name: name.clone(),
+                        profile_id: profile_id.clone(),
+                        mode: AgentMode::Isolated,
+                        profile_config: profile.clone(),
+                        security_config: security_config.clone(),
+                        pin_config: effective_pin_config,
+                        uv_config: uv_config.clone(),
+                        interaction_manager: interaction_manager.clone(),
+                        preparation_slot: preparation_slot.clone(),
+                        operation_lock,
+                        policy_runtime: policy_runtime.clone(),
+                        audit_gate: audit_gate.clone(),
+                        event_tx: event_tx.clone(),
+                        endpoint_factory: endpoint_factory.clone(),
+                        #[cfg(test)]
+                        test_transport_factory: None,
+                        isolated_deps: Some(IsolatedEndpointDeps {
+                            credential_storage: bundle.credential_storage.clone(),
+                            pin_storage: bundle.pin_storage.clone(),
+                            ceremony_scope: ceremony_scope.clone(),
+                            #[cfg(feature = "tpm")]
+                            tpm_key_provider: Arc::new(Mutex::new(bundle.tpm_key_provider)),
+                        }),
+                    };
+
+                    Ok((spec, ceremony_scope, backend))
                 }
             };
-            let backend = match backend_result {
-                Ok(backend) => backend,
+            match spec_result {
+                Ok((spec, _ceremony_scope, backend)) => {
+                    let initial_endpoint_id = match profile.mode {
+                        AgentMode::SameUser => Some(EndpointId::new()),
+                        AgentMode::Isolated => {
+                            match Self::create_endpoint_from_spec(
+                                &spec,
+                                &mut endpoint_manager.lock().unwrap(),
+                            ) {
+                                Ok(eid) => {
+                                    created_endpoint_ids.push(eid.clone());
+                                    Some(eid)
+                                }
+                                Err(e) => {
+                                    let fail_event = ProfileFailBuilder::new(
+                                        profile_id.clone(),
+                                        FailReason::InternalError,
+                                    )
+                                    .build();
+                                    let _ = audit_gate.record(fail_event);
+
+                                    let mut em = endpoint_manager.lock().unwrap();
+                                    for eid in &created_endpoint_ids {
+                                        em.cancel(eid);
+                                        let _ = em.destroy(eid, Some(Duration::from_secs(2)));
+                                    }
+
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    };
+
+                    profiles.insert(
+                        profile_id.clone(),
+                        ProfileRuntime {
+                            profile_name: name.clone(),
+                            profile_id: profile_id.clone(),
+                            uid: resolved.uid,
+                            gid: resolved.gid,
+                            endpoint_id: Mutex::new(initial_endpoint_id),
+                            lifecycle_lock: Mutex::new(()),
+                            endpoint_spec: spec,
+                            preparation_slot,
+                            operation_lock: backend.operation_lock.clone(),
+                            mode: profile.mode,
+                            profile_config: profile.clone(),
+                            current_pending: Mutex::new(None),
+                            active_browser: Mutex::new(HashMap::new()),
+                            shared_browsers: Mutex::new(HashMap::new()),
+                            daemon_uid,
+                            daemon_gid,
+                            browser_uid,
+                            browser_gid,
+                            enabled: AtomicBool::new(true),
+                            credential_storage: backend.credential_storage.clone(),
+                            backend,
+                        },
+                    );
+                }
                 Err(e) => {
                     let fail_event =
                         ProfileFailBuilder::new(profile_id.clone(), FailReason::InternalError)
                             .build();
                     let _ = audit_gate.record(fail_event);
+
+                    let mut em = endpoint_manager.lock().unwrap();
+                    for eid in &created_endpoint_ids {
+                        em.cancel(eid);
+                        let _ = em.destroy(eid, Some(Duration::from_secs(2)));
+                    }
+
                     return Err(e);
                 }
-            };
-
-            profiles.insert(
-                profile_id.clone(),
-                ProfileRuntime {
-                    profile_name: name.clone(),
-                    profile_id: profile_id.clone(),
-                    uid: resolved.uid,
-                    gid: resolved.gid,
-                    lifecycle_lock: Mutex::new(()),
-                    security_config: security_config.clone(),
-                    operation_lock: backend.operation_lock.clone(),
-                    mode: profile.mode,
-                    backend_kind: profile_backend_kind(
-                        profile.mode,
-                        human_backend_kind,
-                        profile.storage.as_ref(),
-                    ),
-                    profile_config: profile.clone(),
-                    active_browser: Mutex::new(HashMap::new()),
-                    shared_browsers: Mutex::new(HashMap::new()),
-                    daemon_uid,
-                    daemon_gid,
-                    browser_uid,
-                    browser_gid,
-                    enabled: AtomicBool::new(true),
-                    credential_storage: backend.credential_storage.clone(),
-                    backend,
-                },
-            );
+            }
         }
 
-        info!("Agent runtime started with {} profile(s)", profiles.len());
+        info!(
+            "Agent runtime started with {} profile(s), {} endpoint(s)",
+            profiles.len(),
+            created_endpoint_ids.len()
+        );
 
         let mut managed_sessions = BTreeMap::new();
         for profile_id in profiles.keys() {
@@ -1464,6 +1599,7 @@ impl AgentRuntime {
         }
 
         let runtime = Arc::new(Self {
+            endpoint_manager,
             ipc_server: ipc_server.clone(),
             audit_gate,
             policy_runtime,
@@ -1471,6 +1607,7 @@ impl AgentRuntime {
             profiles,
             managed_sessions,
             completed_sessions: Mutex::new(BTreeMap::new()),
+            event_rx: Mutex::new(event_rx),
             shutdown: shutdown.clone(),
             shutdown_requested: AtomicBool::new(false),
             runtime_cleanup_started: AtomicBool::new(false),
@@ -1503,6 +1640,491 @@ impl AgentRuntime {
         *runtime.runtime_loop.lock().unwrap() = Some(loop_handle);
 
         Ok(runtime)
+    }
+
+    #[cfg(feature = "agent")]
+    fn create_endpoint_from_spec(
+        spec: &EndpointSpec,
+        endpoint_manager: &mut EndpointManager,
+    ) -> Result<EndpointId, RuntimeError> {
+        use crate::ServiceHandler;
+
+        let name = &spec.profile_name;
+        let profile_id = &spec.profile_id;
+        let _grant_ttl_secs = spec
+            .profile_config
+            .max_grant_ttl
+            .as_ref()
+            .map(|d| d.as_secs())
+            .unwrap_or(60);
+        let _session_ttl_secs = spec
+            .profile_config
+            .max_session_ttl
+            .as_ref()
+            .map(|d| d.as_secs())
+            .unwrap_or(300);
+        let require_uv = spec.profile_config.rules.is_empty() && spec.profile_config.require_uv;
+
+        let binding = EndpointBinding {
+            profile_id: profile_id.clone(),
+            mode: spec.mode,
+        };
+
+        let device_identity_clone = spec.profile_config.device.clone();
+        let endpoint_factory_clone = spec.endpoint_factory.clone();
+        let device_factory = move || -> Result<RawUhidDevice, String> {
+            if let Some(ref factory) = endpoint_factory_clone {
+                factory(&device_identity_clone)
+            } else {
+                let identity = passless_uhid::DeviceIdentity::new(
+                    device_identity_clone.name.clone(),
+                    device_identity_clone.phys.clone(),
+                    device_identity_clone.uniq.clone(),
+                    device_identity_clone.vendor_id as u32,
+                    device_identity_clone.product_id as u32,
+                    0,
+                );
+                RawUhidDevice::create(identity)
+                    .map_err(|e| format!("failed to create device: {:?}", e))
+            }
+        };
+
+        let profile_id_inner = profile_id.clone();
+        let event_tx_inner = spec.event_tx.clone();
+        let profile_id_for_hooks = profile_id.clone();
+        let generated_endpoint_for_hooks = Arc::new(Mutex::new(None::<EndpointId>));
+        let generated_endpoint_for_factory = generated_endpoint_for_hooks.clone();
+        let policy_runtime_inner = spec.policy_runtime.clone();
+        let audit_gate_inner = spec.audit_gate.clone();
+        let preparation_slot_inner = spec.preparation_slot.clone();
+        let interaction_manager_inner = spec.interaction_manager.clone();
+
+        match spec.mode {
+            AgentMode::SameUser => Err(RuntimeError::Config(format!(
+                "profile '{}': same-user mode does not create an agent UHID endpoint",
+                name
+            ))),
+            AgentMode::Isolated => {
+                let deps = spec.isolated_deps.as_ref().ok_or_else(|| {
+                    RuntimeError::Config(format!(
+                        "profile '{}': isolated spec missing isolated_deps",
+                        name
+                    ))
+                })?;
+
+                let rp_ids = spec.profile_config.allowed_rp_ids();
+                let registration_allowed = spec.profile_config.allows_registration();
+
+                let mut scoped_storage = IsolatedScopedStorage::new(
+                    ForwardingStorageHandle::new(deps.credential_storage.clone()),
+                    deps.ceremony_scope.clone(),
+                    rp_ids,
+                    registration_allowed,
+                );
+                scoped_storage.build_index().map_err(|e| {
+                    RuntimeError::Storage(format!(
+                        "profile '{}': failed to build index: {}",
+                        name, e
+                    ))
+                })?;
+
+                let ceremony_scope_inner = deps.ceremony_scope.clone();
+                let op_lock_for_ctx = spec.operation_lock.clone();
+                let prompt_mode = PromptMode::Isolated;
+
+                let audit_gate_for_before_start = spec.audit_gate.clone();
+                let profile_id_for_before_start = profile_id.clone();
+                let name_for_before_start = name.clone();
+
+                #[cfg(feature = "tpm")]
+                let has_tpm_key_provider = deps.tpm_key_provider.lock().unwrap().is_some();
+                #[cfg(not(feature = "tpm"))]
+                let has_tpm_key_provider = false;
+
+                if has_tpm_key_provider {
+                    #[cfg(feature = "tpm")]
+                    {
+                        let provider = deps.tpm_key_provider.lock().unwrap().take().unwrap();
+                        let service =
+                            AuthenticatorService::with_shared_storage_and_key_provider_and_interaction(
+                                Arc::new(Mutex::new(scoped_storage)),
+                                Some(deps.pin_storage.clone()),
+                                provider,
+                                spec.security_config.clone(),
+                                spec.pin_config.clone(),
+                                spec.uv_config.clone(),
+                                spec.interaction_manager.clone(),
+                            )
+                            .map_err(|e| {
+                                RuntimeError::Service(format!(
+                                    "profile '{}': failed to create authenticator service with TPM key provider: {}",
+                                    name, e
+                                ))
+                            })?;
+
+                        let profile_id_for_tpm = profile_id_for_before_start.clone();
+                        let audit_gate_for_tpm = audit_gate_for_before_start.clone();
+                        let name_for_tpm = name_for_before_start.clone();
+                        let name_for_err = name_for_before_start.clone();
+
+                        let endpoint_id = endpoint_manager
+                            .create_and_start_full(
+                                binding,
+                                name.to_string(),
+                                move |generated_endpoint_id: &EndpointId| {
+                                    *generated_endpoint_for_factory.lock().unwrap() =
+                                        Some(generated_endpoint_id.clone());
+                                    let service_handler = ServiceHandler::new(service);
+
+                                    let prompt_handle: Arc<dyn PromptHandle> =
+                                        Arc::new(DesktopPromptHandle::default_config());
+
+                                    let ceremony_context =
+                                        StaticCeremonyContext::new(StaticCeremonyContextConfig {
+                                            profile_id: profile_id_for_tpm.clone(),
+                                            endpoint_id: generated_endpoint_id.clone(),
+                                            mode: prompt_mode,
+                                            policy_runtime: policy_runtime_inner.clone(),
+                                            audit_gate: audit_gate_for_tpm.clone(),
+                                            ceremony_scope: ceremony_scope_inner.clone(),
+                                            require_uv,
+                                            prompt_handle,
+                                            preparation_slot: preparation_slot_inner.clone(),
+                                        })
+                                        .with_interaction_manager(interaction_manager_inner.clone())
+                                        .with_operation_lock(op_lock_for_ctx.clone());
+
+                                    AgentCeremonyHandler::new(service_handler, ceremony_context)
+                                },
+                                device_factory,
+                                WorkerHooks {
+                                    on_response_sent: Some(Box::new(move || {
+                                        if let Some(endpoint_id) =
+                                            generated_endpoint_for_hooks.lock().unwrap().clone()
+                                        {
+                                            let _ =
+                                                event_tx_inner.send(EndpointEvent::ResponseSent {
+                                                    endpoint_id,
+                                                    profile_id: profile_id_for_hooks.clone(),
+                                                });
+                                        }
+                                    })),
+                                },
+                                Some(Box::new(move |eid: &EndpointId| {
+                                    let create_event = EndpointCreateBuilder::new(
+                                        eid.clone(),
+                                        profile_id_for_before_start.clone(),
+                                    )
+                                    .build();
+                                    audit_gate_for_before_start.record(create_event).map_err(
+                                        |e| {
+                                            format!(
+                                                "profile '{}' endpoint create audit failed: {}",
+                                                name_for_tpm, e
+                                            )
+                                        },
+                                    )?;
+                                    Ok(())
+                                })),
+                            )
+                            .map_err(|e| {
+                                RuntimeError::Endpoint(format!("profile '{}': {}", name_for_err, e))
+                            })?;
+
+                        info!(
+                            "Profile '{}' {:?} endpoint created: {}",
+                            name, spec.mode, endpoint_id
+                        );
+
+                        return Ok(endpoint_id);
+                    }
+                    #[cfg(not(feature = "tpm"))]
+                    {
+                        unreachable!()
+                    }
+                }
+
+                let service = AuthenticatorService::with_shared_storage_and_interaction(
+                    Arc::new(Mutex::new(scoped_storage)),
+                    Some(deps.pin_storage.clone()),
+                    spec.security_config.clone(),
+                    spec.pin_config.clone(),
+                    spec.uv_config.clone(),
+                    spec.interaction_manager.clone(),
+                )
+                .map_err(|e| {
+                    RuntimeError::Service(format!(
+                        "profile '{}': failed to create authenticator service: {}",
+                        name, e
+                    ))
+                })?;
+
+                let endpoint_id = endpoint_manager
+                    .create_and_start_full(
+                        binding,
+                        name.to_string(),
+                        move |generated_endpoint_id: &EndpointId| {
+                            *generated_endpoint_for_factory.lock().unwrap() =
+                                Some(generated_endpoint_id.clone());
+                            let service_handler = ServiceHandler::new(service);
+
+                            let prompt_handle: Arc<dyn PromptHandle> =
+                                Arc::new(DesktopPromptHandle::default_config());
+
+                            let ceremony_context =
+                                StaticCeremonyContext::new(StaticCeremonyContextConfig {
+                                    profile_id: profile_id_inner.clone(),
+                                    endpoint_id: generated_endpoint_id.clone(),
+                                    mode: prompt_mode,
+                                    policy_runtime: policy_runtime_inner.clone(),
+                                    audit_gate: audit_gate_inner.clone(),
+                                    ceremony_scope: ceremony_scope_inner.clone(),
+                                    require_uv,
+                                    prompt_handle,
+                                    preparation_slot: preparation_slot_inner.clone(),
+                                })
+                                .with_interaction_manager(interaction_manager_inner.clone())
+                                .with_operation_lock(op_lock_for_ctx.clone());
+
+                            AgentCeremonyHandler::new(service_handler, ceremony_context)
+                        },
+                        device_factory,
+                        WorkerHooks {
+                            on_response_sent: Some(Box::new(move || {
+                                if let Some(endpoint_id) =
+                                    generated_endpoint_for_hooks.lock().unwrap().clone()
+                                {
+                                    let _ = event_tx_inner.send(EndpointEvent::ResponseSent {
+                                        endpoint_id,
+                                        profile_id: profile_id_for_hooks.clone(),
+                                    });
+                                }
+                            })),
+                        },
+                        Some(Box::new(move |eid: &EndpointId| {
+                            let create_event = EndpointCreateBuilder::new(
+                                eid.clone(),
+                                profile_id_for_before_start.clone(),
+                            )
+                            .build();
+                            audit_gate_for_before_start
+                                .record(create_event)
+                                .map_err(|e| {
+                                    format!(
+                                        "profile '{}' endpoint create audit failed: {}",
+                                        name_for_before_start, e
+                                    )
+                                })?;
+                            Ok(())
+                        })),
+                    )
+                    .map_err(|e| RuntimeError::Endpoint(format!("profile '{}': {}", name, e)))?;
+
+                info!(
+                    "Profile '{}' {:?} endpoint created: {}",
+                    name, spec.mode, endpoint_id
+                );
+
+                Ok(endpoint_id)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "agent"))]
+    fn create_endpoint_from_spec(
+        _spec: &EndpointSpec,
+        _endpoint_manager: &mut EndpointManager,
+    ) -> Result<EndpointId, RuntimeError> {
+        Err(RuntimeError::Config(
+            "agent feature not enabled".to_string(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn create_endpoint_from_spec_with_test_transport(
+        spec: &EndpointSpec,
+        endpoint_manager: &mut EndpointManager,
+    ) -> Result<EndpointId, RuntimeError> {
+        use crate::ServiceHandler;
+
+        let name = &spec.profile_name;
+        let profile_id = &spec.profile_id;
+        let _grant_ttl_secs = spec
+            .profile_config
+            .max_grant_ttl
+            .as_ref()
+            .map(|d| d.as_secs())
+            .unwrap_or(60);
+        let _session_ttl_secs = spec
+            .profile_config
+            .max_session_ttl
+            .as_ref()
+            .map(|d| d.as_secs())
+            .unwrap_or(300);
+        let require_uv = spec.profile_config.rules.is_empty() && spec.profile_config.require_uv;
+
+        let binding = super::device::EndpointBinding {
+            profile_id: profile_id.clone(),
+            mode: spec.mode,
+        };
+
+        let test_transport_factory = spec.test_transport_factory.clone().ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "profile '{}': test_transport_factory not set for test endpoint creation",
+                name
+            ))
+        })?;
+
+        let profile_id_inner = profile_id.clone();
+        let event_tx_inner = spec.event_tx.clone();
+        let profile_id_for_hooks = profile_id.clone();
+        let generated_endpoint_for_hooks = Arc::new(Mutex::new(None::<EndpointId>));
+        let generated_endpoint_for_factory = generated_endpoint_for_hooks.clone();
+        let policy_runtime_inner = spec.policy_runtime.clone();
+        let audit_gate_inner = spec.audit_gate.clone();
+        let preparation_slot_inner = spec.preparation_slot.clone();
+        let interaction_manager_inner = spec.interaction_manager.clone();
+
+        match spec.mode {
+            AgentMode::SameUser => Err(RuntimeError::Config(format!(
+                "profile '{}': same-user mode does not create an agent UHID endpoint",
+                name
+            ))),
+            AgentMode::Isolated => {
+                let deps = spec.isolated_deps.as_ref().ok_or_else(|| {
+                    RuntimeError::Config(format!(
+                        "profile '{}': isolated spec missing isolated_deps",
+                        name
+                    ))
+                })?;
+
+                let rp_ids = spec.profile_config.allowed_rp_ids();
+                let registration_allowed = spec.profile_config.allows_registration();
+
+                let mut scoped_storage = super::storage::IsolatedScopedStorage::new(
+                    super::storage::ForwardingStorageHandle::new(deps.credential_storage.clone()),
+                    deps.ceremony_scope.clone(),
+                    rp_ids,
+                    registration_allowed,
+                );
+                scoped_storage.build_index().map_err(|e| {
+                    RuntimeError::Storage(format!(
+                        "profile '{}': failed to build index: {}",
+                        name, e
+                    ))
+                })?;
+
+                let service =
+                    crate::authenticator::AuthenticatorService::with_shared_storage_and_interaction(
+                        Arc::new(Mutex::new(scoped_storage)),
+                        Some(deps.pin_storage.clone()),
+                        spec.security_config.clone(),
+                        spec.pin_config.clone(),
+                        spec.uv_config.clone(),
+                        spec.interaction_manager.clone(),
+                    )
+                    .map_err(|e| {
+                        RuntimeError::Service(format!(
+                            "profile '{}': failed to create authenticator service: {}",
+                            name, e
+                        ))
+                    })?;
+
+                let ceremony_scope_inner = deps.ceremony_scope.clone();
+                let op_lock_for_ctx = spec.operation_lock.clone();
+                let prompt_mode = super::prompt::PromptMode::Isolated;
+
+                let audit_gate_for_before_start = spec.audit_gate.clone();
+                let profile_id_for_before_start = profile_id.clone();
+                let name_for_before_start = name.clone();
+
+                let endpoint_id = endpoint_manager
+                    .create_and_start_with_transport_full(
+                        binding,
+                        name.to_string(),
+                        move |generated_endpoint_id: &EndpointId| {
+                            *generated_endpoint_for_factory.lock().unwrap() =
+                                Some(generated_endpoint_id.clone());
+                            let service_handler = ServiceHandler::new(service);
+
+                            let prompt_handle: Arc<dyn super::prompt::PromptHandle> =
+                                Arc::new(super::prompt::DesktopPromptHandle::default_config());
+
+                            let ceremony_context = super::ceremony::StaticCeremonyContext::new(
+                                super::ceremony::StaticCeremonyContextConfig {
+                                    profile_id: profile_id_inner.clone(),
+                                    endpoint_id: generated_endpoint_id.clone(),
+                                    mode: prompt_mode,
+                                    policy_runtime: policy_runtime_inner.clone(),
+                                    audit_gate: audit_gate_inner.clone(),
+                                    ceremony_scope: ceremony_scope_inner.clone(),
+                                    require_uv,
+                                    prompt_handle,
+                                    preparation_slot: preparation_slot_inner.clone(),
+                                },
+                            )
+                            .with_interaction_manager(interaction_manager_inner.clone())
+                            .with_operation_lock(op_lock_for_ctx.clone());
+
+                            super::ceremony::AgentCeremonyHandler::new(
+                                service_handler,
+                                ceremony_context,
+                            )
+                        },
+                        move || {
+                            test_transport_factory()
+                                .map_err(|e| format!("test transport factory failed: {}", e))
+                        },
+                        crate::worker::WorkerHooks {
+                            on_response_sent: Some(Box::new(move || {
+                                if let Some(endpoint_id) =
+                                    generated_endpoint_for_hooks.lock().unwrap().clone()
+                                {
+                                    let _ = event_tx_inner.send(EndpointEvent::ResponseSent {
+                                        endpoint_id,
+                                        profile_id: profile_id_for_hooks.clone(),
+                                    });
+                                }
+                            })),
+                        },
+                        Some(Box::new(move |eid: &EndpointId| {
+                            let create_event = super::audit_events::EndpointCreateBuilder::new(
+                                eid.clone(),
+                                profile_id_for_before_start.clone(),
+                            )
+                            .build();
+                            audit_gate_for_before_start
+                                .record(create_event)
+                                .map_err(|e| {
+                                    format!(
+                                        "profile '{}' endpoint create audit failed: {}",
+                                        name_for_before_start, e
+                                    )
+                                })?;
+                            Ok(())
+                        })),
+                    )
+                    .map_err(|e| RuntimeError::Endpoint(format!("profile '{}': {}", name, e)))?;
+
+                Ok(endpoint_id)
+            }
+        }
+    }
+
+    fn create_profile_endpoint(&self, spec: &EndpointSpec) -> Result<EndpointId, RuntimeError> {
+        #[cfg(test)]
+        {
+            if spec.test_transport_factory.is_some() {
+                let eid = Self::create_endpoint_from_spec_with_test_transport(
+                    spec,
+                    &mut self.endpoint_manager.lock().unwrap(),
+                )?;
+                return Ok(eid);
+            }
+        }
+        let eid =
+            Self::create_endpoint_from_spec(spec, &mut self.endpoint_manager.lock().unwrap())?;
+        Ok(eid)
     }
 
     fn runtime_loop(self: &Arc<Self>) {
@@ -5410,6 +6032,525 @@ register = "deny"
         };
         assert_eq!(lease.lease_id, lease_id);
         assert_eq!(lease.session_id, session_id);
+    }
+
+    #[test]
+    fn endpoint_id_mutex_can_store_and_retrieve() {
+        let eid: Mutex<Option<EndpointId>> = Mutex::new(None);
+        let new_id = EndpointId::new();
+        *eid.lock().unwrap() = Some(new_id.clone());
+        assert_eq!(eid.lock().unwrap().as_ref().unwrap(), &new_id);
+    }
+
+    #[test]
+    fn endpoint_id_mutex_take_clears_to_none() {
+        let eid: Mutex<Option<EndpointId>> = Mutex::new(Some(EndpointId::new()));
+        let taken = eid.lock().unwrap().take();
+        assert!(taken.is_some());
+        assert!(eid.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn lifecycle_lock_is_independent_of_endpoint_id() {
+        let lifecycle_lock: Mutex<()> = Mutex::new(());
+        let eid: Mutex<Option<EndpointId>> = Mutex::new(None);
+
+        {
+            let _lifecycle = lifecycle_lock.lock().unwrap();
+            assert!(eid.lock().unwrap().is_none());
+            *eid.lock().unwrap() = Some(EndpointId::new());
+        }
+
+        {
+            let _lifecycle = lifecycle_lock.lock().unwrap();
+            assert!(eid.lock().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn stale_endpoint_event_ignored() {
+        let current_eid = EndpointId::new();
+        let stale_eid = EndpointId::new();
+        assert_ne!(current_eid, stale_eid);
+
+        let eid_mutex: Mutex<Option<EndpointId>> = Mutex::new(Some(current_eid.clone()));
+
+        let matches = {
+            let guard = eid_mutex.lock().unwrap();
+            matches!(guard.as_ref(), Some(eid) if *eid == stale_eid)
+        };
+        assert!(!matches, "stale endpoint ID should not match current");
+    }
+
+    #[test]
+    fn endpoint_spec_clone_is_independent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let audit_dir = temp_dir.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let spec1 = EndpointSpec {
+            profile_name: "test".to_string(),
+            profile_id: ProfileId::new("test").unwrap(),
+            mode: AgentMode::Isolated,
+            profile_config: passless_core::agent::AgentProfileConfig {
+                max_operations: 64,
+                max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
+                credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                human_verification_prompt:
+                    passless_core::agent::config::HumanVerificationPrompt::Always,
+                mode: AgentMode::Isolated,
+                principal_user: "testuser".to_string(),
+                rp_ids: vec!["example.com".to_string()],
+                require_uv: false,
+                credential_refs: None,
+                max_grant_ttl: None,
+                max_session_ttl: None,
+                storage: None,
+                registration_allowed: false,
+                rules: vec![],
+                device: passless_core::agent::DeviceIdentity {
+                    name: "test".to_string(),
+                    phys: "test".to_string(),
+                    uniq: "test".to_string(),
+                    vendor_id: 0x1234,
+                    product_id: 0x5678,
+                },
+                start_url: None,
+                browser_command: None,
+                browser_user: None,
+                browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
+            },
+            security_config: SecurityConfig::default(),
+            pin_config: PinConfig::default(),
+            uv_config: UvConfig::default(),
+            interaction_manager: Arc::new(super::super::interaction::AgentInteractionManager::new()),
+            preparation_slot: Arc::new(super::super::ceremony::CeremonyPreparationSlot::new()),
+            operation_lock: Arc::new(Mutex::new(())),
+            policy_runtime: {
+                let clock: Arc<dyn super::super::browser::Clock> =
+                    Arc::new(super::super::browser::SystemClock);
+                let monotonic_clock: Arc<dyn super::super::intent::MonotonicClock> =
+                    Arc::new(super::super::intent::SystemClock::new());
+                let config = passless_core::agent::AgentConfig::default();
+                Arc::new(
+                    super::super::policy_engine::PolicyRuntime::new(
+                        &config,
+                        clock,
+                        monotonic_clock,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            },
+            audit_gate: Arc::new(super::super::audit::AuditGate::open(&audit_dir).unwrap()),
+            event_tx: {
+                let (tx, _rx) = mpsc::channel();
+                tx
+            },
+            endpoint_factory: None,
+            test_transport_factory: None,
+            isolated_deps: None,
+        };
+
+        let spec2 = spec1.clone();
+        assert_eq!(spec1.profile_name, spec2.profile_name);
+        assert_eq!(spec1.profile_id, spec2.profile_id);
+        assert_eq!(spec1.mode, spec2.mode);
+    }
+
+    #[test]
+    fn no_duplicate_endpoint_under_concurrent_lifecycle_lock() {
+        use std::sync::atomic::AtomicUsize;
+
+        let lifecycle_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let eid: Arc<Mutex<Option<EndpointId>>> = Arc::new(Mutex::new(None));
+        let create_count = Arc::new(AtomicUsize::new(0));
+
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let lock = lifecycle_lock.clone();
+                let eid_mutex = eid.clone();
+                let count = create_count.clone();
+                std::thread::spawn(move || {
+                    let _lifecycle = lock.lock().unwrap();
+                    let should_create = {
+                        let guard = eid_mutex.lock().unwrap();
+                        guard.is_none()
+                    };
+                    if should_create {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        *eid_mutex.lock().unwrap() = Some(EndpointId::new());
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(
+            create_count.load(Ordering::SeqCst),
+            1,
+            "endpoint should be created exactly once under lifecycle lock"
+        );
+        assert!(eid.lock().unwrap().is_some());
+    }
+
+    // --- Runtime orchestration tests ---
+
+    use std::sync::atomic::AtomicUsize;
+
+    struct QuickExitEndpoint {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl QuickExitEndpoint {
+        fn new() -> Self {
+            Self {
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::worker::HidEndpoint for QuickExitEndpoint {
+        fn read_packet(
+            &mut self,
+            _buffer: &mut [u8; 64],
+        ) -> Result<Option<usize>, crate::worker::WorkerError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // First call: return None to allow cancel check
+                Ok(None)
+            } else {
+                // Subsequent calls: return None quickly to allow drain
+                std::thread::sleep(Duration::from_millis(1));
+                Ok(None)
+            }
+        }
+
+        fn write_packet(&mut self, _data: &[u8; 64]) -> Result<(), crate::worker::WorkerError> {
+            Ok(())
+        }
+    }
+
+    struct FakeCredentialStorage {
+        credentials: std::collections::HashMap<Vec<u8>, soft_fido2::Credential>,
+        write_counter: AtomicUsize,
+        read_sign_counter: AtomicUsize,
+    }
+
+    impl FakeCredentialStorage {
+        fn new() -> Self {
+            Self {
+                credentials: std::collections::HashMap::new(),
+                write_counter: AtomicUsize::new(0),
+                read_sign_counter: AtomicUsize::new(0),
+            }
+        }
+
+        #[allow(dead_code)]
+        fn write_count(&self) -> usize {
+            self.write_counter.load(Ordering::SeqCst)
+        }
+
+        #[allow(dead_code)]
+        fn read_sign_count(&self) -> usize {
+            self.read_sign_counter.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::storage::CredentialStorage for FakeCredentialStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            self.read_sign_counter.fetch_add(1, Ordering::SeqCst);
+            self.credentials
+                .values()
+                .next()
+                .cloned()
+                .ok_or(soft_fido2::Error::DoesNotExist)
+        }
+
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            self.read_sign_counter.fetch_add(1, Ordering::SeqCst);
+            Err(soft_fido2::Error::DoesNotExist)
+        }
+
+        fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            self.read_sign_counter.fetch_add(1, Ordering::SeqCst);
+            self.credentials
+                .get(id)
+                .cloned()
+                .ok_or(soft_fido2::Error::DoesNotExist)
+        }
+
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            self.write_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
+            self.credentials.remove(id);
+            Ok(())
+        }
+
+        fn count_credentials(&self) -> usize {
+            self.credentials.len()
+        }
+    }
+
+    struct FakePinStorage;
+
+    impl crate::pin_storage::PinStorage for FakePinStorage {
+        fn load_pin_state(&self) -> Result<soft_fido2::PinState, soft_fido2::StatusCode> {
+            Ok(soft_fido2::PinState::new())
+        }
+
+        fn save_pin_state(
+            &self,
+            _state: &soft_fido2::PinState,
+        ) -> Result<(), soft_fido2::StatusCode> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn isolated_endpoint_persists_across_operations() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let audit_dir = temp_dir.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let audit_gate = Arc::new(super::super::audit::AuditGate::open(&audit_dir).unwrap());
+        let clock: Arc<dyn super::super::browser::Clock> =
+            Arc::new(super::super::browser::SystemClock);
+        let monotonic_clock: Arc<dyn super::super::intent::MonotonicClock> =
+            Arc::new(super::super::intent::SystemClock::new());
+
+        let profile_id = ProfileId::new("test-isolated").unwrap();
+        let agent_config = {
+            let mut config = passless_core::agent::AgentConfig::default();
+            config.profiles.insert(
+                "test-isolated".to_string(),
+                passless_core::agent::AgentProfileConfig {
+                    max_operations: 64,
+                    max_concurrent_sessions: 1,
+                    browser_scope: BrowserScope::Session,
+                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                    human_verification_prompt:
+                        passless_core::agent::config::HumanVerificationPrompt::Always,
+                    mode: AgentMode::Isolated,
+                    principal_user: "testuser".to_string(),
+                    rp_ids: vec!["example.com".to_string()],
+                    require_uv: false,
+                    credential_refs: None,
+                    max_grant_ttl: None,
+                    max_session_ttl: None,
+                    storage: Some(passless_core::agent::AgentStorageConfig::Local {
+                        path: temp_dir.path().join("creds"),
+                        pin_path: temp_dir.path().join("pin"),
+                    }),
+                    registration_allowed: false,
+                    rules: vec![],
+                    device: passless_core::agent::DeviceIdentity {
+                        name: "test-iso-device".to_string(),
+                        phys: "test-iso-phys".to_string(),
+                        uniq: "test-iso-uniq".to_string(),
+                        vendor_id: 0x1234,
+                        product_id: 0x5678,
+                    },
+                    start_url: None,
+                    browser_command: None,
+                    browser_user: None,
+                    browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
+                },
+            );
+            config
+        };
+        let policy_runtime = Arc::new(
+            super::super::policy_engine::PolicyRuntime::new(
+                &agent_config,
+                clock.clone(),
+                monotonic_clock.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let cred_storage =
+            Arc::new(Mutex::new(Box::new(FakeCredentialStorage::new())
+                as Box<dyn crate::storage::CredentialStorage>));
+        let pin_storage = Arc::new(Mutex::new(
+            Box::new(FakePinStorage) as Box<dyn crate::pin_storage::PinStorage>
+        ));
+        let _ceremony_scope = super::super::storage::CeremonyScope::new();
+
+        let preparation_slot = Arc::new(super::super::ceremony::CeremonyPreparationSlot::new());
+        let interaction_manager =
+            Arc::new(super::super::interaction::AgentInteractionManager::new());
+        let operation_lock = Arc::new(Mutex::new(()));
+        let (event_tx, _event_rx) = mpsc::channel();
+
+        let spec = EndpointSpec {
+            profile_name: "test-isolated".to_string(),
+            profile_id: profile_id.clone(),
+            mode: AgentMode::Isolated,
+            profile_config: agent_config.profiles.get("test-isolated").unwrap().clone(),
+            security_config: SecurityConfig::default(),
+            pin_config: PinConfig::default(),
+            uv_config: UvConfig::default(),
+            interaction_manager: interaction_manager.clone(),
+            preparation_slot: preparation_slot.clone(),
+            operation_lock: operation_lock.clone(),
+            policy_runtime: policy_runtime.clone(),
+            audit_gate: audit_gate.clone(),
+            event_tx: event_tx.clone(),
+            endpoint_factory: None,
+            test_transport_factory: Some(Arc::new(|| {
+                Ok(Box::new(QuickExitEndpoint::new()) as Box<dyn crate::worker::HidEndpoint>)
+            })),
+            isolated_deps: Some(IsolatedEndpointDeps {
+                credential_storage: cred_storage.clone(),
+                pin_storage: pin_storage.clone(),
+                ceremony_scope: _ceremony_scope.clone(),
+                #[cfg(feature = "tpm")]
+                tpm_key_provider: Arc::new(Mutex::new(None)),
+            }),
+        };
+
+        let endpoint_manager = Mutex::new(super::super::endpoint_manager::EndpointManager::new(
+            1,
+            Arc::new(AtomicBool::new(false)),
+            crate::worker::WorkerConfig::default(),
+        ));
+
+        let backend = CredentialBackendHandle::isolated(
+            profile_id.clone(),
+            cred_storage.clone(),
+            pin_storage.clone(),
+            Arc::new(soft_fido2::SoftwareCredentialKeyProvider),
+            operation_lock.clone(),
+        );
+
+        let profile_runtime = ProfileRuntime {
+            profile_name: "test-isolated".to_string(),
+            profile_id: profile_id.clone(),
+            uid: 1000,
+            gid: 1000,
+            endpoint_id: Mutex::new(None),
+            lifecycle_lock: Mutex::new(()),
+            endpoint_spec: spec,
+            preparation_slot,
+            operation_lock,
+            mode: AgentMode::Isolated,
+            profile_config: agent_config.profiles.get("test-isolated").unwrap().clone(),
+            current_pending: Mutex::new(None),
+            active_browser: Mutex::new(HashMap::new()),
+            shared_browsers: Mutex::new(HashMap::new()),
+            daemon_uid: unsafe { libc::getuid() },
+            daemon_gid: unsafe { libc::getgid() },
+            browser_uid: None,
+            browser_gid: None,
+            enabled: AtomicBool::new(true),
+            backend,
+            credential_storage: cred_storage.clone(),
+        };
+
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(profile_id.clone(), profile_runtime);
+
+        let mut managed_sessions = std::collections::BTreeMap::new();
+        managed_sessions.insert(profile_id.clone(), Mutex::new(Vec::new()));
+
+        let sign_registry = Arc::new(SignContextRegistry::new());
+        let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_socket_path = std::env::temp_dir()
+            .join("passless-test")
+            .join(format!("sign-{}", std::process::id()))
+            .join("sock");
+        let sign_server =
+            SignHttpServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone())
+                .expect("bind sign server");
+        let sign_server_handle = sign_server.serve(sign_registry.clone());
+
+        let runtime = Arc::new(AgentRuntime {
+            endpoint_manager,
+            ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
+            audit_gate,
+            policy_runtime,
+            browser_manager: Arc::new(Mutex::new(
+                super::super::browser::BrowserProcessManager::with_spawner(
+                    clock.clone(),
+                    Arc::new(super::super::browser::TestSpawner),
+                ),
+            )),
+            profiles,
+            managed_sessions,
+            completed_sessions: Mutex::new(std::collections::BTreeMap::new()),
+            event_rx: Mutex::new(_event_rx),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: AtomicBool::new(false),
+            runtime_cleanup_started: AtomicBool::new(false),
+            runtime_loop: Mutex::new(None),
+            worker_tracker: WorkerTracker::new(),
+            daemon_uid: unsafe { libc::getuid() },
+            daemon_gid: unsafe { libc::getgid() },
+            agent_config: std::sync::RwLock::new(agent_config),
+            sign_registry,
+            sign_server_shutdown,
+            sign_server_handle: Mutex::new(Some(sign_server_handle)),
+            sign_socket_path,
+        });
+
+        let profile = runtime.profiles.get(&profile_id).unwrap();
+        let eid = {
+            let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+            let eid = runtime
+                .create_profile_endpoint(&profile.endpoint_spec)
+                .unwrap();
+            *profile.endpoint_id.lock().unwrap() = Some(eid.clone());
+            eid
+        };
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let persisted_eid = profile.endpoint_id.lock().unwrap().clone();
+        assert!(
+            persisted_eid.is_some(),
+            "isolated endpoint should persist after creation"
+        );
+        assert_eq!(persisted_eid.unwrap(), eid);
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let still_persisted = profile.endpoint_id.lock().unwrap().clone();
+        assert!(
+            still_persisted.is_some(),
+            "isolated endpoint should persist across time"
+        );
+        assert_eq!(still_persisted.unwrap(), eid);
+
+        assert!(
+            profile.enabled.load(Ordering::Acquire),
+            "isolated profile should remain enabled"
+        );
+
+        {
+            let mut em = runtime.endpoint_manager.lock().unwrap();
+            em.cancel_all();
+            let _ = em.shutdown_all(Some(Duration::from_secs(1)));
+        }
     }
 
     #[test]
