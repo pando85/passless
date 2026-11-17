@@ -292,6 +292,9 @@ async fn approve_after_delay_emits_signals_and_logs() {
     let (sid, reason): (u32, u32) = msg.body().deserialize().unwrap();
     assert_eq!((sid, reason), (1, 2));
 
+    // Give the server time to write the log entry after emitting the signal.
+    sleep(Duration::from_millis(100)).await;
+
     let log = server.log();
     let events: Vec<&str> = log.iter().map(|r| r["event"].as_str().unwrap()).collect();
     assert_eq!(events, ["Notify", "ActionInvoked", "NotificationClosed"]);
