@@ -292,12 +292,22 @@ async fn approve_after_delay_emits_signals_and_logs() {
     let (sid, reason): (u32, u32) = msg.body().deserialize().unwrap();
     assert_eq!((sid, reason), (1, 2));
 
-    // Give the server time to write the log entry after emitting the signal.
-    sleep(Duration::from_millis(100)).await;
-
-    let log = server.log();
+    // Wait for the server to write all log entries after emitting the signals.
+    let expected = ["Notify", "ActionInvoked", "NotificationClosed"];
+    let log = timeout(Duration::from_secs(3), async {
+        loop {
+            let log = server.log();
+            let events: Vec<&str> = log.iter().map(|r| r["event"].as_str().unwrap()).collect();
+            if events.len() >= expected.len() {
+                break log;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("log entries not written in time");
     let events: Vec<&str> = log.iter().map(|r| r["event"].as_str().unwrap()).collect();
-    assert_eq!(events, ["Notify", "ActionInvoked", "NotificationClosed"]);
+    assert_eq!(events, expected);
     let n = &log[0];
     assert_eq!(n["summary"], "hello");
     assert_eq!(n["id"], 1);
