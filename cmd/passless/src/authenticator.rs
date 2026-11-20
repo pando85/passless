@@ -340,8 +340,6 @@ pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     uv_timeout_seconds: u32,
     prompts: PromptHandle,
     #[cfg(feature = "agent")]
-    interaction_manager: Option<Arc<AgentInteractionManager>>,
-    #[cfg(feature = "agent")]
     isolated_mode: bool,
 }
 
@@ -368,8 +366,6 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             uv_timeout_seconds: uv_config.timeout_seconds,
             prompts,
             #[cfg(feature = "agent")]
-            interaction_manager: None,
-            #[cfg(feature = "agent")]
             isolated_mode: false,
         }
     }
@@ -393,34 +389,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             uv_timeout_seconds: uv_config.timeout_seconds,
             prompts,
             #[cfg(feature = "agent")]
-            interaction_manager: None,
-            #[cfg(feature = "agent")]
             isolated_mode: false,
-        }
-    }
-
-    #[cfg(feature = "agent")]
-    pub fn with_interaction_manager(
-        storage: Arc<Mutex<S>>,
-        pin_storage: Option<Arc<Mutex<P>>>,
-        security_config: SecurityConfig,
-        pin_config: PinConfig,
-        uv_config: UvConfig,
-        prompts: PromptHandle,
-        interaction_manager: Arc<AgentInteractionManager>,
-        isolated_mode: bool,
-    ) -> Self {
-        let uv_manager = build_uv_manager(&uv_config);
-        Self {
-            storage,
-            pin_storage,
-            security_config,
-            pin_config,
-            uv_manager,
-            uv_timeout_seconds: uv_config.timeout_seconds,
-            prompts,
-            interaction_manager: Some(interaction_manager),
-            isolated_mode,
         }
     }
 
@@ -622,33 +591,6 @@ pub(crate) mod test_prompts {
 
 impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
     fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
-        #[cfg(feature = "agent")]
-        {
-            if let Some(ref manager) = self.interaction_manager {
-                let action = action_from_info(info);
-                let generation = 0;
-                match manager.try_consume_up(rp, action, generation) {
-                    Some(result) => {
-                        debug!("Agent interaction override for UP: {:?}", result);
-                        return Ok(result);
-                    }
-                    None => {
-                        if manager.has_active_token() {
-                            debug!(
-                                "Agent interaction token active, auto-approving UP for rp={}",
-                                rp
-                            );
-                            return Ok(UpResult::Accepted);
-                        }
-                    }
-                }
-                if self.isolated_mode {
-                    debug!("Isolated mode: auto-approving UP for rp={}", rp);
-                    return Ok(UpResult::Accepted);
-                }
-            }
-        }
-
         #[cfg(test)]
         if let Some(result) = test_prompts::up_result() {
             return result;
