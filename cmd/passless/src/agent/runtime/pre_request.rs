@@ -237,8 +237,9 @@ pub(crate) fn access_status(
                     rp_id,
                     action,
                     format!(
-                        "Registration approved once for {rp_id} in this browser for {} minutes. \
-                         Navigate there and use the site's normal WebAuthn registration.",
+                        "Registration approved once for {rp_id} in this browser for {} minutes, or \
+                         until this session or MCP server exits, whichever comes first. Navigate \
+                         there and use the site's normal WebAuthn registration.",
                         secs.div_ceil(60)
                     ),
                 )
@@ -859,8 +860,9 @@ mod tests {
         assert_eq!(approved.expires_in_secs, Some(597));
         assert_eq!(
             approved.message,
-            "Registration approved once for example.org in this browser for 10 minutes. \
-             Navigate there and use the site's normal WebAuthn registration."
+            "Registration approved once for example.org in this browser for 10 minutes, or until \
+             this session or MCP server exits, whichever comes first. Navigate there and use the \
+             site's normal WebAuthn registration."
         );
         let limited = access_status(
             &PreRequestState::RateLimited {

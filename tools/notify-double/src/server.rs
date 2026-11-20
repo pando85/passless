@@ -76,29 +76,32 @@ fn sender_of(header: &Header<'_>) -> Option<String> {
     header.sender().map(|s| s.to_string())
 }
 
+/// Emit a signal: broadcast, or unicast to `destination` (notify-osd sends every fallback dialog's
+/// signals only to the connection that called `Notify`, `dbus_message_set_destination` in its
+/// `dbus.c`).
 async fn emit(
     conn: &Connection,
+    destination: Option<&str>,
     member: &str,
     body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
 ) -> zbus::Result<()> {
-    conn.emit_signal(
-        None::<zbus::names::BusName<'_>>,
-        OBJECT_PATH,
-        WELL_KNOWN_NAME,
-        member,
-        body,
-    )
-    .await
+    let destination = match destination {
+        Some(name) => Some(zbus::names::BusName::try_from(name.to_string())?),
+        None => None,
+    };
+    conn.emit_signal(destination, OBJECT_PATH, WELL_KNOWN_NAME, member, body)
+        .await
 }
 
 async fn emit_closed(
     shared: &Shared,
     conn: &Connection,
+    destination: Option<&str>,
     id: u32,
     reason: u32,
     origin: &'static str,
 ) {
-    match emit(conn, "NotificationClosed", &(id, reason)).await {
+    match emit(conn, destination, "NotificationClosed", &(id, reason)).await {
         Ok(()) => shared.log(&Event::NotificationClosed { id, reason, origin }),
         Err(e) => eprintln!("notify-double: emit NotificationClosed failed: {e}"),
     }
@@ -107,6 +110,7 @@ async fn emit_closed(
 async fn run_step(
     shared: Arc<Shared>,
     conn: Connection,
+    destination: Option<String>,
     serial: u64,
     id: u32,
     action: StepAction,
@@ -117,17 +121,19 @@ async fn run_step(
     if shared.state().pending.remove(&serial).is_none() {
         return;
     }
-    // notify-osd's fallback dialog reports its close with reason 3 (observed: `ActionInvoked(0,
-    // key)` then `NotificationClosed(0, 3)`).
-    let close_reason = match shared.config.emulation {
-        Emulation::Spec => REASON_DISMISSED,
-        Emulation::NotifyOsd => REASON_CLOSED_BY_CALL,
+    let destination = destination.as_deref();
+    // notify-osd's fallback dialog reports a click with reason 3 (observed: `ActionInvoked(0,
+    // key)` then `NotificationClosed(0, 3)`), but a keyboard activation of a button, Escape and the
+    // window manager's close with reason 2 and no `ActionInvoked` (its `handle_close`).
+    let (invoke_reason, close_reason) = match shared.config.emulation {
+        Emulation::Spec => (REASON_DISMISSED, REASON_DISMISSED),
+        Emulation::NotifyOsd => (REASON_CLOSED_BY_CALL, REASON_DISMISSED),
     };
     match action {
         // `Approve` is resolved to the notification's own key before the step is scheduled.
         StepAction::Ignore | StepAction::Approve => {}
         StepAction::Invoke(key) => {
-            match emit(&conn, "ActionInvoked", &(id, key.as_str())).await {
+            match emit(&conn, destination, "ActionInvoked", &(id, key.as_str())).await {
                 Ok(()) => shared.log(&Event::ActionInvoked {
                     id,
                     action: key,
@@ -138,10 +144,10 @@ async fn run_step(
                     return;
                 }
             }
-            emit_closed(&shared, &conn, id, close_reason, "script").await;
+            emit_closed(&shared, &conn, destination, id, invoke_reason, "script").await;
         }
         StepAction::Close => {
-            emit_closed(&shared, &conn, id, close_reason, "script").await;
+            emit_closed(&shared, &conn, destination, id, close_reason, "script").await;
         }
     }
 }
@@ -233,9 +239,14 @@ impl NotificationDouble {
                 StepAction::Approve => StepAction::Invoke(resolve_approve_key(&actions)),
                 other => other,
             };
+            // notify-osd addresses its signals to the connection that called `Notify`.
+            let destination = (shared.config.emulation == Emulation::NotifyOsd)
+                .then(|| sender_of(&header))
+                .flatten();
             tokio::spawn(run_step(
                 Arc::clone(shared),
                 conn.clone(),
+                destination,
                 serial,
                 id,
                 action,
@@ -273,7 +284,15 @@ impl NotificationDouble {
                 reason: "CloseNotification",
             });
         }
-        emit_closed(shared, conn, id, REASON_CLOSED_BY_CALL, "CloseNotification").await;
+        emit_closed(
+            shared,
+            conn,
+            None,
+            id,
+            REASON_CLOSED_BY_CALL,
+            "CloseNotification",
+        )
+        .await;
         Ok(())
     }
 

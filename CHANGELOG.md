@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.27.3](https://github.com/pando85/passless/tree/v0.27.3) - 2026-11-13
+
+### Ci
+
+- aur: Bundle verified source signing key during publishing (#613) ([b147b9e](https://github.com/pando85/passless/commit/b147b9e465d3cb32e7ad6cee290adf56a4ddf99f))
+
+## [v0.27.2](https://github.com/pando85/passless/tree/v0.27.2) - 2026-11-13
+
+### Fixed
+
+- Stop pin policy denials consuming uv retries (#610) ([0060c53](https://github.com/pando85/passless/commit/0060c53c696bd114eae4891372ebd917d0444c1f))
+
+## [v0.27.1](https://github.com/pando85/passless/tree/v0.27.1) - 2026-11-13
+
+### Fixed
+
+- Stop closed or timed-out prompts consuming uv retries (#604) ([aa32f21](https://github.com/pando85/passless/commit/aa32f215cfa20787f0c0844f0b74acb5f71f3e2b))
+- Live-test findings (notify-osd dialog close, registration count, JSON origin, no-session error, client UV refusal) (#605) ([89649ac](https://github.com/pando85/passless/commit/89649acf6155f17e0de076cc2a3b881fe7445b0d))
+
+### Build
+
+- deps: Update Rust crate zbus to v6.3.0 (#607) ([5c4c019](https://github.com/pando85/passless/commit/5c4c01907ba6180da034ea207801f53199ace5af))
+
 ## [v0.27.0](https://github.com/pando85/passless/tree/v0.27.0) - 2026-11-13
 
 ### Added

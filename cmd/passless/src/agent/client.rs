@@ -57,6 +57,28 @@ pub enum ClientError {
     Cancelled,
 }
 
+/// What a principal command says when it runs outside an agent session (no control socket on fd 3):
+/// where to run it instead, and the operator's view that needs no session.
+pub fn no_control_fd_message(profile: &str) -> String {
+    format!(
+        "this command must run inside an agent session, which gives it its control channel. \
+         Start one with `passless agent run --profile {profile} -- <command>`, for example \
+         `passless agent run --profile {profile} -- passless agent doctor --profile {profile}`. \
+         For an operator's view of the profile, run `passless agent-admin profile check {profile}`"
+    )
+}
+
+impl ClientError {
+    /// The error as a command of `profile` reports it: [`ClientError::NoControlFd`] names the
+    /// profile in its advice.
+    pub fn describe_for(&self, profile: &str) -> String {
+        match self {
+            Self::NoControlFd => no_control_fd_message(profile),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -71,7 +93,7 @@ impl fmt::Display for ClientError {
             }
             Self::VersionMismatch(e) => write!(f, "version mismatch: {}", e),
             Self::UnsafePath { detail } => write!(f, "unsafe path: {}", detail),
-            Self::NoControlFd => write!(f, "CONTROL_FD (fd 3) not available"),
+            Self::NoControlFd => f.write_str(&no_control_fd_message("<profile>")),
             Self::DaemonNotRunning { socket } => write!(
                 f,
                 "the passless daemon is not running, or runs without agents: no agent socket at {} \
@@ -1129,7 +1151,33 @@ mod tests {
     #[test]
     fn test_client_error_display() {
         let e = ClientError::NoControlFd;
-        assert!(e.to_string().contains("CONTROL_FD"));
+        let text = e.to_string();
+        assert!(
+            !text.contains("CONTROL_FD") && !text.contains("fd 3"),
+            "{text}"
+        );
+        assert!(text.contains("inside an agent session"), "{text}");
+        assert!(text.contains("passless agent run --profile"), "{text}");
+        assert!(
+            text.contains("passless agent-admin profile check"),
+            "{text}"
+        );
+        // A command that knows its profile names it in the examples.
+        let text = e.describe_for("coding");
+        assert!(
+            text.contains(
+                "passless agent run --profile coding -- passless agent doctor --profile coding"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("passless agent-admin profile check coding"),
+            "{text}"
+        );
+        assert_eq!(
+            ClientError::Timeout.describe_for("coding"),
+            ClientError::Timeout.to_string()
+        );
 
         let e = ClientError::Timeout;
         assert!(e.to_string().contains("timed out"));

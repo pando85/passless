@@ -43,6 +43,33 @@ jobs:
             | tar xvz -C /usr/local/bin
           .ci/generate-pkgbuild.rh ${{ matrix.package.pkgbuild }}
 
+      - name: Prepare AUR source signing key
+        if: matrix.package.pkgbuild == 'PKGBUILD'
+        shell: bash
+        env:
+          AUR_PGP_PUBLIC_KEY: ${{ secrets.AUR_PGP_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          fingerprint="CD1DB60B2C8465FD50028EF6D381D73787B45B3E"
+          key_file=".ci/keys/pgp/${fingerprint}.asc"
+
+          # A committed public key takes precedence over the optional Actions secret.
+          if [[ ! -f "$key_file" ]]; then
+            if [[ -z "$AUR_PGP_PUBLIC_KEY" ]]; then
+              echo "::error::Commit $key_file or set the AUR_PGP_PUBLIC_KEY Actions secret (ASCII-armored public key)."
+              exit 1
+            fi
+            mkdir -p "$(dirname "$key_file")"
+            printf '%s\n' "$AUR_PGP_PUBLIC_KEY" > "$key_file"
+          fi
+
+          actual_fingerprint="$(gpg --batch --show-keys --with-colons --fingerprint "$key_file" |
+            awk -F: '$1 == "pub" { primary = 1; next } primary && $1 == "fpr" { print $10; primary = 0 }')"
+          if [[ "$actual_fingerprint" != "$fingerprint" ]]; then
+            echo "::error::The AUR public key does not match the fingerprint in validpgpkeys."
+            exit 1
+          fi
+
       - name: Publish AUR package
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
@@ -50,6 +77,7 @@ jobs:
           pkgbuild: ./${{ matrix.package.pkgbuild }}
           assets: |
             .ci/passless.install
+            ${{ matrix.package.pkgbuild == 'PKGBUILD' && '.ci/keys' || '' }}
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

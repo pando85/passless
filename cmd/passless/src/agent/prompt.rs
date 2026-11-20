@@ -1649,10 +1649,10 @@ mod dbus_tests {
         assert_ne!(a_allow, b_allow);
         assert_ne!(a_deny, b_deny);
 
-        // A's dialog is approved and closes with reason 3. B, under the same id 0, sees both
-        // signals from the real server and stays pending.
+        // A's dialog is approved. B, under the same id 0, sees the broadcast `ActionInvoked` and
+        // stays pending. (The real notify-osd unicasts the `NotificationClosed(0, 3)` that follows
+        // to A's connection alone, so B never sees it; the double's `emit` would broadcast it.)
         double.emit("ActionInvoked", (0u32, a_allow.as_str()));
-        double.emit("NotificationClosed", (0u32, 3u32));
         assert_eq!(a.next(), decision(ACTION_ALLOW_ALWAYS));
         assert_eq!(a.exit_code(), 0);
         assert_eq!(b.next_within(Duration::from_millis(500)), None);
@@ -1662,7 +1662,6 @@ mod dbus_tests {
         assert_eq!(b.next_within(Duration::from_millis(300)), None);
 
         double.emit("ActionInvoked", (0u32, b_deny.as_str()));
-        double.emit("NotificationClosed", (0u32, 3u32));
         assert_eq!(b.next(), decision(ACTION_DENY));
         assert_eq!(b.exit_code(), 0);
     }
@@ -1678,6 +1677,84 @@ mod dbus_tests {
         double.spoof(&bus, "NotificationClosed", (0u32, 3u32));
         assert_eq!(child.next(), decision(ACTION_DENY));
         assert_eq!(child.exit_code(), 0);
+    }
+
+    /// A keypress on the fallback dialog (Enter on the focused button, Escape, the window
+    /// manager's close, "Cancel") makes notify-osd send `NotificationClosed(0, 2)` and no
+    /// `ActionInvoked`; its own "OK" sends `ActionInvoked(0, "default")` then
+    /// `NotificationClosed(0, 3)`. The prompt must end as a dismissal, not wait for the daemon.
+    #[test]
+    fn notify_osd_dialog_closed_without_a_click_ends_the_prompt() {
+        let bus = PrivateBus::start();
+        let _double = Double::start_notify_osd(&bus, "close:200,invoke=default:200");
+
+        let mut child = ChildHarness::start(&bus, 0);
+        assert_eq!(child.shown_by("notify-osd"), 0);
+        assert_eq!(child.next(), ChildEvent::Closed { reason: 2 });
+        assert_eq!(child.exit_code(), 0);
+
+        let mut child = ChildHarness::start(&bus, 0);
+        assert_eq!(child.shown_by("notify-osd"), 0);
+        assert_eq!(child.next(), ChildEvent::Closed { reason: 3 });
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    /// notify-osd unicasts a dialog's signals to the connection that called `Notify`: a close of
+    /// one prompt's dialog (same id 0) must not end another prompt's. The double sends its
+    /// notify-osd signals the same way; with a broadcast B would see A's close and end too.
+    #[test]
+    fn notify_osd_close_reaches_only_its_own_dialog() {
+        let bus = PrivateBus::start();
+        let _double = Double::start_notify_osd(&bus, "close:200,ignore");
+        let mut a = ChildHarness::start(&bus, 0);
+        assert_eq!(a.shown_by("notify-osd"), 0);
+        let mut b = ChildHarness::start(&bus, 0);
+        assert_eq!(b.shown_by("notify-osd"), 0);
+
+        assert_eq!(a.next(), ChildEvent::Closed { reason: 2 });
+        assert_eq!(a.exit_code(), 0);
+        assert_eq!(
+            b.next_within(Duration::from_millis(600)),
+            None,
+            "the other prompt is still pending"
+        );
+        // B is withdrawn by its daemon and ends without a report.
+        b.send("{\"withdraw\":true}");
+        assert_eq!(b.exit_code(), 0);
+    }
+
+    /// On a server with real ids only the close of this prompt's own id ends it: an id of another
+    /// notification does not.
+    #[test]
+    fn a_close_with_a_foreign_id_does_not_end_a_prompt_on_a_server_with_actions() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "ignore", &["actions", "body"]);
+        let mut child = ChildHarness::start(&bus, 0);
+        let id = child.shown();
+        assert_ne!(id, 0);
+
+        double.emit("NotificationClosed", (id + 100, 2u32));
+        double.emit("NotificationClosed", (0u32, 2u32));
+        assert_eq!(child.next_within(Duration::from_millis(400)), None);
+
+        double.emit("NotificationClosed", (id, 2u32));
+        assert_eq!(child.next(), ChildEvent::Closed { reason: 2 });
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    #[test]
+    fn notify_osd_driver_maps_a_keyboard_close_to_a_dismissal() {
+        let bus = PrivateBus::start();
+        let _double = Double::start_notify_osd(&bus, "close:200");
+        let prompter = prompter(&bus, Duration::from_millis(200));
+        let sink = show(&prompter, 1);
+        assert_eq!(
+            sink.wait_for(2),
+            [
+                PromptEvent::Shown,
+                PromptEvent::Denied(EscalationDenyCause::Dismissed)
+            ]
+        );
     }
 
     #[test]
@@ -2117,7 +2194,6 @@ mod dbus_tests {
         thread::sleep(Duration::from_millis(300));
 
         double.emit("ActionInvoked", (0u32, work_allow.as_str()));
-        double.emit("NotificationClosed", (0u32, 3u32));
         assert_eq!(
             work.wait_for(2),
             [PromptEvent::Shown, PromptEvent::Approved]
@@ -2126,7 +2202,6 @@ mod dbus_tests {
         assert_eq!(home.now(), [PromptEvent::Shown], "home is still pending");
 
         double.emit("ActionInvoked", (0u32, home_deny.as_str()));
-        double.emit("NotificationClosed", (0u32, 3u32));
         assert_eq!(
             home.wait_for(2),
             [
@@ -2156,9 +2231,9 @@ mod dbus_tests {
             "the shared id 0 is not closed"
         );
 
-        // A click on the stale dialog with no prompt waiting.
+        // A click on the stale dialog with no prompt waiting. Its `NotificationClosed` goes to the
+        // withdrawn child's connection, which is gone, so no live prompt sees it.
         double.emit("ActionInvoked", (0u32, stale_allow.as_str()));
-        double.emit("NotificationClosed", (0u32, 3u32));
 
         let second = show(&prompter, 2);
         assert_eq!(second.wait_for(1), [PromptEvent::Shown]);
@@ -2166,7 +2241,6 @@ mod dbus_tests {
         // The stale dialog (and a bare legacy key) clicked while the newer prompt waits.
         double.emit("ActionInvoked", (0u32, stale_allow.as_str()));
         double.emit("ActionInvoked", (0u32, ACTION_ALLOW_ALWAYS));
-        double.emit("NotificationClosed", (0u32, 3u32));
         thread::sleep(Duration::from_millis(500));
         assert_eq!(
             first.now(),

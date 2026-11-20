@@ -253,9 +253,15 @@ pub fn pin_health_check(profile: &AgentProfileConfig, view: &StoreView) -> Optio
 /// still holds wildcard registration grants): the stored grants against
 /// `max_wildcard_registrations`, and the daily prompt limit. Passes with a `warning:` at or over
 /// the cap, where new registrations at unlisted sites are refused without a prompt.
+///
+/// `prompts_used` is the daemon's live count of the profile's wildcard registration prompts in the
+/// rolling 24 hours, `None` where there is no running daemon (`passless doctor --agents`). A
+/// prompt counts even when its approved "Register once" ended unused with its principal session,
+/// so the stored grants alone do not explain a refusal at the daily limit.
 pub fn wildcard_registration_check(
     profile: &AgentProfileConfig,
     grants: Option<&ProfileGrants>,
+    prompts_used: Option<usize>,
 ) -> Option<DoctorCheck> {
     let stored = grants.map(|view| wildcard_registration_count(view.rules()));
     if !profile.has_wildcard_registration() && stored.unwrap_or(0) == 0 {
@@ -275,9 +281,18 @@ pub fn wildcard_registration_check(
             ),
         });
     };
+    let prompts = match prompts_used {
+        Some(used) => format!(
+            "{used} of {per_day} registration prompt(s) used in the last 24 hours \
+             (wildcard_registration_prompts_per_day)"
+        ),
+        None => format!(
+            "at most {per_day} prompt(s) per rolling 24 hours \
+             (wildcard_registration_prompts_per_day)"
+        ),
+    };
     let limits = format!(
-        "{stored} of {cap} wildcard registration(s) used (max_wildcard_registrations); at most \
-         {per_day} prompt(s) per rolling 24 hours (wildcard_registration_prompts_per_day)"
+        "{stored} of {cap} wildcard registration(s) used (max_wildcard_registrations); {prompts}"
     );
     let message = if !profile.has_wildcard_registration() {
         format!(
@@ -288,6 +303,12 @@ pub fn wildcard_registration_check(
         format!(
             "warning: {limits}; at the cap, so registration at unlisted sites is refused without \
              a prompt until a grant is revoked (`agent-admin grants revoke`)"
+        )
+    } else if prompts_used.is_some_and(|used| used >= usize::from(per_day)) {
+        format!(
+            "warning: {limits}; at the daily limit, so registration at unlisted sites is refused \
+             without a prompt until the oldest prompt leaves the 24 hour window (an approved \
+             \"Register once\" that ended with its session still counts)"
         )
     } else {
         limits
@@ -322,11 +343,16 @@ pub fn profile_checks(
     profile: &AgentProfileConfig,
     grants: Option<&ProfileGrants>,
     view: &StoreView,
+    wildcard_prompts_used: Option<usize>,
 ) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     checks.extend(pin_coverage_check(profile));
     checks.extend(pin_health_check(profile, view));
-    checks.extend(wildcard_registration_check(profile, grants));
+    checks.extend(wildcard_registration_check(
+        profile,
+        grants,
+        wildcard_prompts_used,
+    ));
     checks.extend(advisory_checks(config, profile_name));
     checks
 }
@@ -392,7 +418,7 @@ pub fn run(
             }
         };
         let stored = grants(name);
-        for mut check in profile_checks(config, name, profile, stored.as_deref(), &view) {
+        for mut check in profile_checks(config, name, profile, stored.as_deref(), &view, None) {
             // The profile goes into the name, as the browser checks do, so that a message that
             // starts with `warning:` still prints as a warning.
             check.name = format!("{name}: {}", check.name);
@@ -677,7 +703,7 @@ mod tests {
             grant("c.example", GrantKind::Escalation, PermittingRule::Wildcard),
             grant("github.com", GrantKind::Registration, PermittingRule::Exact),
         ]);
-        let check = wildcard_registration_check(&profile, Some(&stored)).unwrap();
+        let check = wildcard_registration_check(&profile, Some(&stored), None).unwrap();
         assert_eq!(check.name, "wildcard_registrations");
         assert_eq!(check.mark(), "ok", "{check:?}");
         assert!(check.message.contains("2 of 5"), "{check:?}");
@@ -688,10 +714,51 @@ mod tests {
     }
 
     #[test]
+    fn the_wildcard_count_shows_the_live_prompt_count_when_the_daemon_knows_it() {
+        let profile = profile(&[("*", "request", "request")], None);
+        let stored = ProfileGrants::Enabled(vec![grant(
+            "a.example",
+            GrantKind::Registration,
+            PermittingRule::Wildcard,
+        )]);
+        let check = wildcard_registration_check(&profile, Some(&stored), Some(2)).unwrap();
+        assert_eq!(check.mark(), "ok", "{check:?}");
+        assert!(
+            check
+                .message
+                .contains("1 of 4 wildcard registration(s) used"),
+            "{check:?}"
+        );
+        assert!(
+            check
+                .message
+                .contains("2 of 3 registration prompt(s) used in the last 24 hours"),
+            "{check:?}"
+        );
+        // At the daily limit the check says why a registration is refused without a prompt, also
+        // when no stored grant explains it (an approval that ended with its session).
+        let none = ProfileGrants::Enabled(Vec::new());
+        let check = wildcard_registration_check(&profile, Some(&none), Some(3)).unwrap();
+        assert_eq!(check.mark(), "warn", "{check:?}");
+        assert!(check.message.contains("0 of 4"), "{check:?}");
+        assert!(
+            check.message.contains("3 of 3 registration prompt(s)"),
+            "{check:?}"
+        );
+        assert!(check.message.contains("daily limit"), "{check:?}");
+        // Offline there is no live count.
+        let check = wildcard_registration_check(&profile, Some(&none), None).unwrap();
+        assert!(
+            !check.message.contains("used in the last 24 hours"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
     fn the_wildcard_count_defaults_to_the_documented_limits() {
         let profile = profile(&[("*", "request", "request")], None);
         let stored = ProfileGrants::Enabled(Vec::new());
-        let check = wildcard_registration_check(&profile, Some(&stored)).unwrap();
+        let check = wildcard_registration_check(&profile, Some(&stored), None).unwrap();
         assert!(check.message.contains("0 of 4"), "{check:?}");
         assert!(check.message.contains("3 prompt(s)"), "{check:?}");
     }
@@ -705,7 +772,7 @@ mod tests {
             GrantKind::Registration,
             PermittingRule::Wildcard,
         )]);
-        let check = wildcard_registration_check(&profile, Some(&stored)).unwrap();
+        let check = wildcard_registration_check(&profile, Some(&stored), None).unwrap();
         assert!(check.passed, "the cap is working as designed: {check:?}");
         assert_eq!(check.mark(), "warn");
         assert!(check.message.contains("1 of 1"), "{check:?}");
@@ -726,7 +793,7 @@ mod tests {
             ),
         ]);
         assert!(
-            wildcard_registration_check(&profile, Some(&two))
+            wildcard_registration_check(&profile, Some(&two), None)
                 .unwrap()
                 .message
                 .contains("2 of 1")
@@ -741,8 +808,8 @@ mod tests {
             GrantKind::Registration,
             PermittingRule::Exact,
         )]);
-        assert!(wildcard_registration_check(&profile, Some(&stored)).is_none());
-        assert!(wildcard_registration_check(&profile, None).is_none());
+        assert!(wildcard_registration_check(&profile, Some(&stored), None).is_none());
+        assert!(wildcard_registration_check(&profile, None, None).is_none());
     }
 
     #[test]
@@ -753,7 +820,7 @@ mod tests {
             GrantKind::Registration,
             PermittingRule::Wildcard,
         )]);
-        let check = wildcard_registration_check(&profile, Some(&stored)).unwrap();
+        let check = wildcard_registration_check(&profile, Some(&stored), None).unwrap();
         assert_eq!(check.mark(), "warn");
         assert!(
             check.message.contains("no longer requests registration"),
@@ -764,7 +831,7 @@ mod tests {
     #[test]
     fn without_a_store_only_the_limits_are_shown() {
         let profile = profile(&[("*", "request", "request")], None);
-        let check = wildcard_registration_check(&profile, None).unwrap();
+        let check = wildcard_registration_check(&profile, None, None).unwrap();
         assert_eq!(check.mark(), "ok");
         assert!(check.message.contains("cap 4"), "{check:?}");
     }
@@ -819,7 +886,7 @@ principal_user = \"alice\"
         );
         let store = view(&[("github.com", 1)]);
         let stored = ProfileGrants::Enabled(Vec::new());
-        let checks = profile_checks(&config, "coding", &profile, Some(&stored), &store);
+        let checks = profile_checks(&config, "coding", &profile, Some(&stored), &store, None);
         let names: Vec<_> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
