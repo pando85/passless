@@ -1464,7 +1464,7 @@ impl AgentRuntime {
                             name, e
                         ))
                     })?;
-                    Ok(CredentialBackendHandle::isolated(
+                    let backend = CredentialBackendHandle::isolated(
                         profile_id.clone(),
                         bundle.credential_storage.clone(),
                         bundle.pin_storage.clone(),
