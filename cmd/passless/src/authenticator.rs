@@ -21,6 +21,9 @@ use crate::uv::{
 #[cfg(feature = "face")]
 use crate::uv::FaceIdProvider;
 
+#[cfg(feature = "agent")]
+use crate::agent::interaction::AgentInteractionManager;
+
 use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig, UvConfig, UvProviderType};
 
 use soft_fido2::{
@@ -390,6 +393,32 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             prompts,
             #[cfg(feature = "agent")]
             isolated_mode: false,
+        }
+    }
+
+    /// Like [`Self::with_prompts`], but with an agent interaction manager for token-based
+    /// UP/UV overrides. Sets `isolated_mode` based on `is_agent`.
+    #[cfg(feature = "agent")]
+    pub fn with_interaction_manager(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+        prompts: PromptHandle,
+        _interaction_manager: Arc<AgentInteractionManager>,
+        is_agent: bool,
+    ) -> Self {
+        let uv_manager = build_uv_manager(&uv_config);
+        Self {
+            storage,
+            pin_storage,
+            security_config,
+            pin_config,
+            uv_manager,
+            uv_timeout_seconds: uv_config.timeout_seconds,
+            prompts,
+            isolated_mode: is_agent,
         }
     }
 
@@ -1279,7 +1308,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         Ok(Self {
             authenticator,
             storage,
-            max_uv_retries: pin_config.max_uv_retries,
             always_uv: security_config.always_uv,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
@@ -1587,7 +1615,6 @@ impl<
         Ok(Self {
             authenticator,
             storage,
-            max_uv_retries: pin_config.max_uv_retries,
             always_uv: security_config.always_uv,
             credential_backup_enabled: false,
             credential_backup_supported: false,
