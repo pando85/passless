@@ -32,6 +32,8 @@ application-level authorization proxy.
 - [Agent registration](../AGENT_REGISTRATION.md) and
   [registration testing](../AGENT_REGISTRATION_TESTING.md).
 - [ADR 0014](../decisions/0014-agent-delegation.md): the design and its security invariants.
+- [Password broker roadmap](../plans/agent-password-broker-roadmap.md): proposal for policy-gated
+  agent use of traditional `pass` passwords (not implemented).
 
 ## Two identity modes
 
