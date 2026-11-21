@@ -18,6 +18,6 @@ pub use config::{
 };
 pub use config::{
     AgentSkillScope, AgentSkillTarget, AppConfig, Args, BackendConfig, ClientAction, Commands,
-    ConfigAction, OutputFormat, PinAction, SecurityConfig,
+    ConfigAction, OutputFormat, PinAction, SecurityConfig, UvAction,
 };
 pub use error::{Error, Result};

@@ -358,6 +358,126 @@ pub struct PinConfig {
     pub auto_lock_timeout: u32,
 }
 
+/// User verification provider type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UvProviderType {
+    /// Fingerprint verification via fprintd D-Bus service
+    Fprintd,
+    /// Face recognition via webcam
+    Face,
+    /// Desktop notification (fallback)
+    Notification,
+    /// Custom command/script
+    Command,
+    /// Use all available providers in priority order
+    #[default]
+    Auto,
+}
+
+impl std::str::FromStr for UvProviderType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fprintd" | "fingerprint" => Ok(UvProviderType::Fprintd),
+            "face" | "faceid" => Ok(UvProviderType::Face),
+            "notification" | "notify" => Ok(UvProviderType::Notification),
+            "command" | "cmd" => Ok(UvProviderType::Command),
+            "auto" | "all" => Ok(UvProviderType::Auto),
+            _ => Err(format!(
+                "Invalid UV provider '{}'. Must be: fprintd, face, notification, command, or auto",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for UvProviderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UvProviderType::Fprintd => write!(f, "fprintd"),
+            UvProviderType::Face => write!(f, "face"),
+            UvProviderType::Notification => write!(f, "notification"),
+            UvProviderType::Command => write!(f, "command"),
+            UvProviderType::Auto => write!(f, "auto"),
+        }
+    }
+}
+
+/// fprintd provider configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv-fprintd")]
+pub struct FprintdConfig {
+    /// Enable fprintd provider
+    #[arg(
+        long = "fprintd-enabled",
+        id = "fprintd-enabled",
+        env = "PASSLESS_FPRINTD_ENABLED",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub enabled: bool,
+}
+
+/// Face recognition provider configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv-face")]
+pub struct FaceConfig {
+    /// Enable face recognition provider
+    #[arg(
+        long = "face-enabled",
+        id = "face-enabled",
+        env = "PASSLESS_FACE_ENABLED",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub enabled: bool,
+
+    /// Camera device index (0 = first camera)
+    #[arg(
+        long = "face-camera-index",
+        id = "face-camera-index",
+        env = "PASSLESS_FACE_CAMERA_INDEX",
+        value_name = "INDEX"
+    )]
+    #[serde(default)]
+    #[default(0)]
+    pub camera_index: usize,
+
+    /// Face matching threshold (0.0-1.0, higher = stricter)
+    #[arg(
+        long = "face-threshold",
+        id = "face-threshold",
+        env = "PASSLESS_FACE_THRESHOLD",
+        value_name = "THRESHOLD"
+    )]
+    #[serde(default)]
+    #[default(0.6)]
+    pub threshold: f32,
+}
+
+impl FaceConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.threshold.is_finite() || self.threshold <= 0.0 || self.threshold > 1.0 {
+            return Err(format!(
+                "Face threshold must be finite and in (0.0, 1.0], got {}",
+                self.threshold
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PinConfig {
     /// Validate PIN configuration values
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -379,6 +499,83 @@ impl PinConfig {
         }
         Ok(())
     }
+}
+
+/// Command provider configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv-cmd")]
+pub struct CommandConfig {
+    /// Enable command provider
+    #[arg(
+        long = "uv-command-enabled",
+        id = "uv-command-enabled",
+        env = "PASSLESS_UV_COMMAND_ENABLED",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "false"
+    )]
+    #[serde(default)]
+    #[default(false)]
+    pub enabled: bool,
+
+    /// Command to execute for verification (exit 0 = accept, non-zero = deny)
+    /// Command receives context via environment variables:
+    /// PASSLESS_UV_OPERATION, PASSLESS_UV_RELYING_PARTY, PASSLESS_UV_USER
+    #[arg(
+        long = "uv-command",
+        id = "uv-command-arg",
+        env = "PASSLESS_UV_COMMAND",
+        value_name = "COMMAND",
+        value_delimiter = ' '
+    )]
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+/// User verification configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv")]
+pub struct UvConfig {
+    /// User verification provider selection
+    /// - "auto": Use all available providers in priority order (default)
+    /// - "fprintd": Fingerprint only
+    /// - "face": Face recognition only
+    /// - "notification": Desktop notification only
+    /// - "command": Custom command only
+    #[arg(
+        long = "uv-provider",
+        env = "PASSLESS_UV_PROVIDER",
+        value_name = "PROVIDER"
+    )]
+    #[serde(default)]
+    #[default(UvProviderType::Auto)]
+    pub provider: UvProviderType,
+
+    /// Default timeout for verification (seconds)
+    #[arg(
+        long = "uv-timeout",
+        env = "PASSLESS_UV_TIMEOUT",
+        value_name = "SECONDS"
+    )]
+    #[serde(default)]
+    #[default(30)]
+    pub timeout_seconds: u32,
+
+    /// fprintd configuration
+    #[clap_serde]
+    #[command(flatten)]
+    pub fprintd: FprintdConfig,
+
+    /// Face recognition configuration
+    #[clap_serde]
+    #[command(flatten)]
+    pub face: FaceConfig,
+
+    /// Command provider configuration
+    #[clap_serde]
+    #[command(flatten)]
+    pub command: CommandConfig,
 }
 
 impl SecurityConfig {
@@ -477,6 +674,11 @@ pub struct AppConfig {
     #[clap_serde]
     #[command(flatten)]
     pub pin: PinConfig,
+
+    /// User verification configuration
+    #[clap_serde]
+    #[command(flatten)]
+    pub uv: UvConfig,
 
     /// Agent configuration (only available with the `agent` feature)
     #[cfg(feature = "agent")]
@@ -714,6 +916,11 @@ impl AppConfig {
         self.pin.clone()
     }
 
+    /// Get user verification configuration
+    pub fn uv_config(&self) -> UvConfig {
+        self.uv.clone()
+    }
+
     /// Everything the daemon checks of the configuration before it starts serving: [`Self::validate`]
     /// and the backend's own validation (`main.rs` runs the same steps one by one, with its own
     /// log messages). Used by `passless config check` and `passless doctor`.
@@ -725,6 +932,35 @@ impl AppConfig {
     /// Validate the configuration
     pub fn validate(&self) -> crate::error::Result<()> {
         self.pin.validate()?;
+        self.uv
+            .face
+            .validate()
+            .map_err(crate::error::Error::Config)?;
+        if self.uv.timeout_seconds == 0 || self.uv.timeout_seconds > 300 {
+            return Err(crate::error::Error::Config(
+                "uv.timeout_seconds must be between 1 and 300".into(),
+            ));
+        }
+        match self.uv.provider {
+            UvProviderType::Fprintd if !self.uv.fprintd.enabled => {
+                return Err(crate::error::Error::Config(
+                    "uv.provider=fprintd requires uv.fprintd.enabled=true".into(),
+                ));
+            }
+            UvProviderType::Face if !self.uv.face.enabled => {
+                return Err(crate::error::Error::Config(
+                    "uv.provider=face requires uv.face.enabled=true".into(),
+                ));
+            }
+            UvProviderType::Command
+                if !self.uv.command.enabled || self.uv.command.command.is_empty() =>
+            {
+                return Err(crate::error::Error::Config(
+                    "uv.provider=command requires an enabled non-empty trusted command".into(),
+                ));
+            }
+            _ => {}
+        }
         #[cfg(feature = "agent")]
         {
             let human_path = self.backend().ok().map(|b| b.state_path());
@@ -791,6 +1027,11 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Manage experimental face enrollment and test matching locally
+    Uv {
+        #[command(subcommand)]
+        action: UvAction,
     },
     /// FIDO2 client commands for managing authenticators
     ///
@@ -875,6 +1116,27 @@ pub enum Commands {
         #[command(subcommand)]
         action: TpmAction,
     },
+}
+
+/// Experimental face operations. These do not imply presentation-attack detection.
+#[derive(Subcommand, Debug, Clone)]
+pub enum UvAction {
+    /// Enroll five face samples; requires a build with the face feature
+    FaceEnroll {
+        #[arg(long, default_value_t = 0)]
+        camera_index: usize,
+        #[arg(long, default_value_t = 0.6)]
+        threshold: f32,
+    },
+    /// Exercise face matching on the local webcam; not a FIDO UV assurance check
+    FaceVerify {
+        #[arg(long, default_value_t = 0)]
+        camera_index: usize,
+        #[arg(long, default_value_t = 0.6)]
+        threshold: f32,
+    },
+    /// Show whether a local face template exists
+    FaceStatus,
 }
 
 /// TPM portable parent actions
@@ -1743,6 +2005,56 @@ mod tests {
                     force: true,
                 },
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_invalid_uv_timeout_and_command_config() {
+        let mut cfg = AppConfig::from(&mut Args::parse_from(["passless"]).config);
+        cfg.uv.timeout_seconds = 0;
+        assert!(cfg.validate().is_err());
+        cfg.uv.timeout_seconds = 301;
+        assert!(cfg.validate().is_err());
+        cfg.uv.timeout_seconds = 30;
+        cfg.uv.provider = UvProviderType::Command;
+        cfg.uv.command.enabled = true;
+        cfg.uv.command.command.clear();
+        assert!(cfg.validate().is_err());
+        cfg.uv.command.command = vec!["/usr/bin/true".into()];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_face_threshold_rejects_nonfinite_and_zero() {
+        let mut cfg = FaceConfig {
+            enabled: true,
+            camera_index: 0,
+            threshold: 0.6,
+        };
+        for value in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.1] {
+            cfg.threshold = value;
+            assert!(
+                cfg.validate().is_err(),
+                "value {} should be rejected",
+                value
+            );
+        }
+        cfg.threshold = 0.6;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_uv_face_cli_commands_parse() {
+        let args =
+            Args::try_parse_from(["passless", "uv", "face-enroll", "--camera-index", "1"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Uv {
+                action: UvAction::FaceEnroll {
+                    camera_index: 1,
+                    ..
+                }
             })
         ));
     }

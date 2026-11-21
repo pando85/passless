@@ -22,6 +22,7 @@ pub mod granted_rules;
 #[cfg(test)]
 mod grants_invariants;
 pub mod identity;
+pub mod interaction;
 pub mod ipc;
 pub mod launcher;
 pub mod lock_order;
