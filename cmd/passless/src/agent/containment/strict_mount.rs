@@ -100,7 +100,6 @@ fn validate_layout(mounts: &[MountSpec], forbidden: &[PathBuf]) -> io::Result<()
 /// The caller must supply the complete protected-path inventory and use
 /// trusted, non-overlapping mount trees. Host root is trusted.
 fn validate_source(mount: &MountSpec, daemon_uid: u32) -> io::Result<()> {
-    let mut path = PathBuf::from("/");
     let parents = mount.path.ancestors().skip(1).collect::<Vec<_>>();
     for parent in parents.into_iter().rev() {
         let meta = fs::symlink_metadata(parent)?;
@@ -114,8 +113,8 @@ fn validate_source(mount: &MountSpec, daemon_uid: u32) -> io::Result<()> {
             )));
         }
     }
-    path.push(&mount.path);
-    let meta = fs::symlink_metadata(&path)?;
+    let path = &mount.path;
+    let meta = fs::symlink_metadata(path)?;
     let kind = meta.file_type();
     if !(kind.is_dir() || kind.is_file() || kind.is_socket())
         || meta.uid() != mount.owner
@@ -281,4 +280,96 @@ mod tests {
         assert!(!args.contains(&"--dev-bind"));
         assert!(!args.iter().any(|arg| arg.ends_with("-try")));
     }
+
+    /// Run explicitly on a Linux host with root and working unprivileged
+    /// Bubblewrap. This tests the actual kernel boundary, not just the argv.
+    /// The ordinary CI runner cannot create a distinct-UID sandbox reliably.
+    #[test]
+    #[ignore = "requires root and working unprivileged Bubblewrap"]
+    fn distinct_uid_mount_boundary() {
+        use std::os::unix::fs::{PermissionsExt, chown};
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+        let uid = 65534;
+        let gid = 65534;
+        let fixture = tempfile::tempdir_in("/run").unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        chown(&workspace, Some(uid), Some(gid)).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = fixture.path().join("forbidden");
+        fs::write(&secret, "world-readable control").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Positive control: DAC alone permits the same UID to read this file.
+        assert!(Command::new("/bin/sh")
+            .arg("-c")
+            .arg("test -r \"$1\"")
+            .arg("sh")
+            .arg(&secret)
+            .uid(uid)
+            .gid(gid)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut mounts = vec![
+            spec("/usr", MountAccess::ReadOnly),
+            MountSpec {
+                path: workspace.clone(),
+                owner: uid,
+                access: MountAccess::ReadWrite,
+            },
+        ];
+        // Test fixture only: support both merged-/usr and conventional roots.
+        // The real launcher must derive trusted aliases from its runtime inventory.
+        let mut aliases = Vec::new();
+        for name in ["/bin", "/lib", "/lib64"] {
+            match fs::symlink_metadata(name) {
+                Ok(meta) if meta.is_dir() => mounts.push(spec(name, MountAccess::ReadOnly)),
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let target = fs::read_link(name).unwrap();
+                    assert!(
+                        target.starts_with("/usr") || target.starts_with("usr"),
+                        "unexpected system alias {name}: {target:?}"
+                    );
+                    aliases.extend([
+                        OsString::from("--symlink"),
+                        target.into_os_string(),
+                        OsString::from(name),
+                    ]);
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                other => panic!("unexpected system path {name}: {other:?}"),
+            }
+        }
+        let plan = RestrictedMountPlan::new(mounts, std::slice::from_ref(&secret), 0, uid)
+            .unwrap();
+        let bwrap = super::super::find_bwrap(0).expect("trusted Bubblewrap is required");
+        let output = Command::new(bwrap)
+            .args(plan.bwrap_args())
+            .args(aliases)
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg("test ! -e \"$1\"; test ! -e /dev/uhid; test ! -e /proc/1; printf ok > \"$2/result\"")
+            .arg("sh")
+            .arg(&secret)
+            .arg(&workspace)
+            .uid(uid)
+            .gid(gid)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "restricted child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(workspace.join("result")).unwrap(), "ok");
+    }
+
 }
