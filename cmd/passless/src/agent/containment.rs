@@ -42,6 +42,11 @@ use std::time::{Duration, Instant};
 
 use super::launcher::HardenedChildSetup;
 
+// #459: compile and exercise the restricted mount planner before enabling it in either
+// launcher. The existing native-path containment remains unchanged in this tranche.
+#[cfg(test)]
+mod strict_mount;
+
 /// The `bwrap` options that give the browser a private `/dev` and tie it to its parent.
 pub const BWRAP_PRIVATE_DEV_ARGS: [&str; 6] =
     ["--dev-bind", "/", "/", "--dev", "/dev", "--die-with-parent"];
