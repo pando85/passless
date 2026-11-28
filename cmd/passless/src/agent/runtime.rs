@@ -20,7 +20,7 @@ use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, BrowserScope, DaemonStatus,
     GrantId, PrincipalSessionId, ProfileId,
 };
-use passless_core::config::SecurityConfig;
+use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
 use super::audit::AuditGate;
 use super::audit_events::{
@@ -67,6 +67,8 @@ pub struct RuntimeStartParams<'a> {
     pub human_backend_kind: BackendKind,
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
+    pub pin_config: PinConfig,
+    pub uv_config: UvConfig,
     pub shutdown: Arc<AtomicBool>,
     /// Where a policy reload re-reads the configuration from. `None` disables reload.
     pub config_source: Option<AgentConfigSource>,
@@ -93,6 +95,8 @@ impl AgentConfigSource {
         Ok(config)
     }
 }
+
+
 
 /// Open the granted-rules store under the effective `agents.state_dir`. Without a state directory
 /// every profile's grants are disabled (fail closed).
@@ -967,6 +971,8 @@ impl AgentRuntime {
         human_backend_kind: BackendKind,
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
         shutdown: Arc<AtomicBool>,
         config_source: Option<AgentConfigSource>,
         human_path_automatic: bool,
@@ -979,6 +985,8 @@ impl AgentRuntime {
             human_backend_kind,
             agent_config,
             security_config,
+            pin_config,
+            uv_config,
             shutdown,
             config_source,
             human_path_automatic,
@@ -994,6 +1002,8 @@ impl AgentRuntime {
             human_backend_kind,
             agent_config,
             security_config,
+            pin_config: _pin_config,
+            uv_config: _uv_config,
             shutdown,
             config_source,
             human_path_automatic,
@@ -1504,6 +1514,7 @@ impl AgentRuntime {
 
         Ok(runtime)
     }
+
 
     fn runtime_loop(self: &Arc<Self>) {
         info!("Agent runtime loop started");
@@ -5411,6 +5422,128 @@ register = "deny"
         assert_eq!(lease.lease_id, lease_id);
         assert_eq!(lease.session_id, session_id);
     }
+
+
+    // --- Runtime orchestration tests ---
+
+    use std::sync::atomic::AtomicUsize;
+
+    struct QuickExitEndpoint {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl QuickExitEndpoint {
+        fn new() -> Self {
+            Self {
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::worker::HidEndpoint for QuickExitEndpoint {
+        fn read_packet(
+            &mut self,
+            _buffer: &mut [u8; 64],
+        ) -> Result<Option<usize>, crate::worker::WorkerError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // First call: return None to allow cancel check
+                Ok(None)
+            } else {
+                // Subsequent calls: return None quickly to allow drain
+                std::thread::sleep(Duration::from_millis(1));
+                Ok(None)
+            }
+        }
+
+        fn write_packet(&mut self, _data: &[u8; 64]) -> Result<(), crate::worker::WorkerError> {
+            Ok(())
+        }
+    }
+
+    struct FakeCredentialStorage {
+        credentials: std::collections::HashMap<Vec<u8>, soft_fido2::Credential>,
+        write_counter: AtomicUsize,
+        read_sign_counter: AtomicUsize,
+    }
+
+    impl FakeCredentialStorage {
+        fn new() -> Self {
+            Self {
+                credentials: std::collections::HashMap::new(),
+                write_counter: AtomicUsize::new(0),
+                read_sign_counter: AtomicUsize::new(0),
+            }
+        }
+
+        #[allow(dead_code)]
+        fn write_count(&self) -> usize {
+            self.write_counter.load(Ordering::SeqCst)
+        }
+
+        #[allow(dead_code)]
+        fn read_sign_count(&self) -> usize {
+            self.read_sign_counter.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::storage::CredentialStorage for FakeCredentialStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            self.read_sign_counter.fetch_add(1, Ordering::SeqCst);
+            self.credentials
+                .values()
+                .next()
+                .cloned()
+                .ok_or(soft_fido2::Error::DoesNotExist)
+        }
+
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            self.read_sign_counter.fetch_add(1, Ordering::SeqCst);
+            Err(soft_fido2::Error::DoesNotExist)
+        }
+
+        fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            self.read_sign_counter.fetch_add(1, Ordering::SeqCst);
+            self.credentials
+                .get(id)
+                .cloned()
+                .ok_or(soft_fido2::Error::DoesNotExist)
+        }
+
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            self.write_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
+            self.credentials.remove(id);
+            Ok(())
+        }
+
+        fn count_credentials(&self) -> usize {
+            self.credentials.len()
+        }
+    }
+
+    struct FakePinStorage;
+
+    impl crate::pin_storage::PinStorage for FakePinStorage {
+        fn load_pin_state(&self) -> Result<soft_fido2::PinState, soft_fido2::StatusCode> {
+            Ok(soft_fido2::PinState::new())
+        }
+
+        fn save_pin_state(
+            &self,
+            _state: &soft_fido2::PinState,
+        ) -> Result<(), soft_fido2::StatusCode> {
+            Ok(())
+        }
+    }
+
+    #[test]
 
     #[test]
     fn shared_attach_same_session_twice_keeps_refcount_one() {

@@ -11,10 +11,12 @@ mod notification;
 mod pin_storage;
 mod storage;
 mod util;
+mod uv;
 mod worker;
 
 use passless_core::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
+    UvAction,
 };
 
 use soft_fido2::CredentialKeyProvider;
@@ -197,6 +199,8 @@ fn spawn_agent_runtime(
     human_backend_kind: agent::audit_events::BackendKind,
     agent_config: passless_core::agent::AgentConfig,
     security_config: passless_core::config::SecurityConfig,
+    pin_config: passless_core::config::PinConfig,
+    uv_config: passless_core::config::UvConfig,
     shutdown: Arc<AtomicBool>,
     config_source: Option<agent::runtime::AgentConfigSource>,
 ) -> Option<std::thread::JoinHandle<()>> {
@@ -212,6 +216,8 @@ fn spawn_agent_runtime(
                 human_backend_kind,
                 &agent_config,
                 security_config,
+                pin_config,
+                uv_config,
                 shutdown_for_runtime.clone(),
                 config_source,
                 notification::human_path_is_automatic(),
@@ -376,6 +382,77 @@ fn run() -> Result<()> {
                     Ok(())
                 }
             },
+            Commands::Uv { action } => match action {
+                UvAction::FaceEnroll {
+                    camera_index,
+                    threshold,
+                } => {
+                    #[cfg(feature = "face")]
+                    {
+                        if !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0 {
+                            return Err(Error::Config("Invalid face threshold".into()));
+                        }
+                        let provider = uv::FaceIdProvider::new(*camera_index, *threshold, None);
+                        uv::UserVerificationProvider::enroll(&provider)
+                            .map_err(|e| Error::Config(e.to_string()))?;
+                        println!("Face template enrolled (experimental; no liveness detection)");
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "face"))]
+                    {
+                        let _ = (camera_index, threshold);
+                        Err(Error::Config(
+                            "Face support requires --features face".into(),
+                        ))
+                    }
+                }
+                UvAction::FaceVerify {
+                    camera_index,
+                    threshold,
+                } => {
+                    #[cfg(feature = "face")]
+                    {
+                        if !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0 {
+                            return Err(Error::Config("Invalid face threshold".into()));
+                        }
+                        let provider = uv::FaceIdProvider::new(*camera_index, *threshold, None);
+                        let ctx = uv::VerificationContext::new("local face test");
+                        match uv::UserVerificationProvider::verify(&provider, &ctx)
+                            .map_err(|e| Error::Config(e.to_string()))?
+                        {
+                            uv::VerificationResult::Accepted => {
+                                println!("Face matched (experimental; no liveness detection)");
+                                Ok(())
+                            }
+                            _ => Err(Error::Config("Face did not match".into())),
+                        }
+                    }
+                    #[cfg(not(feature = "face"))]
+                    {
+                        let _ = (camera_index, threshold);
+                        Err(Error::Config(
+                            "Face support requires --features face".into(),
+                        ))
+                    }
+                }
+                UvAction::FaceStatus => {
+                    #[cfg(feature = "face")]
+                    {
+                        let provider = uv::FaceIdProvider::new(0, 0.6, None);
+                        println!(
+                            "Face enrolled: {}",
+                            uv::UserVerificationProvider::is_enrolled(&provider)
+                        );
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "face"))]
+                    {
+                        Err(Error::Config(
+                            "Face support requires --features face".into(),
+                        ))
+                    }
+                }
+            },
             Commands::Client {
                 device,
                 output,
@@ -498,6 +575,13 @@ fn run() -> Result<()> {
         return Err(e);
     }
 
+    #[cfg(not(feature = "face"))]
+    if config.uv.provider == passless_core::config::UvProviderType::Face {
+        return Err(Error::Config(
+            "uv.provider=face requires a build with --features face".into(),
+        ));
+    }
+
     if config.verbose && log_level != log::LevelFilter::Debug {
         info!("Enabling verbose logging...");
         log::set_max_level(log::LevelFilter::Debug);
@@ -602,6 +686,7 @@ fn run() -> Result<()> {
 
             let security_config = config.security_config();
             let pin_config = config.pin_config();
+            let uv_config = config.uv_config();
             let operation_lock = Arc::new(Mutex::new(()));
             let allow_storage_creation = allow_e2e_storage_creation();
 
@@ -622,6 +707,7 @@ fn run() -> Result<()> {
                         Some(pin_storage.clone()),
                         security_config.clone(),
                         pin_config.clone(),
+                        uv_config.clone(),
                     )?;
 
                     let agent_runtime = spawn_agent_runtime(
@@ -632,6 +718,8 @@ fn run() -> Result<()> {
                         agent::audit_events::BackendKind::Local,
                         config.agents.clone(),
                         security_config,
+                        pin_config,
+                        uv_config,
                         shutdown.clone(),
                         agent_config_source.clone(),
                     );
@@ -671,6 +759,7 @@ fn run() -> Result<()> {
                         Some(pin_storage.clone()),
                         security_config.clone(),
                         pin_config.clone(),
+                        uv_config.clone(),
                     )?;
 
                     let agent_runtime = spawn_agent_runtime(
@@ -681,6 +770,8 @@ fn run() -> Result<()> {
                         agent::audit_events::BackendKind::Pass,
                         config.agents.clone(),
                         security_config,
+                        pin_config,
+                        uv_config,
                         shutdown.clone(),
                         agent_config_source.clone(),
                     );
@@ -718,6 +809,7 @@ fn run() -> Result<()> {
                             provider,
                             security_config.clone(),
                             pin_config.clone(),
+                            uv_config.clone(),
                         )?;
 
                         let agent_runtime = spawn_agent_runtime(
@@ -728,6 +820,8 @@ fn run() -> Result<()> {
                             agent::audit_events::BackendKind::Tpm,
                             config.agents.clone(),
                             security_config,
+                            pin_config,
+                            uv_config,
                             shutdown.clone(),
                             agent_config_source.clone(),
                         );
@@ -752,6 +846,7 @@ fn run() -> Result<()> {
                             Some(pin_storage.clone()),
                             security_config.clone(),
                             pin_config.clone(),
+                            uv_config.clone(),
                         )?;
 
                         let agent_runtime = spawn_agent_runtime(
@@ -762,6 +857,8 @@ fn run() -> Result<()> {
                             agent::audit_events::BackendKind::Tpm,
                             config.agents.clone(),
                             security_config,
+                            pin_config,
+                            uv_config,
                             shutdown.clone(),
                             agent_config_source.clone(),
                         );
@@ -835,6 +932,9 @@ fn run() -> Result<()> {
         let pin_config = config.pin_config();
         let allow_storage_creation = allow_e2e_storage_creation();
 
+        // Get UV config for biometric verification
+        let uv_config = config.uv_config();
+
         match backend {
             BackendConfig::Local { path } => {
                 let storage = LocalStorageAdapter::new_with_options(
@@ -848,6 +948,7 @@ fn run() -> Result<()> {
                     Some(pin_storage),
                     security_config,
                     pin_config,
+                    uv_config,
                 )?;
                 run_with_service(service, uhid, shutdown)
             }
@@ -878,6 +979,7 @@ fn run() -> Result<()> {
                     Some(pin_storage),
                     security_config,
                     pin_config,
+                    uv_config,
                 )?;
                 run_with_service(service, uhid, shutdown)
             }
@@ -902,6 +1004,7 @@ fn run() -> Result<()> {
                         provider,
                         security_config,
                         pin_config,
+                        uv_config,
                     )?;
                     run_with_service(service, uhid, shutdown)
                 } else {
@@ -917,6 +1020,7 @@ fn run() -> Result<()> {
                         Some(pin_storage),
                         security_config,
                         pin_config,
+                        uv_config,
                     )?;
                     run_with_service(service, uhid, shutdown)
                 }

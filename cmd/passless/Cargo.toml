@@ -31,6 +31,7 @@ required-features = ["agent"]
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]
+face = ["dep:nokhwa", "dep:face_id", "dep:image", "dep:ort"]
 agent = ["passless-core/agent"]
 agent-validation = ["agent"]
 
@@ -61,6 +62,7 @@ zeroize.workspace = true
 hex.workspace = true
 shadow-rs.workspace = true
 dirs.workspace = true
+thiserror.workspace = true
 ciborium = "0.2"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 hmac = "0.13"
@@ -74,6 +76,18 @@ hkdf = { version = "0.13", optional = true }
 aes = { version = "0.9", optional = true }
 cipher = { version = "0.5", optional = true }
 toml.workspace = true
+
+# UV provider dependencies
+tokio.workspace = true
+which.workspace = true
+futures-util = "0.3"
+
+# Face recognition (optional, heavy dependencies)
+nokhwa = { workspace = true, optional = true }
+face_id = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+# face_id 0.4.4 still needs the pre-rc.14 ort Session::builder API.
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }
 
 [dev-dependencies]
 base64 = "0.23"

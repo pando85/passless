@@ -77,7 +77,6 @@ impl PinStorage for TpmPinStorage {
             "Loading PIN state from TPM storage: {}",
             self.path.display()
         );
-
         let sealed_data = std::fs::read(&self.path).map_err(|e| {
             warn!("Failed to read sealed PIN state: {}", e);
             StatusCode::Other
